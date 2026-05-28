@@ -1,0 +1,33 @@
+{
+    "predicted": {
+        "608383": {
+            "question": "Will Freddie Mac not IPO by June 30, 2026?",
+            "date": "2026-05-27 19:17",
+            "bounds": "5% - 5%",
+            "pu": 0.05,
+            "pm": 0.9605,
+            "theoretical_kelly": 0.4401,
+            "allocation": 18.49
+        },
+        "558938": {
+            "question": "Will Argentina win the 2026 FIFA World Cup?",
+            "date": "2026-05-27 19:17",
+            "bounds": "5% - 5%",
+            "pu": 0.05,
+            "pm": 0.0835,
+            "theoretical_kelly": 0.0,
+            "allocation": 0.0
+        },
+        "1048199": {
+            "question": "Taylor Swift pregnant before 2027?",
+            "date": "2026-05-27 19:57",
+            "bounds": "23% - 46%",
+            "pu": 0.34500000000000003,
+            "pm": 0.255,
+            "theoretical_kelly": 0.0,
+            "allocation": 0.0
+        }
+    },
+    "skipped": {},
+    "resolved": {}
+}

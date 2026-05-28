@@ -1,17 +1,33 @@
-# Python caches
+# Ignore Python bytecode files
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 
-# Virtual environment
-.venv/
-
-# Jupyter notebooks checkpoints
+# Ignore Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+# Ignore environment files
+.env
+.venv/
 
 # VS Code workspace settings
 .vscode/
+*.code-workspace
+
+# Ignore logs
+logs/
+
+# Ignore data files
+data/
+
+# Ignore model files
+models/
 
 # OS files
 .DS_Store
 Thumbs.db
+
+# Ignore any other files you don't want to track
+temp/
+
