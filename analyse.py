@@ -184,7 +184,6 @@ def run_interactive_analyzer():
     category, sort_mode, show_odds = "All", "1", True
     
     while True:
-        print("\n--- POLYMARKET QUANT ANALYZER ---")
         print(f"1. Category Filter : [{category}]")
         print(f"2. Sort Metric     : [{'Vol' if sort_mode=='1' else '24h Vol' if sort_mode=='2' else 'Velocity' if sort_mode=='3' else 'Yield' if sort_mode=='4' else 'Spread' if sort_mode=='5' else 'Days'}]")
         print(f"3. View Odds       : [{'ON' if show_odds else 'OFF'}]")

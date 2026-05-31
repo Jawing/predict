@@ -470,11 +470,10 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
 
 if __name__ == "__main__":
     while True:
-        print("\nSelect Operation Mode:")
         print(" 1: Discover Markets")
         print(" 2: Review Markets")
         print(" 3: Target Specific URLs")
-        print(" 4: Complete Reset")
+        print(" 4: Delete all data")
         print(" 5: Exit")
         
         choice = input("> ").strip()
@@ -488,12 +487,12 @@ if __name__ == "__main__":
             break
             
         elif choice == "4":
-            confirm = input("WARNING: Type 'CONFIRM' to delete all mathematical history and Brier scores: ")
+            confirm = input("WARNING: Type 'CONFIRM' to delete all local data: ")
             if confirm == "CONFIRM":
                 if os.path.exists(HISTORY_FILE): os.remove(HISTORY_FILE)
-                print("Reset complete.")
+                print("All data deleted.")
             else:
-                print("Reset aborted.")
+                print("Data deletion cancelled.")
             continue
             
         elif choice == "3":
