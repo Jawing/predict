@@ -1,22 +1,22 @@
 # Predict
 
-A CLI toolkit for exploring active Polymarket markets and managing predictions.
+A CLI toolkit for exploring Polymarket and managing predictions.
 
 ## Repository Overview
 
-- `predict.py` - Main pipeline for discovering markets, reviewing predictions/skips, targeting specific event URLs, and managing local prediction history.
-- `analyse.py` - Market analytics utility for scanning active markets, computing volumes, spreads, velocity, and annualized yield.
-- `tags.py` - Simple helper script that fetches active events and prints available tag labels for category filtering.
+- `predict.py` - Main pipeline for discovering markets, reviewing and managing local prediction history.
+- `analyse.py` - Market analytics tool for summarizing active markets, categories and computing metrics.
 
 ## Features
 
-- Fetches active markets from the Polymarket Gamma API
-- Filters markets by category, odds, timeframe, liquidity, and resolution state
+- Randomly discover markets from Polymarket to predict or review predicted/skipped markets
+- Calculate allocations using [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) with logit smoothing and weighted confidence
 - Applies risk controls such as edge thresholds, minimum/maximum days, and volume impact caps
-- Saves prediction history locally
-- Review previously predicted and skipped markets
+- Saves prediction history locally and calculate [Brier scores](https://en.wikipedia.org/wiki/Brier_score)
 
 ## Setup
+
+Install [Python](https://www.python.org/)
 
 Install dependencies:
 
@@ -26,22 +26,16 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run the main prediction engine:
+Run the main prediction pipeline:
 
 ```powershell
 python predict.py
 ```
 
-Run the comparative market analytics tool:
+Run the market analytics tool:
 
 ```powershell
 python analyse.py
-```
-
-Print available Polymarket tags (Categories) for active events:
-
-```powershell
-python tags.py
 ```
 
 ## Configuration Settings for `predict.py`

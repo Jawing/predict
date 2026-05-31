@@ -44,10 +44,23 @@ def save_history(history):
 
 def extract_prices(m):
     """Helper to safely extract mid, bid, and ask prices from a market dictionary."""
-    try: pm_mid = float(json.loads(m.get('outcomePrices', '["0.5"]'))[0])
-    except: return None, None, None
-    try: pm_bid, pm_ask = float(m.get('bestBid', pm_mid)), float(m.get('bestAsk', pm_mid))
-    except: pm_bid, pm_ask = pm_mid, pm_mid
+    try:
+        prices = m.get('outcomePrices')
+        if isinstance(prices, str):
+            pm_mid = float(json.loads(prices)[0])
+        elif isinstance(prices, list):
+            pm_mid = float(prices[0])
+        else:
+            return None, None, None
+    except: 
+        return None, None, None
+        
+    try: 
+        pm_bid = float(m.get('bestBid', pm_mid))
+        pm_ask = float(m.get('bestAsk', pm_mid))
+    except: 
+        pm_bid, pm_ask = pm_mid, pm_mid
+        
     return pm_bid, pm_ask, pm_mid
 
 def update_resolutions(history):
@@ -66,11 +79,18 @@ def update_resolutions(history):
             
             # If the market is finalized or closed, score it to prevent purgatory
             if is_closed or uma_resolved:
-                prices = json.loads(resp.get("outcomePrices", '["0.5", "0.5"]'))
+                # Safely parse outcomes into floats
+                prices_raw = resp.get("outcomePrices")
+                if isinstance(prices_raw, str):
+                    prices = [float(x) for x in json.loads(prices_raw)]
+                elif isinstance(prices_raw, list):
+                    prices = [float(x) for x in prices_raw]
+                else:
+                    prices = [0.5, 0.5]
                 
                 if len(prices) >= 2:
-                    if prices[0] in ["1", "1.0"]: outcome = 1.0
-                    elif prices[1] in ["1", "1.0"]: outcome = 0.0
+                    if prices[0] == 1.0: outcome = 1.0
+                    elif prices[1] == 1.0: outcome = 0.0
                     else: outcome = 0.5 # Catch-all for voided/cancelled/50-50 splits
                 else:
                     outcome = 0.5
@@ -198,9 +218,14 @@ def validate_market(m, history, mode):
         
     try:
         res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
-        days_until = (res_dt - datetime.now(timezone.utc)).days
+        seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+
+        if seconds_left <= 0:
+            return False, "Market has already expired"
+            
+        days_until = seconds_left / 86400.0
         if days_until < MIN_DAYS or days_until > MAX_DAYS:
-            return False, f"Time horizon ({days_until} days) outside bounds"
+            return False, f"Time horizon ({days_until:.1f} days) outside bounds"
     except:
         return False, "Invalid end date format"
             
