@@ -16,9 +16,7 @@ A CLI toolkit for exploring Polymarket and managing predictions.
 
 ## Setup
 
-Install [Python](https://www.python.org/)
-
-Install dependencies:
+Install [Python](https://www.python.org/) and dependencies:
 
 ```powershell
 pip install -r requirements.txt
