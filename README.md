@@ -9,7 +9,6 @@ A CLI toolkit for exploring Polymarket and managing predictions.
 
 ## Features
 
-- Discover markets from Polymarket to predict or review markets
 - Calculate allocations using [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) with smoothed confidence 
 - Applies risk controls such as edge thresholds and time horizon filters
 - Saves prediction history locally and calculates [Brier scores](https://en.wikipedia.org/wiki/Brier_score)
