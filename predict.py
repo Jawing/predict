@@ -17,8 +17,8 @@ GAMMA_API = "https://gamma-api.polymarket.com" # Base API URL
 
 # --- MICROSTRUCTURE DEFENSES ---
 MIN_EDGE = 0.02          # 2% minimum mathematical edge to bother executing
-MAX_DAYS = 400           # Ignore markets locking up capital for more than 400 days
-MIN_DAYS = 1             # Ignore markets resolving within 24 hours
+MAX_DAYS = 420          # Ignore markets locking up capital for more than 420 days
+MIN_DAYS = 0             # Ignore markets resolving within 24 hours
 EXTREME_ODDS = 0.02      # Ignore tail-risk markets below 2% or above 98%
 
 # Global TCP Session for massive latency reduction on API loops
@@ -126,20 +126,35 @@ def calculate_base_ego(history):
     return bs_m_total / (bs_u_total + bs_m_total)
 
 def parse_user_input(user_input):
-    # Added '-?' to the regex to capture negative numbers so we can properly reject them
-    numbers = [float(x) for x in re.findall(r'-?\d+\.?\d*', user_input)]
+    # Normalize range hyphens into spaces so they aren't mistaken for negative numbers
+    # e.g., "10 - 20" -> "10   20"
+    cleaned = user_input.replace(' - ', ' ')
+    # e.g., "16-51" -> "16 51" (hyphen preceded by a digit)
+    cleaned = re.sub(r'(?<=\d)-', ' ', cleaned)
+    # e.g., "10%-20%" -> "10% 20%" (hyphen preceded by a % sign)
+    cleaned = re.sub(r'(?<=%)-', ' ', cleaned)
     
-    if len(numbers) == 0:
-        raise ValueError("No numbers found in input")
+    # Now extract the remaining numbers
+    str_numbers = re.findall(r'-?\d+\.?\d*', cleaned)
+    
+    if not str_numbers:
+        raise ValueError("Invalid input")
         
-    # Validate that the extracted values are valid percentages (0 to 100)
-    for num in numbers[:2]:
+    numbers = []
+    # Validate extracted strings directly to catch "-0" before it turns into a float
+    for s in str_numbers[:2]:
+        if s.startswith('-'):
+            raise ValueError(f"Negative values ({s}) are not allowed. Please enter 0-100.")
+        
+        num = float(s)
         if num < 0 or num > 100:
             raise ValueError(f"Value '{num}' is out of bounds. Percentages must be between 0 and 100")
             
+        numbers.append(num)
+        
     if len(numbers) == 1:
         return numbers[0] / 100.0, numbers[0] / 100.0
-    elif len(numbers) >= 2:
+    else:
         return min(numbers[0], numbers[1]) / 100.0, max(numbers[0], numbers[1]) / 100.0
 
 def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, volume, bankroll, base_ego, kelly, max_vol):
@@ -433,7 +448,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             history["predicted"][market_id] = {
                 "question": question,
                 "date": today_str,
-                "bounds": f"{(lower*100):.0f}% - {(upper*100):.0f}%",
+                "bounds": f"{(lower*100):.1f}% - {(upper*100):.1f}%",
                 "pu": (lower + upper) / 2.0,
                 "pm": pm_mid,
                 "theoretical_kelly": round(adj_kelly, 4), 
@@ -536,7 +551,7 @@ if __name__ == "__main__":
             category = category_input if category_input else "All"
             
             while True:
-                market_mode = input("\nDiscover Mode - Select Page Limit:\n 1: All Active Markets (Full Platform Brink)\n 2: Custom Top Pages Limit\n> ").strip()
+                market_mode = input("\nDiscover Mode - Select Page Limit:\n 1: All Active Markets (Full Platform)\n 2: Custom Top Pages (e.g., 1, 10)\n> ").strip()
                 if market_mode in ["1", "2"]:
                     op_mode = "discover"
                     sub_mode = "all" if market_mode == "1" else "custom"

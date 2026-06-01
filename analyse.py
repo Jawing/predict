@@ -319,7 +319,7 @@ def display_pager(markets, show_odds):
             else:
                 time_str = f"{h:02d}:{mins:02d}:{s:02d}"
 
-            odds_str = f"{m['odds']*100:.0f}%"
+            odds_str = f"{m['odds']*100:.1f}%"
             
             row = f"{m_vol_str:<9} | {h24_str:<8} | {liq_str:<8} | {vel_str:<5} | {spr_str:<6} | {yld_str:<8} | {time_str:<12} | "
             if show_odds: row += f"{odds_str:<5} | "
