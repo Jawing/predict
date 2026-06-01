@@ -10,18 +10,14 @@ import numpy as np
 # --- CONFIGURATION ---
 HISTORY_FILE = "prediction_history.json"
 BANKROLL = 42.00
-KELLY_FRACTION = 1.0
-MAX_VOLUME_IMPACT = 0.02
-MAX_GUESS = 20000  # Initial upper bound for market universe probing
-GAMMA_API = "https://gamma-api.polymarket.com" # Base API URL
+GAMMA_API = "https://gamma-api.polymarket.com"
 
-# --- MICROSTRUCTURE DEFENSES ---
-MIN_EDGE = 0.02          # 2% minimum mathematical edge to bother executing
-MAX_DAYS = 420          # Ignore markets locking up capital for more than 420 days
-MIN_DAYS = 0             # Ignore markets resolving within 24 hours
-EXTREME_ODDS = 0.02      # Ignore tail-risk markets below 2% or above 98%
+# --- FILTERING PARAMETERS ---
+MIN_EDGE = 0.01      # X% minimum mathematical edge to bother executing
+MAX_DAYS = 420       # Ignore markets locking up capital for more than X days
+MIN_DAYS = 0         # Ignore markets resolving within X days (e.g., 1 day = 24h, 0.5 days = 12h)
+EXTREME_ODDS = 0.01  # Ignore tail-odds markets below X% (e.g., 0.01 = 1%)
 
-# Global TCP Session for massive latency reduction on API loops
 api = requests.Session()
 
 def load_history():
@@ -43,17 +39,12 @@ def save_history(history):
         json.dump(history, f, indent=4)
 
 def extract_prices(m):
-    """Helper to safely extract mid, bid, and ask prices from a market dictionary."""
     try:
         prices = m.get('outcomePrices')
-        if isinstance(prices, str):
-            pm_mid = float(json.loads(prices)[0])
-        elif isinstance(prices, list):
-            pm_mid = float(prices[0])
-        else:
-            return None, None, None
-    except: 
-        return None, None, None
+        if isinstance(prices, str): pm_mid = float(json.loads(prices)[0])
+        elif isinstance(prices, list): pm_mid = float(prices[0])
+        else: return None, None, None
+    except: return None, None, None
         
     try: 
         pm_bid = float(m.get('bestBid', pm_mid))
@@ -77,27 +68,22 @@ def update_resolutions(history):
             is_closed = resp.get("closed", False)
             uma_resolved = resp.get("umaResolutionStatus") == "resolved"
             
-            # If the market is finalized or closed, score it to prevent purgatory
             if is_closed or uma_resolved:
-                # Safely parse outcomes into floats
                 prices_raw = resp.get("outcomePrices")
-                if isinstance(prices_raw, str):
-                    prices = [float(x) for x in json.loads(prices_raw)]
-                elif isinstance(prices_raw, list):
-                    prices = [float(x) for x in prices_raw]
-                else:
-                    prices = [0.5, 0.5]
+                if isinstance(prices_raw, str): prices = [float(x) for x in json.loads(prices_raw)]
+                elif isinstance(prices_raw, list): prices = [float(x) for x in prices_raw]
+                else: prices = [0.5, 0.5]
                 
                 if len(prices) >= 2:
                     if prices[0] == 1.0: outcome = 1.0
                     elif prices[1] == 1.0: outcome = 0.0
-                    else: outcome = 0.5 # Catch-all for voided/cancelled/50-50 splits
-                else:
-                    outcome = 0.5
+                    else: outcome = 0.5 
+                else: outcome = 0.5
                 
                 pred_data = history["predicted"][market_id]
                 history["resolved"][market_id] = {
                     "question": pred_data.get("question", "Unknown"),
+                    "slug": pred_data.get("slug", "Unknown"),
                     "pu": pred_data.get("pu", 0.5),
                     "pm": pred_data.get("pm", 0.5),
                     "outcome": outcome,
@@ -149,7 +135,6 @@ def parse_user_input(user_input):
         num = float(s)
         if num < 0 or num > 100:
             raise ValueError(f"Value '{num}' is out of bounds. Percentages must be between 0 and 100")
-            
         numbers.append(num)
         
     if len(numbers) == 1:
@@ -157,7 +142,7 @@ def parse_user_input(user_input):
     else:
         return min(numbers[0], numbers[1]) / 100.0, max(numbers[0], numbers[1]) / 100.0
 
-def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, volume, bankroll, base_ego, kelly, max_vol):
+def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, bankroll, base_ego):
     eps = 0.01
     pu_mid = (lower_bound + upper_bound) / 2.0
     spread = upper_bound - lower_bound
@@ -186,19 +171,21 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, vol
         return "THIN_EDGE", true_price, 0.0, 0.0, dynamic_ego, edge
     
     raw_kelly = max(0, edge / (1 - true_price))
-    adj_kelly = raw_kelly * kelly
-    final_allocation = min(adj_kelly * bankroll, volume * max_vol)
+    final_allocation = raw_kelly * bankroll
     
-    return action, true_price, adj_kelly, final_allocation, dynamic_ego, edge
+    return action, true_price, raw_kelly, final_allocation, dynamic_ego, edge
 
-def find_market_universe_brink(max_guess=MAX_GUESS, limit=100):
+def find_platform_brink(limit=100):
     print("[*] Probing platform boundaries via binary search...")
+    max_guess = 2**16 # Set a large number as initial upper bound for offset
     low, high, max_valid = 0, max_guess, 0
     while low <= high:
         mid = ((low + high) // 2) // limit * limit
         try:
             res = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={mid}").json()
-            if res and len(res) > 0:
+            if isinstance(res, dict) and 'error' in res:
+                high = mid - limit
+            elif isinstance(res, list) and len(res) > 0:
                 max_valid, low = mid, mid + limit
             else:
                 high = mid - limit 
@@ -246,11 +233,9 @@ def validate_market(m, history, mode):
             
     return True, "Valid"
 
-def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", custom_limit=1):
+def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0):
     if mode == "discover":
-        # Determine maximum offset strictly by the bounds selected
-        max_offset = find_market_universe_brink() if sub_mode == "all" else max(0, (custom_limit - 1) * 100)
-        
+        seen_categories = set()
         while True:
             offset = random.randint(0, max_offset // 100) * 100
             print(f"[*] Fetching markets with event offset {offset}...")
@@ -266,13 +251,26 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 # --- CATEGORY FILTERING ---
                 if category and category.lower() != "all":
                     tags = [t.get('label', '').lower() for t in event.get('tags', []) if isinstance(t, dict)]
-                    if not any(category.lower() in t for t in tags):
+                    matches = [t for t in tags if category.lower() in t]
+                    if not matches:
                         continue
+                        
+                    # Print matched categories once during discovery
+                    for match in matches:
+                        full_name = match.title()
+                        if full_name not in seen_categories:
+                            print(f"[+] Category Matched: '{full_name}'")
+                            seen_categories.add(full_name)
+
+                    # Print all seen Categories
+                    # if seen_categories:
+                    #     print(f"Current Matched Categories: {', '.join(sorted(seen_categories))}")
+
                         
                 valid_markets = []
                 for m in event.get('markets', []):
-                    m['parent_slug'] = event.get('slug', 'unknown-event')
-                    m['parent_name'] = event.get('title', 'Unknown Event')
+                    m['parent_slug'] = event.get('slug', 'unknown')
+                    m['parent_name'] = event.get('title', 'unknown')
                     
                     is_valid, reason = validate_market(m, history, mode)
                     if is_valid: 
@@ -285,17 +283,20 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     
     elif mode == "target":
         if not target_slugs:
-            print("[!] Error: No valid slugs (URL) provided.")
+            print("[!] Error: No valid URL/slug provided.")
             return
             
         for slug in target_slugs:
             try:
                 events = api.get(f"{GAMMA_API}/events?slug={slug}").json()
+                if not events:
+                    print(f"[-] Invalid or empty data returned for slug: {slug}")
+                    continue
+                    
                 for event in events:
                     for m in event.get('markets', []):
-                        m['parent_slug'] = event.get('slug', 'unknown-event')
-                        m['parent_name'] = event.get('title', 'Unknown Event')
-                        
+                        m['parent_slug'] = event.get('slug', 'unknown')
+                        m['parent_name'] = event.get('title', 'unknown')
                         is_valid, reason = validate_market(m, history, mode)
                         if is_valid: yield m
                         else: print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")
@@ -316,8 +317,8 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
             try:
                 m = api.get(f"{GAMMA_API}/markets/{market_id}").json()
                 if m:
-                    m['parent_slug'] = m.get('slug', 'review-market') 
-                    m['parent_name'] = m.get('question', 'Review Market')
+                    m['parent_slug'] = m.get('slug', 'unknown') 
+                    m['parent_name'] = m.get('question', 'unknown')
                     
                     is_valid, reason = validate_market(m, history, mode)
                     if is_valid: 
@@ -333,7 +334,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
             except Exception:
                 continue
 
-def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", custom_limit=1):
+def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0):
     history = update_resolutions(load_history())
     live_base_ego = calculate_base_ego(history)
     
@@ -342,7 +343,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
     print(f"Bankroll       : ${BANKROLL:,.2f}")
     print(f"Base Ego       : {live_base_ego:.3f} (Historical Accuracy Weight)\n")
     
-    market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, custom_limit)
+    market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset)
 
     portfolio_data = []
     session_trades = {}
@@ -359,7 +360,6 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             try:
                 new_m = next(market_stream)
                 
-                # Utilize the new helper function for clean extraction
                 pm_bid, pm_ask, pm_mid = extract_prices(new_m)
                 if pm_mid is None:
                     continue
@@ -383,13 +383,21 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         m = session_markets[current_index]
         market_id = m.get('id')
         question = m.get('question', 'Unknown Question')
-        event_url = f"https://polymarket.com/event/{m.get('parent_slug')}"
+        event_slug = m.get('parent_slug', 'unknown')
+        event_url = f"https://polymarket.com/event/{event_slug}"
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         
         try:
             res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
             exact_date_str = res_dt.strftime("%B %d, %Y")
-            days_str = f"{(res_dt - datetime.now(timezone.utc)).days} Days"
+            
+            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+            if seconds_left < 86400:
+                h, rem = divmod(seconds_left, 3600)
+                mn, s = divmod(rem, 60)
+                days_str = f"{int(h)}h {int(mn)}m {int(s)}s"
+            else:
+                days_str = f"{int(seconds_left // 86400)} Days"
         except: exact_date_str, days_str = "Unknown", "Unknown"
 
         pm_bid, pm_ask, pm_mid = m['cached_bid'], m['cached_ask'], m['cached_mid']
@@ -432,7 +440,11 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         elif user_input.lower() == 's': 
             print("Status: Skipped.\n")
             if market_id not in history["predicted"]:
-                history["skipped"][market_id] = {"date": today_str}
+                history["skipped"][market_id] = {
+                    "question": question,
+                    "slug": event_slug,
+                    "date": today_str
+                }
             current_index += 1 
             continue
         
@@ -441,17 +453,18 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             volume = float(m.get('volumeNum', 0))
             fee_rate = m.get('feeSchedule', {}).get('rate', 0.05)
             
-            action, true_price, adj_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
-                lower, upper, pm_bid, pm_ask, fee_rate, volume, BANKROLL, live_base_ego, KELLY_FRACTION, MAX_VOLUME_IMPACT
+            action, true_price, raw_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
+                lower, upper, pm_bid, pm_ask, fee_rate, BANKROLL, live_base_ego
             )
             
             history["predicted"][market_id] = {
                 "question": question,
+                "slug": event_slug,
                 "date": today_str,
                 "bounds": f"{(lower*100):.1f}% - {(upper*100):.1f}%",
                 "pu": (lower + upper) / 2.0,
                 "pm": pm_mid,
-                "theoretical_kelly": round(adj_kelly, 4), 
+                "theoretical_kelly": round(raw_kelly, 4), 
                 "allocation": round(final_alloc, 2)
             }
             history["skipped"].pop(market_id, None)
@@ -469,8 +482,8 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
                 print(f"EXPOSURE     : {cumulative_exposure*100:.1f}% of Bankroll Used")
                 print(f"FEE RATE     : {fee_rate*100:.1f}%")
-                print(f"VOLUME       : ${volume:,.0f} available (Max impact cap: ${volume*MAX_VOLUME_IMPACT:,.2f})")
-                print(f"KELLY ALLOC %: {adj_kelly*100:.2f}% of bankroll")
+                print(f"VOLUME       : ${volume:,.0f}")
+                print(f"KELLY ALLOC %: {raw_kelly*100:.2f}% of bankroll")
                 print(f"FINAL ALLOC %: {final_alloc/BANKROLL*100:.1f}% of bankroll")
                 print(f"ALLOCATION   : ${final_alloc:,.2f}")
                 print(f"SESSION DATA : {len(session_trades)} predictions | Total Allocated: ${sum(session_trades.values()):,.2f}\n")
@@ -484,14 +497,9 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                     "Alloc": f"${final_alloc:,.2f}"
                 })
             else:
-                if volume == 0 or (volume * MAX_VOLUME_IMPACT) < 0.01 and action not in ["NONE", "THIN_EDGE"]:
-                    reason = f"Insufficient platform liquidity (Volume: ${volume})"
-                elif action == "THIN_EDGE": 
-                    reason = f"Edge below {MIN_EDGE*100}% threshold"
-                elif action == "NONE": 
-                    reason = "Trapped inside bid-ask spread"
-                else: 
-                    reason = "No mathematical edge"
+                if action == "THIN_EDGE": reason = f"Edge below {MIN_EDGE*100}% threshold"
+                elif action == "NONE": reason = "Trapped inside bid-ask spread"
+                else: reason = "No mathematical edge"
                 
                 print(f"ACTION       : $0 Allocation ({reason})")
                 print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
@@ -502,7 +510,6 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             current_index += 1 
                 
         except ValueError as e: 
-            # This will now print the exact string from your parse_user_input validation
             print(f"\n[!] Error: {e}. Please try again.\n")
             
     save_history(history)
@@ -512,7 +519,7 @@ if __name__ == "__main__":
     while True:
         print(" 1: Discover Markets")
         print(" 2: Review Markets")
-        print(" 3: Target Specific URLs")
+        print(" 3: Target Specific URLs/Slugs")
         print(" 4: Delete all data")
         print(" 5: Exit")
         
@@ -520,7 +527,7 @@ if __name__ == "__main__":
         
         targets = None
         category = "All"
-        custom_limit = 1
+        session_max_offset = 0 
         
         if choice == "5":
             print("Exiting program.")
@@ -536,32 +543,49 @@ if __name__ == "__main__":
             continue
             
         elif choice == "3":
-            urls_input = input("Paste Polymarket URLs (comma or space separated):\n> ").replace(',', ' ').split()
-            targets = [url.split("/event/")[1].split("/")[0].split("?")[0] for url in urls_input if "/event/" in url]
+            urls_input = input("Paste Polymarket URLs/Slugs (comma or space separated):\n> ").replace(',', ' ').split()
+            targets = []
+            for item in urls_input:
+                if not item: continue
+                if "/event/" in item:
+                    targets.append(item.split("/event/")[1].split("/")[0].split("?")[0])
+                else:
+                    targets.append(item.split("?")[0])
             
             if not targets:
-                print("No valid URLs parsed. Returning to main menu.\n")
+                print("No valid inputs parsed. Returning to main menu.\n")
                 continue
             else:
                 print(f"Parsed Targets ({len(targets)}): {', '.join(targets)}")
             op_mode, sub_mode = "target", "all"
             
         elif choice == "1":
-            category_input = input("\nEnter Category Tag (e.g., 'Politics', 'Crypto') or hit enter for 'All': ").strip().title()
+            category_input = input("\nEnter Category Tag (e.g., 'Politics', 'Crypto') or hit enter for 'All': ").strip()
             category = category_input if category_input else "All"
             
+            # Fetch Brink to establish dynamic boundary checks
+            platform_max_offset = find_platform_brink()
+            max_pages = (platform_max_offset // 100) + 1
+            
             while True:
-                market_mode = input("\nDiscover Mode - Select Page Limit:\n 1: All Active Markets (Full Platform)\n 2: Custom Top Pages (e.g., 1, 10)\n> ").strip()
+                market_mode = input(f"\nDiscover Mode - Select Page Limit:\n 1: All Active Markets (Full Platform, {max_pages} pages)\n 2: Custom Top Pages (1 to {max_pages})\n> ").strip()
                 if market_mode in ["1", "2"]:
                     op_mode = "discover"
                     sub_mode = "all" if market_mode == "1" else "custom"
                     
                     if sub_mode == "custom":
                         try:
-                            custom_limit = int(input("Enter number of top pages to search (e.g., 5, 10): ").strip())
+                            custom_limit = int(input(f"Enter number of top pages to search (1 to {max_pages}): ").strip())
+                            if custom_limit < 1 or custom_limit > max_pages:
+                                print(f"[!] Out of bounds. Please enter a number between 1 and {max_pages}.")
+                                continue
+                            session_max_offset = (custom_limit - 1) * 100
                         except ValueError:
-                            print("[!] Defaulting to 1 page.")
-                            custom_limit = 1
+                            print("[!] Invalid input. Defaulting to 1 page.")
+                            session_max_offset = 0
+                    else:
+                        session_max_offset = platform_max_offset
+                        
                     break
                 print("Invalid selection. Please choose 1 or 2.")
                 
@@ -578,8 +602,7 @@ if __name__ == "__main__":
             print("Invalid selection. Please choose 1-5.")
             continue
             
-        # Execute the main pipeline loop with the new variables passed through
-        portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, custom_limit=custom_limit)
+        portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset)
         
         if portfolio is not None and not portfolio.empty:
             print("\n--- Final Session Allocations ---")
