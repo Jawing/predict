@@ -145,17 +145,33 @@ def parse_user_input(user_input):
 
 def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, bankroll, base_ego):
     eps = 0.01
-    pu_mid = (lower_bound + upper_bound) / 2.0
-    spread = upper_bound - lower_bound
     
-    dynamic_ego = max(0.00, base_ego * (1.0 - spread))
-    pu_clip = np.clip(pu_mid, eps, 1-eps)
+    # 1. Midpoints and Uncertainty Spreads
+    pu_mid = (lower_bound + upper_bound) / 2.0
+    u_spread = upper_bound - lower_bound
+    m_spread = pm_ask - pm_bid
     pm_mid_clip = np.clip((pm_bid + pm_ask) / 2.0, eps, 1-eps)
     
+    # 2. Bidirectional Conviction Weighting
+    # We reduce the weight of whoever is more uncertain (wider spread)
+    u_conviction = base_ego * (1.0 - u_spread)
+    m_conviction = (1.0 - base_ego) * (1.0 - m_spread)
+    
+    # 3. Calculate Dynamic Ego (Normalized)
+    if (u_conviction + m_conviction) > 0:
+        dynamic_ego = u_conviction / (u_conviction + m_conviction)
+    else:
+        # Fallback to historical baseline if both user and market are at maximum uncertainty
+        dynamic_ego = base_ego 
+        
+    pu_clip = np.clip(pu_mid, eps, 1-eps)
+    
+    # 4. Bayesian Logit Pooling
     logit_pu, logit_pm = np.log(pu_clip / (1-pu_clip)), np.log(pm_mid_clip / (1-pm_mid_clip))
     logit_norm = (dynamic_ego * logit_pu) + ((1 - dynamic_ego) * logit_pm)
     pu_norm = 1 / (1 + np.exp(-logit_norm)) 
     
+    # 5. Pricing and Action Mapping
     cost_yes, cost_no = pm_ask, 1.0 - pm_bid 
     
     if pu_norm > cost_yes:
@@ -165,12 +181,14 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     else:
         return "NONE", 0.0, 0.0, 0.0, dynamic_ego, 0.0
     
+    # 6. Edge and Fee Evaluation
     true_price = base_price + (fee_rate * base_price * (1 - base_price))
     edge = win_prob - true_price
     
     if edge < MIN_EDGE:
         return "THIN_EDGE", true_price, 0.0, 0.0, dynamic_ego, edge
     
+    # 7. Uncapped Fractional Kelly Allocation
     raw_kelly = max(0, edge / (1 - true_price))
     final_allocation = raw_kelly * bankroll
     
