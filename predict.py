@@ -108,6 +108,8 @@ def calculate_base_ego(history):
         bs_u_total += (data.get("pu", 0.5) - outcome) ** 2
         bs_m_total += (data.get("pm", 0.5) - outcome) ** 2
         
+    print(f"[*] Current Brier Score - User: {bs_u_total:.4f} | Market: {bs_m_total:.4f}")
+    # If both scores are zero (e.g., no resolved markets or perfect predictions), return neutral ego of 0.5
     if bs_u_total == 0 and bs_m_total == 0: return 0.50 
     return bs_m_total / (bs_u_total + bs_m_total)
 
@@ -336,12 +338,12 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
 
 def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0):
     history = update_resolutions(load_history())
-    live_base_ego = calculate_base_ego(history)
+    base_ego = calculate_base_ego(history)
     
     print(f"\n--- Starting Session [{mode.upper()} - {sub_mode.upper()}] ---")
     if mode == "discover": print(f"Category Filter: {category.upper()}")
     print(f"Bankroll       : ${BANKROLL:,.2f}")
-    print(f"Base Ego       : {live_base_ego:.3f} (Historical Accuracy Weight)\n")
+    print(f"Base Ego       : {base_ego:.3f} (Brier Score Ratio)\n")
     
     market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset)
 
@@ -454,7 +456,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             fee_rate = m.get('feeSchedule', {}).get('rate', 0.05)
             
             action, true_price, raw_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
-                lower, upper, pm_bid, pm_ask, fee_rate, BANKROLL, live_base_ego
+                lower, upper, pm_bid, pm_ask, fee_rate, BANKROLL, base_ego
             )
             
             history["predicted"][market_id] = {
@@ -472,7 +474,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             print(f"\n--- MARKET ANALYSIS ---")
             print(f"Market Spread: Bid {pm_bid*100:.1f}% | Ask {pm_ask*100:.1f}% (Spread: {(pm_ask - pm_bid)*100:.1f}%)")
             print(f"User Bounds  : {lower*100:.1f}% to {upper*100:.1f}% (Spread: {(upper-lower)*100:.1f}%)")
-            print(f"Dynamic Ego  : {dynamic_ego:.2f} (Base {live_base_ego:.2f})")
+            print(f"Dynamic Ego  : {dynamic_ego:.2f} (Base {base_ego:.2f})")
             
             if final_alloc > 0.01:
                 cumulative_exposure += final_alloc / BANKROLL
