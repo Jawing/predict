@@ -239,7 +239,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
         seen_categories = set()
         while True:
             offset = random.randint(0, max_offset // 100) * 100
-            print(f"[*] Fetching markets...",  end="\r")
+            print(f"[*] Fetching market...",  end="\r")
             try:
                 events = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}").json()
             except Exception:
