@@ -2,16 +2,16 @@
 
 A CLI toolkit for exploring Polymarket and managing predictions.
 
-## Repository Overview
+## Overview
 
-- `predict.py` - Main pipeline for discovering markets, reviewing and managing local prediction history.
-- `analyse.py` - Market analytics tool for summarizing active markets, categories and computing metrics.
+- `predict.py` - Main CLI for discovering markets, reviewing and managing prediction history.
+- `analyse.py` - Analytics tool for summarizing active markets, categories and computing metrics.
 
 ## Features
 
-- Calculate allocations using [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) with smoothed confidence 
-- Applies risk controls such as edge thresholds and time horizon filters
-- Saves prediction history locally and calculates [Brier scores](https://en.wikipedia.org/wiki/Brier_score)
+- Calculate allocations using confidence weighted [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) 
+- Filter markets by prediction edge, time and odds
+- Saves predictions locally and compare [Brier scores](https://en.wikipedia.org/wiki/Brier_score)
 
 ## Setup
 
@@ -21,18 +21,10 @@ Install [Python](https://www.python.org/) and dependencies:
 pip install -r requirements.txt
 ```
 
-## Usage
-
-Run the main prediction pipeline:
+Run the CLI
 
 ```powershell
 python predict.py
-```
-
-Run the market analytics tool:
-
-```powershell
-python analyse.py
 ```
 
 ## Configuration Settings for `predict.py`
@@ -51,4 +43,7 @@ python analyse.py
 - `EXTREME_ODDS = 0.01`
   - Filters out extreme tail markets priced below 1% or above 99%.
 
+## Planned
+
+- Sync with Polymarket Portfolio
 
