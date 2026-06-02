@@ -82,12 +82,11 @@ def update_resolutions(history):
                 
                 pred_data = history["predicted"][market_id]
                 history["resolved"][market_id] = {
-                    "question": pred_data.get("question", "Unknown"),
-                    "slug": pred_data.get("slug", "Unknown"),
+                    "question": pred_data.get("question", "unknown"),
+                    "slug": pred_data.get("slug", "unknown"),
                     "pu": pred_data.get("pu", 0.5),
                     "pm": pred_data.get("pm", 0.5),
-                    "outcome": outcome,
-                    "date_resolved": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                    "outcome": outcome
                 }
                 del history["predicted"][market_id]
                 resolved_count += 1
@@ -240,7 +239,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
         seen_categories = set()
         while True:
             offset = random.randint(0, max_offset // 100) * 100
-            print(f"[*] Fetching markets with event offset {offset}...")
+            print(f"[*] Fetching markets...",  end="\r")
             try:
                 events = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}").json()
             except Exception:
@@ -355,7 +354,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
     
     while True:
         if cumulative_exposure >= 1.0:
-            print("\n[!] Maximum capital exposure reached (100%). Session ending.")
+            print(f"\n[!] Maximum capital exposure reached. Session ending.")
             break
             
         if current_index >= len(session_markets):
@@ -384,7 +383,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 
         m = session_markets[current_index]
         market_id = m.get('id')
-        question = m.get('question', 'Unknown Question')
+        question = m.get('question', 'unknown')
         event_slug = m.get('parent_slug', 'unknown')
         event_url = f"https://polymarket.com/event/{event_slug}"
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -400,15 +399,15 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 days_str = f"{int(h)}h {int(mn)}m {int(s)}s"
             else:
                 days_str = f"{int(seconds_left // 86400)} Days"
-        except: exact_date_str, days_str = "Unknown", "Unknown"
+        except: exact_date_str, days_str = "unknown", "unknown"
 
         pm_bid, pm_ask, pm_mid = m['cached_bid'], m['cached_ask'], m['cached_mid']
 
         print(f"==================================================")
         print(f"Event    : {m.get('parent_name')}")
+        print(f"URL      : {event_url}")
         print(f"Market   : {question}")
-        print(f"Resolves : {exact_date_str} ({days_str})")
-        print(f"Exposure : {cumulative_exposure*100:.1f}% deployed")
+        print(f"Resolves : {exact_date_str} ({days_str})\n")
 
         user_input = input("Enter % bounds ('16-51' or '42'), 's' (skip), 'r' (redo), 'q' (quit): ").strip()
 
@@ -452,7 +451,6 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         
         try:
             lower, upper = parse_user_input(user_input)
-            volume = float(m.get('volumeNum', 0))
             fee_rate = m.get('feeSchedule', {}).get('rate', 0.05)
             
             action, true_price, raw_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
@@ -463,11 +461,8 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 "question": question,
                 "slug": event_slug,
                 "date": today_str,
-                "bounds": f"{(lower*100):.1f}% - {(upper*100):.1f}%",
                 "pu": (lower + upper) / 2.0,
-                "pm": pm_mid,
-                "theoretical_kelly": round(raw_kelly, 4), 
-                "allocation": round(final_alloc, 2)
+                "pm": pm_mid
             }
             history["skipped"].pop(market_id, None)
             
@@ -482,14 +477,8 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 
                 print(f"ACTION       : BUY {action} @ {true_price*100:.1f}%")
                 print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
-                print(f"EXPOSURE     : {cumulative_exposure*100:.1f}% of Bankroll Used")
-                print(f"FEE RATE     : {fee_rate*100:.1f}%")
-                print(f"VOLUME       : ${volume:,.0f}")
-                print(f"KELLY ALLOC %: {raw_kelly*100:.2f}% of bankroll")
-                print(f"FINAL ALLOC %: {final_alloc/BANKROLL*100:.1f}% of bankroll")
+                print(f"KELLY %      : {raw_kelly*100:.2f}% of bankroll")
                 print(f"ALLOCATION   : ${final_alloc:,.2f}")
-                print(f"SESSION DATA : {len(session_trades)} predictions | Total Allocated: ${sum(session_trades.values()):,.2f}\n")
-                print(f"LINK         : {event_url}\n")
                 
                 portfolio_data.append({
                     "Question": question[:50] + "..",
@@ -505,10 +494,10 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 
                 print(f"ACTION       : $0 Allocation ({reason})")
                 print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
-                print(f"EXPOSURE     : {cumulative_exposure*100:.1f}% of Bankroll Used")
-                print(f"SESSION DATA : {len(session_trades)} trades | Total Allocated: ${sum(session_trades.values()):,.2f}\n")
-                print(f"LINK         : {event_url}\n")
-                
+            
+            print(f"EXPOSURE     : {cumulative_exposure*100:.1f}% of Bankroll Used")
+            print(f"SESSION DATA : {len(session_trades)} predictions | Total Allocated: ${sum(session_trades.values()):,.2f}\n")
+
             current_index += 1 
                 
         except ValueError as e: 
