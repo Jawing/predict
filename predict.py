@@ -1,3 +1,4 @@
+import math
 import requests
 import json
 import os
@@ -161,6 +162,21 @@ def calculate_annualized_yield(edge, true_price, days_until):
         apy = 0.0
         
     return roi, apy
+
+def stringify_overflow(obj):
+    """Recursively converts infinite floats into strings."""
+    if isinstance(obj, float):
+        if obj == float('inf'):
+            return "Infinity"
+        elif obj == float('-inf'):
+            return "-Infinity"
+        elif math.isnan(obj):
+            return "NaN"
+    elif isinstance(obj, dict):
+        return {k: stringify_overflow(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [stringify_overflow(x) for x in obj]
+    return obj
 
 def parse_user_input(user_input):
     # Normalize range hyphens into spaces so they aren't mistaken for negative numbers
@@ -599,7 +615,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         except ValueError as e: 
             print(f"\n[!] Error: {e}. Please try again.\n")
             
-    save_history(history)
+    save_history(stringify_overflow(history))
     return pd.DataFrame(portfolio_data)
 
 if __name__ == "__main__":
