@@ -13,10 +13,10 @@ BANKROLL = 42.00
 GAMMA_API = "https://gamma-api.polymarket.com"
 
 # --- FILTERING PARAMETERS ---
-MIN_EDGE = 0.01      # X% minimum mathematical edge to bother executing
+MIN_EDGE = 0.00      # X% minimum mathematical edge to bother executing (e.g., 0.01 = 1%)
 MAX_DAYS = 420       # Ignore markets locking up capital for more than X days
 MIN_DAYS = 0         # Ignore markets resolving within X days (e.g., 1 day = 24h, 0.5 days = 12h)
-EXTREME_ODDS = 0.01  # Ignore tail-odds markets below X% (e.g., 0.01 = 1%)
+EXTREME_ODDS = 0.00  # Ignore tail-odds markets below X% (e.g., 0.01 = 1%)
 
 api = requests.Session()
 
@@ -112,6 +112,23 @@ def calculate_base_ego(history):
     if bs_u_total == 0 and bs_m_total == 0: return 0.50 
     return bs_m_total / (bs_u_total + bs_m_total)
 
+def calculate_annualized_yield(edge, true_price, days_until):
+    # Prevent division by zero for expired markets or 0 prices
+    if days_until <= 0.0 or true_price <= 0:
+        return 0.0, 0.0
+        
+    # 1. Raw Expected Return on Investment
+    roi = edge / true_price
+    
+    # 2. Annualized Yield (APY - Compounding)
+    # If the edge is negative, the APY will geometrically compound the loss
+    try:
+        apy = ((1 + roi) ** (365.0 / days_until)) - 1
+    except:
+        apy = 0.0
+        
+    return roi, apy
+
 def parse_user_input(user_input):
     # Normalize range hyphens into spaces so they aren't mistaken for negative numbers
     # e.g., "10 - 20" -> "10   20"
@@ -184,13 +201,13 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     # 6. Edge and Fee Evaluation
     true_price = base_price + (fee_rate * base_price * (1 - base_price))
     edge = win_prob - true_price
-    
-    if edge < MIN_EDGE:
-        return "THIN_EDGE", true_price, 0.0, 0.0, dynamic_ego, edge
-    
+
     # 7. Uncapped Fractional Kelly Allocation
     raw_kelly = max(0, edge / (1 - true_price))
     final_allocation = raw_kelly * bankroll
+    
+    if edge < MIN_EDGE:
+        return "THIN_EDGE", true_price, raw_kelly, 0.0, dynamic_ego, edge
     
     return action, true_price, raw_kelly, final_allocation, dynamic_ego, edge
 
@@ -214,7 +231,7 @@ def find_platform_brink(limit=100):
 
 # --- UNIFIED PIPELINE ARCHITECTURE ---
 
-def validate_market(m, history, mode):
+def validate_market(m, history, mode, exclude_mode="none"):
     if m.get('closed') or m.get('umaResolutionStatus') == 'resolved':
         return False, "Market closed or resolved"
     if not m.get('active'):
@@ -228,9 +245,17 @@ def validate_market(m, history, mode):
         return False, "Invalid outcomes structure"
 
     market_id = m.get('id')
-    if mode == "discover" and (market_id in history.get("predicted", {}) or market_id in history.get("skipped", {})):
-        return False, "Already predicted or skipped"
-        
+    
+    # --- DYNAMIC EXCLUSION FILTER ---
+    if mode == "discover":
+        if market_id in history.get("predicted", {}) or market_id in history.get("skipped", {}):
+            return False, "Already predicted or skipped"
+    elif mode == "target":
+        if exclude_mode in ["predicted", "both"] and market_id in history.get("predicted", {}):
+            return False, "Already predicted"
+        if exclude_mode in ["skipped", "both"] and market_id in history.get("skipped", {}):
+            return False, "Already skipped"
+            
     _, _, pm_mid = extract_prices(m)
     if pm_mid is None:
         return False, "Broken or missing price data from API"
@@ -252,7 +277,7 @@ def validate_market(m, history, mode):
             
     return True, "Valid"
 
-def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0):
+def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0, exclude_mode="none"):
     if mode == "discover":
         seen_categories = set()
         while True:
@@ -291,7 +316,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     m['parent_slug'] = event.get('slug', 'unknown')
                     m['parent_name'] = event.get('title', 'unknown')
                     
-                    is_valid, reason = validate_market(m, history, mode)
+                    is_valid, reason = validate_market(m, history, mode, exclude_mode)
                     if is_valid: 
                         valid_markets.append(m)
                     elif reason.startswith("Non-binary"):
@@ -316,7 +341,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     for m in event.get('markets', []):
                         m['parent_slug'] = event.get('slug', 'unknown')
                         m['parent_name'] = event.get('title', 'unknown')
-                        is_valid, reason = validate_market(m, history, mode)
+                        is_valid, reason = validate_market(m, history, mode, exclude_mode)
                         if is_valid: yield m
                         else: print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")
             except Exception as e:
@@ -339,7 +364,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     m['parent_slug'] = m.get('slug', 'unknown') 
                     m['parent_name'] = m.get('question', 'unknown')
                     
-                    is_valid, reason = validate_market(m, history, mode)
+                    is_valid, reason = validate_market(m, history, mode, exclude_mode)
                     if is_valid: 
                         yield m
                     else:
@@ -353,7 +378,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
             except Exception:
                 continue
 
-def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0):
+def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0, exclude_mode="none"):
     history = update_resolutions(load_history())
     base_ego = calculate_base_ego(history)
     
@@ -362,7 +387,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
     print(f"Bankroll       : ${BANKROLL:,.2f}")
     print(f"Base Ego       : {base_ego:.3f} (Brier Score Ratio)\n")
     
-    market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset)
+    market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset, exclude_mode)
 
     portfolio_data = []
     session_trades = {}
@@ -475,12 +500,22 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 lower, upper, pm_bid, pm_ask, fee_rate, BANKROLL, base_ego
             )
             
+            res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
+            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+            days_until = seconds_left / 86400.0
+
+            roi, apy = calculate_annualized_yield(edge, true_price, days_until)
+
             history["predicted"][market_id] = {
                 "question": question,
                 "slug": event_slug,
                 "date": today_str,
                 "pu": (lower + upper) / 2.0,
-                "pm": pm_mid
+                "pm": pm_mid,
+                "dynamic_ego": dynamic_ego,
+                "kelly": raw_kelly,
+                "edge": edge,
+                "apy": apy
             }
             history["skipped"].pop(market_id, None)
             
@@ -489,7 +524,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             print(f"User Bounds  : {lower*100:.1f}% to {upper*100:.1f}% (Spread: {(upper-lower)*100:.1f}%)")
             print(f"Dynamic Ego  : {dynamic_ego:.2f} (Base {base_ego:.2f})")
             
-            if final_alloc > 0.01:
+            if action in ["YES", "NO"]:
                 cumulative_exposure += final_alloc / BANKROLL
                 session_trades[market_id] = final_alloc
                 
@@ -497,6 +532,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
                 print(f"KELLY %      : {raw_kelly*100:.2f}% of bankroll")
                 print(f"ALLOCATION   : ${final_alloc:,.2f}")
+                print(f"APY          : {apy*100:.2f}% (Compounded)")
                 
                 portfolio_data.append({
                     "Question": question[:50] + "..",
@@ -508,7 +544,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             else:
                 if action == "THIN_EDGE": reason = f"Edge below {MIN_EDGE*100}% threshold"
                 elif action == "NONE": reason = "Trapped inside bid-ask spread"
-                else: reason = "No mathematical edge"
+                else: reason = "Unknown"
                 
                 print(f"ACTION       : $0 Allocation ({reason})")
                 print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
@@ -536,7 +572,8 @@ if __name__ == "__main__":
         
         targets = None
         category = "All"
-        session_max_offset = 0 
+        session_max_offset = 0
+        target_exclude_mode = "none" # Default initialization
         
         if choice == "5":
             print("Exiting program.")
@@ -566,6 +603,17 @@ if __name__ == "__main__":
                 continue
             else:
                 print(f"Parsed Targets ({len(targets)}): {', '.join(targets)}")
+                
+            # --- TARGET MODE EXCLUSION MENU ---
+            print("\nTarget Mode - Select Exclusion Filter:")
+            print(" 1: None (Target all markets)")
+            print(" 2: Exclude Already Predicted")
+            print(" 3: Exclude Already Skipped")
+            print(" 4: Exclude Both (Predicted + Skipped)")
+            
+            ex_choice = input("> ").strip()
+            target_exclude_mode = {"2": "predicted", "3": "skipped", "4": "both"}.get(ex_choice, "none")
+                
             op_mode, sub_mode = "target", "all"
             
         elif choice == "1":
@@ -611,7 +659,7 @@ if __name__ == "__main__":
             print("Invalid selection. Please choose 1-5.")
             continue
             
-        portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset)
+        portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset, exclude_mode=target_exclude_mode)
         
         if portfolio is not None and not portfolio.empty:
             print("\n--- Final Session Allocations ---")

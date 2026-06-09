@@ -10,7 +10,7 @@ PAGE_SIZE = 40  # Rows per terminal page
 api = requests.Session()
 
 def extract_market_metrics(m):
-    """Safely extracts base metrics, calculating spreads, velocities, and annualized yields."""
+    """Safely extracts base metrics, calculating spreads and velocities."""
     # Base Odds (Strict parsing to handle API strings vs lists)
     try: 
         prices = m.get('outcomePrices')
@@ -46,14 +46,8 @@ def extract_market_metrics(m):
     
     # --- SYNTHESIZED METRICS ---
     velocity = (m_24h / m_vol) if m_vol > 0 else 0.0
-    
-    # Yield requires a valid, positive time horizon
-    if seconds_left and seconds_left > 0 and 0.01 < odds < 0.99:
-        ann_yield = ((1.0 / odds) - 1.0) * (365.0 / (seconds_left / 86400.0))
-    else:
-        ann_yield = 0.0
         
-    return odds, spread, seconds_left, m_vol, m_24h, velocity, ann_yield, m_liq
+    return odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq
 
 def fetch_global_overview(fetch_depth=2000, top_x=20):
     """Sweeps the platform to build a macro view of categories and liquidity distribution."""
@@ -207,7 +201,7 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
                 if not m.get('active') or m.get('closed') or m.get('umaResolutionStatus') == 'resolved':
                     continue
                     
-                odds, spread, seconds_left, m_vol, m_24h, velocity, ann_yield, m_liq = extract_market_metrics(m)
+                odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq = extract_market_metrics(m)
                 
                 # STRICT PIPELINE FILTER: Discard null dates or expired markets
                 if seconds_left is None or seconds_left <= 0:
@@ -223,7 +217,6 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
                     "m_24h": m_24h,
                     "m_liq": m_liq,
                     "velocity": velocity,
-                    "yield": ann_yield,
                     "odds": odds,
                     "spread": spread,
                     "seconds": seconds_left
@@ -256,7 +249,7 @@ def print_global_summary(markets, total_oi):
     print(f" Total Volume        : ${total_vol:,.0f}")
     print(f" Total 24h Volume    : ${total_24h:,.0f}")
     print(f" Total Liquidity     : ${total_liq:,.0f}")
-    print(f" Total Open Interest : ${total_oi:,.0f}") # Accurately injected globally
+    print(f" Total Open Interest : ${total_oi:,.0f}")
     print(f" Avg Market Velocity : {avg_velocity*100:.1f}%")
     print(f" Avg Platform Spread : {avg_spread*100:.2f}%")
     print("="*70 + "\n")
@@ -268,9 +261,8 @@ def sort_markets(markets, sort_mode, reverse_sort):
         "2": ("m_24h", True),    # 24h Volume
         "3": ("m_liq", True),    # Liquidity
         "4": ("velocity", True), # Velocity
-        "5": ("yield", True),    # Annualized Yield
-        "6": ("spread", False),  # Tightest Spread 
-        "7": ("seconds", False)  # Resolving Soonest
+        "5": ("spread", False),  # Tightest Spread 
+        "6": ("seconds", False)  # Resolving Soonest
     }
     
     key, default_rev = sort_map.get(sort_mode, ("m_vol", True))
@@ -287,12 +279,12 @@ def display_pager(markets, show_odds):
     while current_idx < total_markets:
         chunk = markets[current_idx : current_idx + PAGE_SIZE]
         
-        print("=" * 175)
-        header = f"{'Mkt Vol':<9} | {'24h Vol':<8} | {'Liq':<8} | {'Vel %':<5} | {'Spread':<6} | {'Ann. Yld':<8} | {'Ends In':<12} | "
+        print("=" * 165)
+        header = f"{'Mkt Vol':<9} | {'24h Vol':<8} | {'Liq':<8} | {'Vel %':<5} | {'Spread':<6} | {'Ends In':<12} | "
         if show_odds: header += f"{'Odds':<5} | "
         header += f"{'Target URL Slug':<35} | Market Question"
         print(header)
-        print("=" * 175)
+        print("=" * 165)
         
         for m in chunk:
             m_vol_str = f"${m['m_vol']:,.0f}"
@@ -301,9 +293,6 @@ def display_pager(markets, show_odds):
             
             vel_str = f"{m['velocity']*100:.0f}%"
             spr_str = f"{m['spread']*100:.1f}%"
-            
-            yld = m['yield'] * 100
-            yld_str = f"{yld:,.0f}%" if yld < 10000 else ">10k%"
             
             # --- Exact Seconds Formatting Logic ---
             secs = m['seconds']
@@ -321,13 +310,13 @@ def display_pager(markets, show_odds):
 
             odds_str = f"{m['odds']*100:.1f}%"
             
-            row = f"{m_vol_str:<9} | {h24_str:<8} | {liq_str:<8} | {vel_str:<5} | {spr_str:<6} | {yld_str:<8} | {time_str:<12} | "
+            row = f"{m_vol_str:<9} | {h24_str:<8} | {liq_str:<8} | {vel_str:<5} | {spr_str:<6} | {time_str:<12} | "
             if show_odds: row += f"{odds_str:<5} | "
             row += f"{m['target_slug']:<35} | {m['question']}"
             
             print(row)
             
-        print("=" * 175)
+        print("=" * 165)
         
         current_idx += PAGE_SIZE
         if current_idx >= total_markets:
@@ -342,7 +331,7 @@ def run_interactive_analyzer():
     
     while True:
         print(f"\n1. Category Filter : [{category}]")
-        print(f"2. Sort Metric     : [{'Vol' if sort_mode=='1' else '24h Vol' if sort_mode=='2' else 'Liquidity' if sort_mode=='3' else 'Velocity' if sort_mode=='4' else 'Yield' if sort_mode=='5' else 'Spread' if sort_mode=='6' else 'Time Left'}]")
+        print(f"2. Sort Metric     : [{'Vol' if sort_mode=='1' else '24h Vol' if sort_mode=='2' else 'Liquidity' if sort_mode=='3' else 'Velocity' if sort_mode=='4' else 'Spread' if sort_mode=='5' else 'Time Left'}]")
         print(f"3. Reverse Sort    : [{'ON' if reverse_sort else 'OFF'}]")
         print(f"4. View Odds       : [{'ON' if show_odds else 'OFF'}]")
         print("5. Execute Scan & View Data")
@@ -354,9 +343,9 @@ def run_interactive_analyzer():
         elif choice == "1":
             category = input("Enter Category (e.g., 'Politics', 'Crypto') or 'All': ").strip().title() or "All"
         elif choice == "2":
-            print("Sort by: [1] Vol [2] 24h Vol [3] Liquidity [4] Velocity [5] Ann. Yld [6] Spread [7] Soonest")
+            print("Sort by: [1] Vol [2] 24h Vol [3] Liquidity [4] Velocity [5] Spread [6] Soonest")
             s_choice = input("> ").strip()
-            if s_choice in ["1", "2", "3", "4", "5", "6", "7"]: sort_mode = s_choice
+            if s_choice in ["1", "2", "3", "4", "5", "6"]: sort_mode = s_choice
         elif choice == "3":
             reverse_sort = not reverse_sort
         elif choice == "4":
