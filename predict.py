@@ -80,14 +80,23 @@ def update_resolutions(history):
                     else: outcome = 0.5 
                 else: outcome = 0.5
                 
-                pred_data = history["predicted"][market_id]
-                history["resolved"][market_id] = {
-                    "question": pred_data.get("question", "unknown"),
-                    "slug": pred_data.get("slug", "unknown"),
-                    "pu": pred_data.get("pu", 0.5),
-                    "pm": pred_data.get("pm", 0.5),
-                    "outcome": outcome
-                }
+                pred_list = history["predicted"][market_id]
+                # Backwards compatibility
+                if isinstance(pred_list, dict): pred_list = [pred_list]
+                
+                if market_id not in history["resolved"]:
+                    history["resolved"][market_id] = []
+                    
+                for pred_data in pred_list:
+                    history["resolved"][market_id].append({
+                        "question": pred_data.get("question", "unknown"),
+                        "slug": pred_data.get("slug", "unknown"),
+                        "pu": pred_data.get("pu", 0.5),
+                        "pm": pred_data.get("pm", 0.5),
+                        "kelly": pred_data.get("kelly", 0.0), # Save the weight
+                        "outcome": outcome
+                    })
+                    
                 del history["predicted"][market_id]
                 resolved_count += 1
         except Exception:
@@ -102,13 +111,37 @@ def calculate_base_ego(history):
     if not resolved: return 0.50 
         
     bs_u_total, bs_m_total = 0.0, 0.0
-    for data in resolved.values():
-        outcome = data.get("outcome", 0)
-        bs_u_total += (data.get("pu", 0.5) - outcome) ** 2
-        bs_m_total += (data.get("pm", 0.5) - outcome) ** 2
+    total_weight = 0.0
+    
+    for market_preds in resolved.values():
+        # Backwards compatibility: wrap old dicts in a list
+        if isinstance(market_preds, dict):
+            market_preds = [market_preds]
+            
+        for data in market_preds:
+            outcome = data.get("outcome", 0)
+            
+            # Fetch the Kelly fraction used
+            weight = data.get("kelly", 0.0)
+            
+            if weight <= 0: 
+                continue 
+                
+            # Kelly-Weighted Brier Penalty
+            bs_u_total += weight * ((data.get("pu", 0.5) - outcome) ** 2)
+            bs_m_total += weight * ((data.get("pm", 0.5) - outcome) ** 2)
+            total_weight += weight
+            
+    # If there are resolved markets, but all of them had $0 allocated
+    if total_weight == 0:
+        return 0.50
+            
+    if total_weight > 0:
+        bs_u_total /= total_weight
+        bs_m_total /= total_weight
         
     print(f"[*] Current Brier Score - User: {bs_u_total:.4f} | Market: {bs_m_total:.4f}")
-    # If both scores are zero (e.g., no resolved markets or perfect predictions), return neutral ego of 0.5
+    
     if bs_u_total == 0 and bs_m_total == 0: return 0.50 
     return bs_m_total / (bs_u_total + bs_m_total)
 
@@ -506,17 +539,26 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
 
             roi, apy = calculate_annualized_yield(edge, true_price, days_until)
 
-            history["predicted"][market_id] = {
+            # 1. Ensure the market ID key contains a list
+            if market_id not in history["predicted"]:
+                history["predicted"][market_id] = []
+            elif isinstance(history["predicted"][market_id], dict):
+                # Backwards compatibility for old dict entries
+                history["predicted"][market_id] = [history["predicted"][market_id]]
+            
+            # 2. Append the new independent prediction tranche
+            history["predicted"][market_id].append({
                 "question": question,
                 "slug": event_slug,
                 "date": today_str,
                 "pu": (lower + upper) / 2.0,
                 "pm": pm_mid,
                 "dynamic_ego": dynamic_ego,
-                "kelly": raw_kelly,
+                "kelly": raw_kelly, # Required for new Weighted Brier calculation
                 "edge": edge,
                 "apy": apy
-            }
+            })
+            
             history["skipped"].pop(market_id, None)
             
             print(f"\n--- MARKET ANALYSIS ---")
