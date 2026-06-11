@@ -92,6 +92,7 @@ def update_resolutions(history):
                     history["resolved"][market_id].append({
                         "question": pred_data.get("question", "unknown"),
                         "slug": pred_data.get("slug", "unknown"),
+                        "date": pred_data.get("date", "unknown"),
                         "pu": pred_data.get("pu", 0.5),
                         "pm": pred_data.get("pm", 0.5),
                         "kelly": pred_data.get("kelly", 0.0), # Save the weight
@@ -106,6 +107,172 @@ def update_resolutions(history):
     if resolved_count > 0:
         print(f"[+] BACKGROUND SYSTEM: Auto-resolved and scored {resolved_count} closed markets.")
     return history
+
+def print_review_table(history, sub_mode):
+    # 1. Gather all items according to sub_mode
+    rows = []
+    
+    # Gather predicted
+    if sub_mode in ["predicted", "all"]:
+        for market_id, value in history.get("predicted", {}).items():
+            preds = value if isinstance(value, list) else [value]
+            for pred in preds:
+                rows.append({
+                    "Mode": "predicted",
+                    "Market ID": market_id,
+                    "Date": pred.get("date", "unknown"),
+                    "Question": pred.get("question", "unknown"),
+                    "Web Link": f"https://polymarket.com/event/{pred.get('slug', 'unknown')}",
+                    "Kelly": pred.get("kelly", 0.0),
+                    "APY": pred.get("apy", 0.0),
+                    "Edge": pred.get("edge", 0.0),
+                    "pu": pred.get("pu", 0.5),
+                    "pm": pred.get("pm", 0.5),
+                    "Outcome": ""
+                })
+                
+    # Gather skipped
+    if sub_mode in ["skipped", "all"]:
+        for market_id, value in history.get("skipped", {}).items():
+            rows.append({
+                "Mode": "skipped",
+                "Market ID": market_id,
+                "Date": value.get("date", "unknown"),
+                "Question": value.get("question", "unknown"),
+                "Web Link": f"https://polymarket.com/event/{value.get('slug', 'unknown')}"
+            })
+            
+    # Gather resolved
+    if sub_mode in ["resolved", "all"]:
+        for market_id, value in history.get("resolved", {}).items():
+            resolutions = value if isinstance(value, list) else [value]
+            for res in resolutions:
+                rows.append({
+                    "Mode": "resolved",
+                    "Market ID": market_id,
+                    "Date": res.get("date", "unknown"),
+                    "Question": res.get("question", "unknown"),
+                    "Web Link": f"https://polymarket.com/event/{res.get('slug', 'unknown')}",
+                    "Kelly": res.get("kelly", 0.0),
+                    "pu": res.get("pu", 0.5),
+                    "pm": res.get("pm", 0.5),
+                    "Outcome": str(res.get("outcome", 0.5))
+                })
+
+    if not rows:
+        print(f"\n[!] No markets found in history for sub-mode: '{sub_mode}'")
+        return
+
+    # 2. Get Sorting Option
+    sort_by = "date"
+    if sub_mode == "predicted":
+        print("\nSort 'predicted' by:")
+        print(" 1: Date (default)")
+        print(" 2: Kelly")
+        print(" 3: APY")
+        print(" 4: Edge")
+        sort_choice = input("> ").strip()
+        sort_by = {"2": "kelly", "3": "apy", "4": "edge"}.get(sort_choice, "date")
+    elif sub_mode == "resolved":
+        print("\nSort 'resolved' by:")
+        print(" 1: Date (default)")
+        print(" 2: Kelly")
+        sort_choice = input("> ").strip()
+        sort_by = {"2": "kelly"}.get(sort_choice, "date")
+
+    # 3. Sort rows (all sort directions are descending for dates and metrics)
+    if sort_by == "date":
+        rows.sort(key=lambda x: x.get("Date", "unknown") if x.get("Date", "unknown") != "unknown" else "", reverse=True)
+    elif sort_by == "kelly":
+        rows.sort(key=lambda x: x.get("Kelly", 0.0), reverse=True)
+    elif sort_by == "apy":
+        rows.sort(key=lambda x: x.get("APY", 0.0), reverse=True)
+    elif sort_by == "edge":
+        rows.sort(key=lambda x: x.get("Edge", 0.0), reverse=True)
+
+    # 4. Format and Print Table manually (with Question hyperlinked to Web Link)
+    if sub_mode == "predicted":
+        headers = ["Date", "Question", "Kelly", "APY", "Edge", "pu", "pm"]
+        widths = [16, 60, 8, 8, 8, 6, 6]
+        aligns = ["left", "left", "right", "right", "right", "right", "right"]
+    elif sub_mode == "skipped":
+        headers = ["Date", "Question"]
+        widths = [16, 80]
+        aligns = ["left", "left"]
+    elif sub_mode == "resolved":
+        headers = ["Date", "Question", "Kelly", "pu", "pm", "Outcome"]
+        widths = [16, 60, 8, 6, 6, 8]
+        aligns = ["left", "left", "right", "right", "right", "left"]
+    else: # "all"
+        headers = ["Mode", "Date", "Question", "Kelly", "Edge", "Outcome"]
+        widths = [10, 16, 60, 8, 8, 8]
+        aligns = ["left", "left", "left", "right", "right", "left"]
+
+    def format_cell(text, width, align):
+        if align == "right":
+            return str(text).rjust(width)[:width]
+        return str(text).ljust(width)[:width]
+
+    header_parts = []
+    for h, w, a in zip(headers, widths, aligns):
+        header_parts.append(format_cell(h, w, a))
+    header_str = " | ".join(header_parts)
+    separator_str = "-+-".join(["-" * w for w in widths])
+    
+    print("\n" + "=" * len(header_str))
+    print(f" [HISTORY TABLE: {sub_mode.upper()} - sorted by {sort_by.upper()}] ".center(len(header_str), "="))
+    print("=" * len(header_str))
+    print(header_str)
+    print(separator_str)
+
+    for r in rows:
+        kelly_val = r.get("Kelly")
+        apy_val = r.get("APY")
+        edge_val = r.get("Edge")
+        pu_val = r.get("pu")
+        pm_val = r.get("pm")
+        
+        kelly_str = f"{kelly_val*100:.2f}%" if kelly_val is not None else "-"
+        apy_str = f"{apy_val*100:.2f}%" if apy_val is not None else "-"
+        edge_str = f"{edge_val*100:.2f}%" if edge_val is not None else "-"
+        pu_str = f"{pu_val*100:.1f}%" if pu_val is not None else "-"
+        pm_str = f"{pm_val*100:.1f}%" if pm_val is not None else "-"
+        
+        outcome_val = r.get("Outcome")
+        if outcome_val == "1.0": outcome_str = "YES"
+        elif outcome_val == "0.0": outcome_str = "NO"
+        elif outcome_val == "0.5": outcome_str = "HALF"
+        else: outcome_str = "-"
+        
+        # Populate row values based on sub_mode
+        if sub_mode == "predicted":
+            vals = [r["Date"], r["Question"], kelly_str, apy_str, edge_str, pu_str, pm_str]
+            q_idx = 1
+        elif sub_mode == "skipped":
+            vals = [r["Date"], r["Question"]]
+            q_idx = 1
+        elif sub_mode == "resolved":
+            vals = [r["Date"], r["Question"], kelly_str, pu_str, pm_str, outcome_str]
+            q_idx = 1
+        else: # "all"
+            vals = [r["Mode"].upper(), r["Date"], r["Question"], kelly_str, edge_str, outcome_str]
+            q_idx = 2
+            
+        row_parts = []
+        for i, (v, w, a) in enumerate(zip(vals, widths, aligns)):
+            if i == q_idx:
+                if len(v) > w:
+                    q_visible = v[:w-3] + "..."
+                else:
+                    q_visible = v
+                q_padded = q_visible.ljust(w)
+                # Hyperlink visible text to polymarket event page
+                row_parts.append(f"\033]8;;{r['Web Link']}\033\\{q_padded}\033]8;;\033\\")
+            else:
+                row_parts.append(format_cell(v, w, a))
+                
+        print(" | ".join(row_parts))
+    print("=" * len(header_str) + "\n")
 
 def calculate_base_ego(history):
     resolved = history.get("resolved", {})
@@ -136,10 +303,9 @@ def calculate_base_ego(history):
     # If there are resolved markets, but all of them had $0 allocated
     if total_weight == 0:
         return 0.50
-            
-    if total_weight > 0:
-        bs_u_total /= total_weight
-        bs_m_total /= total_weight
+
+    bs_u_total /= total_weight
+    bs_m_total /= total_weight
         
     print(f"[*] Current Brier Score - User: {bs_u_total:.4f} | Market: {bs_m_total:.4f}")
     
@@ -429,25 +595,48 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
 
 def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0, exclude_mode="none"):
     history = update_resolutions(load_history())
+    save_history(stringify_overflow(history))
+    
+    if mode == "review":
+        print_review_table(history, sub_mode)
+        
+        has_active_markets = False
+        if sub_mode in ["predicted", "all"] and history.get("predicted"):
+            has_active_markets = True
+        if sub_mode in ["skipped", "all"] and history.get("skipped"):
+            has_active_markets = True
+            
+        if not has_active_markets:
+            print("[*] No active/open markets to review in this sub-mode. Returning to main menu.")
+            return None
+            
+        review_choice = input("Do you want to run a prediction review session on the active markets in this selection? (y/n): ").strip().lower()
+        if review_choice != 'y':
+            return None
+            
     base_ego = calculate_base_ego(history)
     
     print(f"\n--- Starting Session [{mode.upper()} - {sub_mode.upper()}] ---")
     if mode == "discover": print(f"Category Filter: {category.upper()}")
     print(f"Bankroll       : ${BANKROLL:,.2f}")
-    print(f"Base Ego       : {base_ego:.3f} (Brier Score Ratio)\n")
+    print(f"Base Ego       : {base_ego:.3f} (Brier Score Ratio)")
     
     market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset, exclude_mode)
 
     portfolio_data = []
     session_trades = {}
-    cumulative_exposure = 0.0 
-    session_markets = [] 
+    
+    # Seed cumulative exposure from existing predicted history
+    cumulative_exposure = 0.0
+    for pred_value in history.get("predicted", {}).values():
+        preds = pred_value if isinstance(pred_value, list) else [pred_value]
+        for p in preds:
+            cumulative_exposure += p.get("kelly", 0.0)
+    print(f"Past Exposure  : {cumulative_exposure*100:.1f}% of Bankroll Used\n")
+    session_markets = []
     current_index = 0
     
     while True:
-        if cumulative_exposure >= 1.0:
-            print(f"\n[!] Maximum capital exposure reached. Session ending.")
-            break
             
         if current_index >= len(session_markets):
             try:
@@ -706,12 +895,12 @@ if __name__ == "__main__":
                 
         elif choice == "2":
             while True:
-                review_mode = input("\nReview Mode - Select Sub-Mode:\n 1: 'Predicted' Markets\n 2: 'Skipped' Markets\n 3: All (Predicted + Skipped)\n> ").strip()
-                if review_mode in ["1", "2", "3"]:
+                review_mode = input("\nReview Mode - Select Sub-Mode:\n 1: 'Predicted' Markets\n 2: 'Skipped' Markets\n 3: 'Resolved' Markets\n 4: All (Predicted + Skipped + Resolved)\n> ").strip()
+                if review_mode in ["1", "2", "3", "4"]:
                     op_mode = "review"
-                    sub_mode = {"1": "predicted", "2": "skipped", "3": "all"}[review_mode]
+                    sub_mode = {"1": "predicted", "2": "skipped", "3": "resolved", "4": "all"}[review_mode]
                     break
-                print("Invalid selection. Please choose 1, 2, or 3.")
+                print("Invalid selection. Please choose 1, 2, 3, or 4.")
                 
         else:
             print("Invalid selection. Please choose 1-5.")

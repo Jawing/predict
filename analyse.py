@@ -256,6 +256,9 @@ def print_global_summary(markets, total_oi):
 
 def sort_markets(markets, sort_mode, reverse_sort):
     """Sorts the flattened list based on selected metric and direction."""
+    if sort_mode == "7":
+        return markets[::-1] if reverse_sort else markets
+        
     sort_map = {
         "1": ("m_vol", True),    # Total Volume
         "2": ("m_24h", True),    # 24h Volume
@@ -331,7 +334,7 @@ def run_interactive_analyzer():
     
     while True:
         print(f"\n1. Category Filter : [{category}]")
-        print(f"2. Sort Metric     : [{'Vol' if sort_mode=='1' else '24h Vol' if sort_mode=='2' else 'Liquidity' if sort_mode=='3' else 'Velocity' if sort_mode=='4' else 'Spread' if sort_mode=='5' else 'Time Left'}]")
+        print(f"2. Sort Metric     : [{'Vol' if sort_mode=='1' else '24h Vol' if sort_mode=='2' else 'Liquidity' if sort_mode=='3' else 'Velocity' if sort_mode=='4' else 'Spread' if sort_mode=='5' else 'Time Left' if sort_mode=='6' else 'None'}]")
         print(f"3. Reverse Sort    : [{'ON' if reverse_sort else 'OFF'}]")
         print(f"4. View Odds       : [{'ON' if show_odds else 'OFF'}]")
         print("5. Execute Scan & View Data")
@@ -343,9 +346,9 @@ def run_interactive_analyzer():
         elif choice == "1":
             category = input("Enter Category (e.g., 'Politics', 'Crypto') or 'All': ").strip().title() or "All"
         elif choice == "2":
-            print("Sort by: [1] Vol [2] 24h Vol [3] Liquidity [4] Velocity [5] Spread [6] Soonest")
+            print("Sort by: [1] Vol [2] 24h Vol [3] Liquidity [4] Velocity [5] Spread [6] Soonest [7] No Sorting")
             s_choice = input("> ").strip()
-            if s_choice in ["1", "2", "3", "4", "5", "6"]: sort_mode = s_choice
+            if s_choice in ["1", "2", "3", "4", "5", "6", "7"]: sort_mode = s_choice
         elif choice == "3":
             reverse_sort = not reverse_sort
         elif choice == "4":
