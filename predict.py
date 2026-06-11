@@ -12,6 +12,7 @@ import numpy as np
 HISTORY_FILE = "prediction_history.json"
 BANKROLL = 42.00
 GAMMA_API = "https://gamma-api.polymarket.com"
+POLYGON_WALLET = ""  # Set your wallet address (0x...) to auto-fetch USDC balance
 
 # --- FILTERING PARAMETERS ---
 MIN_EDGE = 0.00      # X% minimum mathematical edge to bother executing (e.g., 0.01 = 1%)
@@ -20,6 +21,248 @@ MIN_DAYS = 0         # Ignore markets resolving within X days (e.g., 1 day = 24h
 EXTREME_ODDS = 0.00  # Ignore tail-odds markets below X% (e.g., 0.01 = 1%)
 
 api = requests.Session()
+
+from utils import ensure_list, parse_outcome_prices, format_time_remaining, stringify_overflow
+
+def get_wallet_usdc_balance(wallet_address):
+    if not wallet_address or not wallet_address.startswith("0x"):
+        return None
+    rpcs = [
+        "https://polygon-rpc.com",
+        "https://polygon.llamarpc.com",
+        "https://rpc.ankr.com/polygon"
+    ]
+    usdc_contract = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+    addr_clean = wallet_address.lower().replace('0x', '').zfill(64)
+    data = '0x70a08231' + addr_clean
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": usdc_contract, "data": data}, "latest"],
+        "id": 1
+    }
+    for rpc in rpcs:
+        try:
+            resp = api.post(rpc, json=payload, timeout=3).json()
+            result_hex = resp.get("result", "0x0")
+            return int(result_hex, 16) / 10**6
+        except Exception:
+            continue
+    return None
+
+def calculate_vwap(asks, target_usdc):
+    if not asks or target_usdc <= 0:
+        return 0.0, 0.0
+    total_shares = 0.0
+    remaining_usdc = target_usdc
+    total_spent = 0.0
+    for ask in asks:
+        try:
+            price = float(ask['price'])
+            size = float(ask['size'])
+        except Exception:
+            continue
+        if price <= 0:
+            continue
+        max_usdc_at_this_level = price * size
+        if remaining_usdc >= max_usdc_at_this_level:
+            total_shares += size
+            remaining_usdc -= max_usdc_at_this_level
+            total_spent += max_usdc_at_this_level
+        else:
+            shares = remaining_usdc / price
+            total_shares += shares
+            total_spent += remaining_usdc
+            remaining_usdc = 0.0
+            break
+    if total_shares > 0:
+        vwap = total_spent / total_shares
+        return vwap, total_spent
+    return 0.0, 0.0
+
+def refresh_prices_from_clob(m):
+    clob_ids_str = m.get('clobTokenIds')
+    if not clob_ids_str:
+        return m
+    try:
+        clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
+        if not clob_ids or len(clob_ids) == 0:
+            return m
+        yes_token = clob_ids[0]
+        r = api.get(f"https://clob.polymarket.com/book?token_id={yes_token}", timeout=5)
+        if r.status_code == 200:
+            book = r.json()
+            bids = [float(b['price']) for b in book.get('bids', [])]
+            asks = [float(a['price']) for a in book.get('asks', [])]
+            if bids and asks:
+                best_bid = max(bids)
+                best_ask = min(asks)
+                m['bestBid'] = best_bid
+                m['bestAsk'] = best_ask
+                midpoint = (best_bid + best_ask) / 2.0
+                m['outcomePrices'] = [midpoint, 1.0 - midpoint]
+    except Exception:
+        pass
+    return m
+
+def import_polymarket_positions(wallet_address, history):
+    global BANKROLL
+    if not wallet_address:
+        wallet_address = input("Enter Polymarket wallet address (0x...): ").strip()
+    if not wallet_address.startswith("0x"):
+        print("[!] Invalid address format.")
+        return history
+        
+    base_ego = calculate_base_ego(history)
+        
+    print(f"[*] Fetching positions from Polymarket for {wallet_address}...")
+    try:
+        url = f"https://data-api.polymarket.com/positions?user={wallet_address}"
+        positions = api.get(url, timeout=10).json()
+    except Exception as e:
+        print(f"[!] Error fetching positions: {e}")
+        return history
+        
+    if not positions:
+        print("[*] No positions found on Polymarket for this user.")
+        return history
+        
+    print("[*] Calculating Live Portfolio Value...")
+    cash_balance = get_wallet_usdc_balance(wallet_address) or 0.0
+    portfolio_value = 0.0
+    
+    for pos in positions:
+        size = float(pos.get("size", 0.0))
+        avg_price = float(pos.get("avgPrice", 0.0))
+        # Polymarket data API often provides currentValue, otherwise fallback to cost basis (initialValue)
+        value = float(pos.get("currentValue", pos.get("initialValue", size * avg_price)))
+        portfolio_value += value
+        
+    BANKROLL = cash_balance + portfolio_value
+    print(f"[+] Live Bankroll Updated: ${BANKROLL:,.2f} (Cash: ${cash_balance:,.2f} | Portfolio: ${portfolio_value:,.2f})")
+    
+    print(f"[+] Found {len(positions)} positions. Importing new ones...")
+    imported_predicted = 0
+    imported_resolved = 0
+    
+    for pos in positions:
+        cond_id = pos.get("conditionId")
+        if not cond_id:
+            continue
+            
+        # Check if already in history (under predicted or resolved keys)
+        already_stored = False
+        for m_id, preds in history.get("predicted", {}).items():
+            preds_list = ensure_list(preds)
+            if any(p.get("conditionId") == cond_id for p in preds_list):
+                already_stored = True
+                break
+        if not already_stored:
+            for m_id, res in history.get("resolved", {}).items():
+                res_list = ensure_list(res)
+                if any(r.get("conditionId") == cond_id for r in res_list):
+                    already_stored = True
+                    break
+                    
+        if already_stored:
+            continue
+            
+        # Query Gamma API to resolve metadata
+        try:
+            resp = api.get(f"{GAMMA_API}/markets?conditionId={cond_id}", timeout=5).json()
+            if not resp or not isinstance(resp, list):
+                continue
+            m = resp[0]
+        except Exception:
+            continue
+            
+        market_id = m.get("id")
+        question = m.get("question")
+        slug = m.get("slug")
+        
+        # Calculate attributes
+        avg_price = float(pos.get("avgPrice", 0.5))
+        size = float(pos.get("size", 0.0))
+        initial_val = float(pos.get("initialValue", size * avg_price))
+        
+        # Avoid zero division
+        kelly_val = initial_val / BANKROLL if BANKROLL > 0 else 0.0
+        
+        outcome_str = pos.get("outcome", "Yes")
+        
+        print(f"\n[IMPORT] Question: {question}")
+        print(f"         Outcome: {outcome_str}  |  Entry Price (pm): {avg_price*100:.1f}%")
+        
+        pu_input = input("         Enter your subjective probability bounds % (e.g., 60-70 or 65) or press enter to skip: ").strip()
+        try:
+            if pu_input:
+                lower, upper = parse_user_input(pu_input)
+            else:
+                lower, upper = avg_price, avg_price
+        except:
+            lower, upper = avg_price, avg_price
+            
+        pu_val = (lower + upper) / 2.0
+        edge = pu_val - avg_price
+        
+        # Reverse-calculate dynamic_ego using the user bounds
+        u_spread = upper - lower
+        m_spread = 0.0 # Unknown historic market spread, assuming fully tight
+        
+        u_conviction = base_ego * (1.0 - u_spread)
+        m_conviction = (1.0 - base_ego) * (1.0 - m_spread)
+        if (u_conviction + m_conviction) > 0:
+            dynamic_ego = u_conviction / (u_conviction + m_conviction)
+        else:
+            dynamic_ego = base_ego
+        
+        if outcome_str == "No":
+            # For 'No', the true subjective probability is 1 - pu. Wait, the user is buying 'No' shares at avgPrice.
+            # Usually, pu for 'No' would be interpreted as the probability of 'No' occurring.
+            # But in the database, `pu` is strictly the probability of `Yes`.
+            # If the user enters the probability of their outcome (No), we should normalize it.
+            # Let's just store the pu as entered if we assume the user understands pu is the probability of Yes.
+            pass
+        
+        # Calculate APY
+        try:
+            res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
+            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+            days_until = seconds_left / 86400.0
+        except:
+            days_until = 0.0
+            
+        _, apy = calculate_annualized_yield(edge, avg_price, days_until)
+        
+        pred_entry = {
+            "question": question,
+            "slug": slug,
+            "date": pos.get("endDate", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")),
+            "pu": pu_val,
+            "pm": avg_price,
+            "dynamic_ego": dynamic_ego,
+            "kelly": kelly_val,
+            "edge": edge,
+            "apy": apy,
+            "conditionId": cond_id
+        }
+        
+        # Put in resolved or predicted based on redeemable status
+        if pos.get("redeemable"):
+            outcome_val = 1.0 if outcome_str == "Yes" else 0.0 if outcome_str == "No" else 0.5
+            pred_entry["outcome"] = outcome_val
+            if market_id not in history["resolved"]:
+                history["resolved"][market_id] = []
+            history["resolved"][market_id].append(pred_entry)
+            imported_resolved += 1
+        else:
+            if market_id not in history["predicted"]:
+                history["predicted"][market_id] = []
+            history["predicted"][market_id].append(pred_entry)
+            imported_predicted += 1
+            
+    print(f"\n[+] Import complete: {imported_predicted} open predictions and {imported_resolved} resolved predictions imported.")
+    return history
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -40,19 +283,15 @@ def save_history(history):
         json.dump(history, f, indent=4)
 
 def extract_prices(m):
-    try:
-        prices = m.get('outcomePrices')
-        if isinstance(prices, str): pm_mid = float(json.loads(prices)[0])
-        elif isinstance(prices, list): pm_mid = float(prices[0])
-        else: return None, None, None
-    except: return None, None, None
-        
+    prices = parse_outcome_prices(m)
+    if len(prices) < 1:
+        return None, None, None
+    pm_mid = prices[0]
     try: 
         pm_bid = float(m.get('bestBid', pm_mid))
         pm_ask = float(m.get('bestAsk', pm_mid))
     except: 
         pm_bid, pm_ask = pm_mid, pm_mid
-        
     return pm_bid, pm_ask, pm_mid
 
 def update_resolutions(history):
@@ -70,20 +309,15 @@ def update_resolutions(history):
             uma_resolved = resp.get("umaResolutionStatus") == "resolved"
             
             if is_closed or uma_resolved:
-                prices_raw = resp.get("outcomePrices")
-                if isinstance(prices_raw, str): prices = [float(x) for x in json.loads(prices_raw)]
-                elif isinstance(prices_raw, list): prices = [float(x) for x in prices_raw]
-                else: prices = [0.5, 0.5]
+                prices = parse_outcome_prices(resp)
+                if len(prices) < 2:
+                    prices = [0.5, 0.5]
                 
-                if len(prices) >= 2:
-                    if prices[0] == 1.0: outcome = 1.0
-                    elif prices[1] == 1.0: outcome = 0.0
-                    else: outcome = 0.5 
-                else: outcome = 0.5
+                if prices[0] == 1.0: outcome = 1.0
+                elif prices[1] == 1.0: outcome = 0.0
+                else: outcome = 0.5 
                 
-                pred_list = history["predicted"][market_id]
-                # Backwards compatibility
-                if isinstance(pred_list, dict): pred_list = [pred_list]
+                pred_list = ensure_list(history["predicted"][market_id])
                 
                 if market_id not in history["resolved"]:
                     history["resolved"][market_id] = []
@@ -109,13 +343,40 @@ def update_resolutions(history):
     return history
 
 def print_review_table(history, sub_mode):
+    TABLE_CONFIGS = {
+        "predicted": {
+            "headers": ["Date", "Question", "Kelly", "APY", "Edge", "pu", "pm"],
+            "widths": [16, 60, 8, 8, 8, 6, 6],
+            "aligns": ["left", "left", "right", "right", "right", "right", "right"],
+            "q_idx": 1
+        },
+        "skipped": {
+            "headers": ["Date", "Question"],
+            "widths": [16, 80],
+            "aligns": ["left", "left"],
+            "q_idx": 1
+        },
+        "resolved": {
+            "headers": ["Date", "Question", "Kelly", "pu", "pm", "Outcome"],
+            "widths": [16, 60, 8, 6, 6, 8],
+            "aligns": ["left", "left", "right", "right", "right", "left"],
+            "q_idx": 1
+        },
+        "all": {
+            "headers": ["Mode", "Date", "Question", "Kelly", "Edge", "Outcome"],
+            "widths": [10, 16, 60, 8, 8, 8],
+            "aligns": ["left", "left", "left", "right", "right", "left"],
+            "q_idx": 2
+        }
+    }
+
     # 1. Gather all items according to sub_mode
     rows = []
     
     # Gather predicted
     if sub_mode in ["predicted", "all"]:
         for market_id, value in history.get("predicted", {}).items():
-            preds = value if isinstance(value, list) else [value]
+            preds = ensure_list(value)
             for pred in preds:
                 rows.append({
                     "Mode": "predicted",
@@ -145,7 +406,7 @@ def print_review_table(history, sub_mode):
     # Gather resolved
     if sub_mode in ["resolved", "all"]:
         for market_id, value in history.get("resolved", {}).items():
-            resolutions = value if isinstance(value, list) else [value]
+            resolutions = ensure_list(value)
             for res in resolutions:
                 rows.append({
                     "Mode": "resolved",
@@ -180,7 +441,7 @@ def print_review_table(history, sub_mode):
         sort_choice = input("> ").strip()
         sort_by = {"2": "kelly"}.get(sort_choice, "date")
 
-    # 3. Sort rows (all sort directions are descending for dates and metrics)
+    # 3. Sort rows
     if sort_by == "date":
         rows.sort(key=lambda x: x.get("Date", "unknown") if x.get("Date", "unknown") != "unknown" else "", reverse=True)
     elif sort_by == "kelly":
@@ -191,22 +452,11 @@ def print_review_table(history, sub_mode):
         rows.sort(key=lambda x: x.get("Edge", 0.0), reverse=True)
 
     # 4. Format and Print Table manually (with Question hyperlinked to Web Link)
-    if sub_mode == "predicted":
-        headers = ["Date", "Question", "Kelly", "APY", "Edge", "pu", "pm"]
-        widths = [16, 60, 8, 8, 8, 6, 6]
-        aligns = ["left", "left", "right", "right", "right", "right", "right"]
-    elif sub_mode == "skipped":
-        headers = ["Date", "Question"]
-        widths = [16, 80]
-        aligns = ["left", "left"]
-    elif sub_mode == "resolved":
-        headers = ["Date", "Question", "Kelly", "pu", "pm", "Outcome"]
-        widths = [16, 60, 8, 6, 6, 8]
-        aligns = ["left", "left", "right", "right", "right", "left"]
-    else: # "all"
-        headers = ["Mode", "Date", "Question", "Kelly", "Edge", "Outcome"]
-        widths = [10, 16, 60, 8, 8, 8]
-        aligns = ["left", "left", "left", "right", "right", "left"]
+    config = TABLE_CONFIGS.get(sub_mode, TABLE_CONFIGS["all"])
+    headers = config["headers"]
+    widths = config["widths"]
+    aligns = config["aligns"]
+    q_idx = config["q_idx"]
 
     def format_cell(text, width, align):
         if align == "right":
@@ -247,16 +497,12 @@ def print_review_table(history, sub_mode):
         # Populate row values based on sub_mode
         if sub_mode == "predicted":
             vals = [r["Date"], r["Question"], kelly_str, apy_str, edge_str, pu_str, pm_str]
-            q_idx = 1
         elif sub_mode == "skipped":
             vals = [r["Date"], r["Question"]]
-            q_idx = 1
         elif sub_mode == "resolved":
             vals = [r["Date"], r["Question"], kelly_str, pu_str, pm_str, outcome_str]
-            q_idx = 1
         else: # "all"
             vals = [r["Mode"].upper(), r["Date"], r["Question"], kelly_str, edge_str, outcome_str]
-            q_idx = 2
             
         row_parts = []
         for i, (v, w, a) in enumerate(zip(vals, widths, aligns)):
@@ -282,10 +528,7 @@ def calculate_base_ego(history):
     total_weight = 0.0
     
     for market_preds in resolved.values():
-        # Backwards compatibility: wrap old dicts in a list
-        if isinstance(market_preds, dict):
-            market_preds = [market_preds]
-            
+        market_preds = ensure_list(market_preds)
         for data in market_preds:
             outcome = data.get("outcome", 0)
             
@@ -329,20 +572,7 @@ def calculate_annualized_yield(edge, true_price, days_until):
         
     return roi, apy
 
-def stringify_overflow(obj):
-    """Recursively converts infinite floats into strings."""
-    if isinstance(obj, float):
-        if obj == float('inf'):
-            return "Infinity"
-        elif obj == float('-inf'):
-            return "-Infinity"
-        elif math.isnan(obj):
-            return "NaN"
-    elif isinstance(obj, dict):
-        return {k: stringify_overflow(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [stringify_overflow(x) for x in obj]
-    return obj
+
 
 def parse_user_input(user_input):
     # Normalize range hyphens into spaces so they aren't mistaken for negative numbers
@@ -481,12 +711,10 @@ def validate_market(m, history, mode, exclude_mode="none"):
         res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
         seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
 
-        if seconds_left <= 0:
-            return False, "Market has already expired"
-            
-        days_until = seconds_left / 86400.0
-        if days_until < MIN_DAYS or days_until > MAX_DAYS:
-            return False, f"Time horizon ({days_until:.1f} days) outside bounds"
+        if seconds_left > 0:
+            days_until = seconds_left / 86400.0
+            if days_until < MIN_DAYS or days_until > MAX_DAYS:
+                return False, f"Time horizon ({days_until:.1f} days) outside bounds"
     except:
         return False, "Invalid end date format"
             
@@ -594,6 +822,18 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 continue
 
 def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0, exclude_mode="none"):
+    global BANKROLL
+    
+    # Live wallet bankroll update
+    if POLYGON_WALLET:
+        print(f"[*] Fetching live USDC balance on Polygon for wallet {POLYGON_WALLET}...")
+        balance = get_wallet_usdc_balance(POLYGON_WALLET)
+        if balance is not None:
+            BANKROLL = balance
+            print(f"[+] Wallet USDC Balance successfully loaded: ${BANKROLL:,.2f}")
+        else:
+            print(f"[!] Failed to fetch live wallet balance. Falling back to default: ${BANKROLL:,.2f}")
+            
     history = update_resolutions(load_history())
     save_history(stringify_overflow(history))
     
@@ -629,7 +869,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
     # Seed cumulative exposure from existing predicted history
     cumulative_exposure = 0.0
     for pred_value in history.get("predicted", {}).values():
-        preds = pred_value if isinstance(pred_value, list) else [pred_value]
+        preds = ensure_list(pred_value)
         for p in preds:
             cumulative_exposure += p.get("kelly", 0.0)
     print(f"Past Exposure  : {cumulative_exposure*100:.1f}% of Bankroll Used\n")
@@ -663,6 +903,11 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 break
                 
         m = session_markets[current_index]
+        # Real-time CLOB update right before display/evaluation
+        m = refresh_prices_from_clob(m)
+        pm_bid, pm_ask, pm_mid = extract_prices(m)
+        m['cached_bid'], m['cached_ask'], m['cached_mid'] = pm_bid, pm_ask, pm_mid
+        
         market_id = m.get('id')
         question = m.get('question', 'unknown')
         event_slug = m.get('parent_slug', 'unknown')
@@ -674,24 +919,19 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             exact_date_str = res_dt.strftime("%B %d, %Y")
             
             seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
-            if seconds_left < 86400:
-                h, rem = divmod(seconds_left, 3600)
-                mn, s = divmod(rem, 60)
-                days_str = f"{int(h)}h {int(mn)}m {int(s)}s"
-            else:
-                days_str = f"{int(seconds_left // 86400)} Days"
+            days_str = format_time_remaining(seconds_left)
         except: exact_date_str, days_str = "unknown", "unknown"
-
+ 
         pm_bid, pm_ask, pm_mid = m['cached_bid'], m['cached_ask'], m['cached_mid']
-
+ 
         print(f"==================================================")
         print(f"Event    : {m.get('parent_name')}")
         print(f"URL      : {event_url}")
         print(f"Market   : {question}")
         print(f"Resolves : {exact_date_str} ({days_str})\n")
-
+ 
         user_input = input("Enter % bounds ('16-51' or '42'), 's' (skip), 'r' (redo), 'q' (quit): ").strip()
-
+ 
         if user_input.lower() == 'q':
             print("\nSaving and quitting session...")
             break
@@ -744,12 +984,42 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
 
             roi, apy = calculate_annualized_yield(edge, true_price, days_until)
 
+            # Walk order book to calculate VWAP and slippage if we have an action and allocation
+            vwap_true = true_price
+            slippage = 0.0
+            adjusted_edge = edge
+            adjusted_apy = apy
+            
+            if action in ["YES", "NO"] and final_alloc > 0:
+                clob_ids_str = m.get('clobTokenIds')
+                asks_list = []
+                if clob_ids_str:
+                    try:
+                        clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
+                        # Index 0 is YES, Index 1 is NO
+                        token_id = clob_ids[0] if action == "YES" else clob_ids[1]
+                        r = api.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
+                        if r.status_code == 200:
+                            book = r.json()
+                            asks_list = book.get('asks', [])
+                    except Exception:
+                        pass
+                if asks_list:
+                    vwap, total_spent = calculate_vwap(asks_list, final_alloc)
+                    if vwap > 0:
+                        vwap_true = vwap + (fee_rate * vwap * (1.0 - vwap))
+                        slippage = vwap_true - true_price
+                        
+                        # Re-calculate edge and APY using VWAP price
+                        win_prob = true_price + edge
+                        adjusted_edge = win_prob - vwap_true
+                        _, adjusted_apy = calculate_annualized_yield(adjusted_edge, vwap_true, days_until)
+
             # 1. Ensure the market ID key contains a list
             if market_id not in history["predicted"]:
                 history["predicted"][market_id] = []
-            elif isinstance(history["predicted"][market_id], dict):
-                # Backwards compatibility for old dict entries
-                history["predicted"][market_id] = [history["predicted"][market_id]]
+            else:
+                history["predicted"][market_id] = ensure_list(history["predicted"][market_id])
             
             # 2. Append the new independent prediction tranche
             history["predicted"][market_id].append({
@@ -760,8 +1030,9 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 "pm": pm_mid,
                 "dynamic_ego": dynamic_ego,
                 "kelly": raw_kelly, # Required for new Weighted Brier calculation
-                "edge": edge,
-                "apy": apy
+                "edge": adjusted_edge,
+                "apy": adjusted_apy,
+                "conditionId": m.get("conditionId")
             })
             
             history["skipped"].pop(market_id, None)
@@ -776,16 +1047,24 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 session_trades[market_id] = final_alloc
                 
                 print(f"ACTION       : BUY {action} @ {true_price*100:.1f}%")
-                print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
+                if slippage > 0:
+                    print(f"VWAP PRICE   : {vwap_true*100:.2f}% (Slippage: +{slippage*100:.2f}%)")
+                    print(f"ADJUSTED EDGE: {adjusted_edge*100:.2f}% (Target: {edge*100:.2f}%)")
+                    print(f"ADJUSTED APY : {adjusted_apy*100:.2f}% (Target: {apy*100:.2f}%)")
+                    if adjusted_edge < MIN_EDGE:
+                        print(f"[WARNING] Slippage reduces edge below MIN_EDGE ({MIN_EDGE*100:.1f}%)!")
+                else:
+                    print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
+                    print(f"APY          : {apy*100:.2f}% (Compounded)")
+                    
                 print(f"KELLY %      : {raw_kelly*100:.2f}% of bankroll")
                 print(f"ALLOCATION   : ${final_alloc:,.2f}")
-                print(f"APY          : {apy*100:.2f}% (Compounded)")
                 
                 portfolio_data.append({
                     "Question": question[:50] + "..",
                     "Action": action,
                     "Ego": f"{dynamic_ego:.2f}",
-                    "Price": f"{true_price*100:.1f}%",
+                    "Price": f"{vwap_true*100:.1f}%",
                     "Alloc": f"${final_alloc:,.2f}"
                 })
             else:
@@ -813,7 +1092,8 @@ if __name__ == "__main__":
         print(" 2: Review Markets")
         print(" 3: Target Specific URLs/Slugs")
         print(" 4: Delete all data")
-        print(" 5: Exit")
+        print(" 5: Import Polymarket Wallet Positions")
+        print(" 6: Exit")
         
         choice = input("> ").strip()
         
@@ -822,9 +1102,14 @@ if __name__ == "__main__":
         session_max_offset = 0
         target_exclude_mode = "none" # Default initialization
         
-        if choice == "5":
+        if choice == "6":
             print("Exiting program.")
             break
+            
+        elif choice == "5":
+            history = import_polymarket_positions(POLYGON_WALLET, load_history())
+            save_history(stringify_overflow(history))
+            continue
             
         elif choice == "4":
             confirm = input("WARNING: Type 'CONFIRM' to delete all local data: ")
@@ -903,7 +1188,7 @@ if __name__ == "__main__":
                 print("Invalid selection. Please choose 1, 2, 3, or 4.")
                 
         else:
-            print("Invalid selection. Please choose 1-5.")
+            print("Invalid selection. Please choose 1-6.")
             continue
             
         portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset, exclude_mode=target_exclude_mode)

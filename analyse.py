@@ -9,19 +9,15 @@ PAGE_SIZE = 40  # Rows per terminal page
 
 api = requests.Session()
 
+from utils import parse_outcome_prices, format_time_remaining
+
+
+
 def extract_market_metrics(m):
     """Safely extracts base metrics, calculating spreads and velocities."""
     # Base Odds (Strict parsing to handle API strings vs lists)
-    try: 
-        prices = m.get('outcomePrices')
-        if isinstance(prices, str):
-            odds = float(json.loads(prices)[0])
-        elif isinstance(prices, list):
-            odds = float(prices[0])
-        else:
-            odds = 0.50
-    except: 
-        odds = 0.50
+    prices = parse_outcome_prices(m)
+    odds = prices[0] if len(prices) > 0 else 0.50
         
     # Liquidity Spreads
     try:
@@ -88,14 +84,6 @@ def fetch_global_overview(fetch_depth=2000, top_x=20):
             
             for m in event.get('markets', []):
                 if m.get('active') and not m.get('closed') and m.get('umaResolutionStatus') != 'resolved':
-                    # Only tally events that haven't officially expired
-                    try:
-                        res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
-                        if (res_dt - datetime.now(timezone.utc)).total_seconds() <= 0:
-                            continue
-                    except:
-                        pass
-
                     total_markets += 1
                     event_vol += float(m.get('volumeNum', 0))
                     event_24h_vol += float(m.get('volume24hr', 0))
@@ -157,10 +145,23 @@ def fetch_global_overview(fetch_depth=2000, top_x=20):
         
     print("="*100 + "\n")
 
-def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
+def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="1", reverse_sort=False):
     """Fetches events, flattens sub-markets, and securely calculates OI."""
     print(f"\n[*] Fetching top {fetch_depth} active events from Polymarket...")
     
+    # Map selected sort mode to Gamma API order/ascending parameters
+    api_order_map = {
+        "1": "volume",
+        "2": "volume24hr",
+        "3": "liquidity",
+        "6": "endDate",
+        "7": "competitive"
+    }
+    order_param = api_order_map.get(sort_mode, "volume")
+    ascending_param = "true" if sort_mode == "6" else "false"
+    if reverse_sort:
+        ascending_param = "false" if ascending_param == "true" else "true"
+        
     all_markets = []
     offset = 0
     total_filtered_oi = 0
@@ -168,7 +169,7 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
     
     while offset < fetch_depth:
         limit = min(100, fetch_depth - offset)
-        url = f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}"
+        url = f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}&order={order_param}&ascending={ascending_param}"
         
         try:
             events = api.get(url, timeout=10).json()
@@ -192,6 +193,7 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
 
             event_title = event.get('title', 'Unknown Event')
             parent_slug = event.get('slug', '')
+            event_comp = float(event.get('competitive', 0))
             
             # Grab OI at the event level
             event_oi = float(event.get('openInterest', event.get('openInterestNum', 0)))
@@ -203,8 +205,8 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
                     
                 odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq = extract_market_metrics(m)
                 
-                # STRICT PIPELINE FILTER: Discard null dates or expired markets
-                if seconds_left is None or seconds_left <= 0:
+                # STRICT PIPELINE FILTER: Discard null dates (expired markets with negative seconds are allowed)
+                if seconds_left is None:
                     continue
                 
                 has_valid_market = True
@@ -219,7 +221,8 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None):
                     "velocity": velocity,
                     "odds": odds,
                     "spread": spread,
-                    "seconds": seconds_left
+                    "seconds": seconds_left,
+                    "competitive": event_comp
                 })
                 
             # Prevent Double Counting: Only add Event OI once if the event had surviving markets
@@ -256,7 +259,7 @@ def print_global_summary(markets, total_oi):
 
 def sort_markets(markets, sort_mode, reverse_sort):
     """Sorts the flattened list based on selected metric and direction."""
-    if sort_mode == "7":
+    if sort_mode == "8":
         return markets[::-1] if reverse_sort else markets
         
     sort_map = {
@@ -265,7 +268,8 @@ def sort_markets(markets, sort_mode, reverse_sort):
         "3": ("m_liq", True),    # Liquidity
         "4": ("velocity", True), # Velocity
         "5": ("spread", False),  # Tightest Spread 
-        "6": ("seconds", False)  # Resolving Soonest
+        "6": ("seconds", False), # Resolving Soonest
+        "7": ("competitive", True) # Competitive
     }
     
     key, default_rev = sort_map.get(sort_mode, ("m_vol", True))
@@ -298,18 +302,7 @@ def display_pager(markets, show_odds):
             spr_str = f"{m['spread']*100:.1f}%"
             
             # --- Exact Seconds Formatting Logic ---
-            secs = m['seconds']
-            d = int(secs // 86400)
-            rem = secs % 86400
-            h = int(rem // 3600)
-            rem %= 3600
-            mins = int(rem // 60)
-            s = int(rem % 60)
-            
-            if d > 0:
-                time_str = f"{d}d {h:02d}h"
-            else:
-                time_str = f"{h:02d}:{mins:02d}:{s:02d}"
+            time_str = format_time_remaining(m['seconds'])
 
             odds_str = f"{m['odds']*100:.1f}%"
             
@@ -332,9 +325,20 @@ def display_pager(markets, show_odds):
 def run_interactive_analyzer():
     category, sort_mode, show_odds, reverse_sort = "All", "1", True, False
     
+    SORT_LABELS = {
+        "1": "Vol",
+        "2": "24h Vol",
+        "3": "Liquidity",
+        "4": "Velocity",
+        "5": "Spread",
+        "6": "Time Left",
+        "7": "Competitive",
+        "8": "None"
+    }
+    
     while True:
         print(f"\n1. Category Filter : [{category}]")
-        print(f"2. Sort Metric     : [{'Vol' if sort_mode=='1' else '24h Vol' if sort_mode=='2' else 'Liquidity' if sort_mode=='3' else 'Velocity' if sort_mode=='4' else 'Spread' if sort_mode=='5' else 'Time Left' if sort_mode=='6' else 'None'}]")
+        print(f"2. Sort Metric     : [{SORT_LABELS.get(sort_mode, 'Vol')}]")
         print(f"3. Reverse Sort    : [{'ON' if reverse_sort else 'OFF'}]")
         print(f"4. View Odds       : [{'ON' if show_odds else 'OFF'}]")
         print("5. Execute Scan & View Data")
@@ -346,9 +350,9 @@ def run_interactive_analyzer():
         elif choice == "1":
             category = input("Enter Category (e.g., 'Politics', 'Crypto') or 'All': ").strip().title() or "All"
         elif choice == "2":
-            print("Sort by: [1] Vol [2] 24h Vol [3] Liquidity [4] Velocity [5] Spread [6] Soonest [7] No Sorting")
+            print("Sort by: [1] Vol [2] 24h Vol [3] Liquidity [4] Velocity [5] Spread [6] Soonest [7] Competitive [8] No Sorting")
             s_choice = input("> ").strip()
-            if s_choice in ["1", "2", "3", "4", "5", "6", "7"]: sort_mode = s_choice
+            if s_choice in ["1", "2", "3", "4", "5", "6", "7", "8"]: sort_mode = s_choice
         elif choice == "3":
             reverse_sort = not reverse_sort
         elif choice == "4":
@@ -357,7 +361,7 @@ def run_interactive_analyzer():
             try: depth = int(input("Search Depth limit (e.g., 500, 1000): ").strip())
             except ValueError: depth = 500
                 
-            markets, total_oi = fetch_and_compile_markets(fetch_depth=depth, category_filter=category)
+            markets, total_oi = fetch_and_compile_markets(fetch_depth=depth, category_filter=category, sort_mode=sort_mode, reverse_sort=reverse_sort)
             if markets:
                 print_global_summary(markets, total_oi)
                 display_pager(sort_markets(markets, sort_mode, reverse_sort), show_odds)
