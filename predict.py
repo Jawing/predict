@@ -605,7 +605,9 @@ def parse_user_input(user_input):
     else:
         return min(numbers[0], numbers[1]) / 100.0, max(numbers[0], numbers[1]) / 100.0
 
-def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, bankroll, base_ego):
+def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, bankroll, base_ego, custom_min_edge=None):
+    if custom_min_edge is None:
+        custom_min_edge = MIN_EDGE
     eps = 0.01
     
     # 1. Midpoints and Uncertainty Spreads
@@ -651,7 +653,7 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     raw_kelly = max(0, edge / (1 - true_price))
     final_allocation = raw_kelly * bankroll
     
-    if edge < MIN_EDGE:
+    if edge < custom_min_edge:
         return "THIN_EDGE", true_price, raw_kelly, 0.0, dynamic_ego, edge
     
     return action, true_price, raw_kelly, final_allocation, dynamic_ego, edge
@@ -1159,7 +1161,12 @@ if __name__ == "__main__":
         elif choice == "6":
             print("\n--- CUSTOM MARKET CALCULATOR ---")
             history = load_history()
-            base_ego = calculate_base_ego(history)
+            
+            ego_mode = input("Use Historical Ego (H) or Default 0.5 (D)? [Default H]: ").strip().upper()
+            if ego_mode == 'D':
+                base_ego = 0.5
+            else:
+                base_ego = calculate_base_ego(history)
             
             try:
                 m_input = input("Market Probability Bounds % (e.g., 42-52 or 47): ").strip()
@@ -1183,8 +1190,14 @@ if __name__ == "__main__":
                 else:
                     calc_bankroll = BANKROLL
                     
+                min_edge_input = input(f"Minimum Edge % (default {MIN_EDGE*100:.1f}): ").strip()
+                if min_edge_input:
+                    calc_min_edge = float(min_edge_input) / 100.0
+                else:
+                    calc_min_edge = MIN_EDGE
+                    
                 action, true_price, raw_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
-                    lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego
+                    lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego, custom_min_edge=calc_min_edge
                 )
                 
                 _, apy = calculate_annualized_yield(edge, true_price, days_until)
@@ -1198,40 +1211,39 @@ if __name__ == "__main__":
                     if days_until > 0: print(f"APY          : {apy*100:.2f}%")
                     print(f"KELLY %      : {raw_kelly*100:.2f}% of bankroll")
                     print(f"ALLOCATION   : ${final_alloc:,.2f}")
-                    
-                    save_q = input("\nSave this custom market to history? (y/n): ").strip().lower()
-                    if save_q == 'y':
-                        q_title = input("Enter a title for this market: ").strip()
-                        if not q_title: q_title = "Custom Market"
-                        
-                        custom_id = f"custom_{int(datetime.now().timestamp())}"
-                        if "predicted" not in history:
-                            history["predicted"] = {}
-                        if custom_id not in history["predicted"]:
-                            history["predicted"][custom_id] = []
-                            
-                        history["predicted"][custom_id].append({
-                            "question": f"[CUSTOM] {q_title}",
-                            "slug": "custom",
-                            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                            "pu": (lower + upper) / 2.0,
-                            "pm": (m_lower + m_upper) / 2.0,
-                            "dynamic_ego": dynamic_ego,
-                            "kelly": raw_kelly,
-                            "edge": edge,
-                            "apy": apy,
-                            "conditionId": "custom"
-                        })
-                        save_history(stringify_overflow(history))
-                        print("[+] Saved to predicted history.")
-                        
                 else:
-                    if action == "THIN_EDGE": reason = f"Edge below {MIN_EDGE*100}% threshold"
+                    if action == "THIN_EDGE": reason = f"Edge below {calc_min_edge*100:.1f}% threshold"
                     elif action == "NONE": reason = "Trapped inside bid-ask spread"
                     else: reason = "Unknown"
                     print(f"ACTION       : $0 Allocation ({reason})")
                     print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
                     print(f"DYNAMIC EGO  : {dynamic_ego:.2f} (Base {base_ego:.2f})")
+                    
+                save_q = input("\nSave this custom market prediction to history? (y/n): ").strip().lower()
+                if save_q == 'y':
+                    q_title = input("Enter a title for this market: ").strip()
+                    if not q_title: q_title = "Custom Market"
+                    
+                    custom_id = f"custom_{int(datetime.now().timestamp())}"
+                    if "predicted" not in history:
+                        history["predicted"] = {}
+                    if custom_id not in history["predicted"]:
+                        history["predicted"][custom_id] = []
+                        
+                    history["predicted"][custom_id].append({
+                        "question": f"[CUSTOM] {q_title}",
+                        "slug": "custom",
+                        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        "pu": (lower + upper) / 2.0,
+                        "pm": (m_lower + m_upper) / 2.0,
+                        "dynamic_ego": dynamic_ego,
+                        "kelly": raw_kelly,
+                        "edge": edge,
+                        "apy": apy,
+                        "conditionId": "custom"
+                    })
+                    save_history(stringify_overflow(history))
+                    print("[+] Saved to predicted history.")
                 
             except ValueError as e:
                 print(f"\n[!] Error: {e}. Please try again.\n")
