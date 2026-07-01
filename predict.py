@@ -1162,11 +1162,18 @@ if __name__ == "__main__":
             print("\n--- CUSTOM MARKET CALCULATOR ---")
             history = load_history()
             
-            ego_mode = input("Use Historical Ego (H) or Default 0.5 (D)? [Default H]: ").strip().upper()
-            if ego_mode == 'D':
-                base_ego = 0.5
-            else:
+            ego_mode = input("Custom Base Ego (e.g., 0.5) or leave blank for Historical Ego: ").strip().upper()
+            if not ego_mode:
                 base_ego = calculate_base_ego(history)
+            else:
+                try:
+                    base_ego = float(ego_mode)
+                    if not (0.0 <= base_ego <= 1.0):
+                        print("[!] Ego must be between 0.0 and 1.0. Defaulting to Historical.")
+                        base_ego = calculate_base_ego(history)
+                except ValueError:
+                    print("[!] Invalid ego value. Defaulting to Historical.")
+                    base_ego = calculate_base_ego(history)
             
             try:
                 m_input = input("Market Probability Bounds % (e.g., 42-52 or 47): ").strip()
