@@ -1093,7 +1093,9 @@ if __name__ == "__main__":
         print(" 3: Target Specific URLs/Slugs")
         print(" 4: Delete all data")
         print(" 5: Import Polymarket Wallet Positions")
-        print(" 6: Exit")
+        print(" 6: Custom Market Calculator")
+        print(" 7: Manually Resolve Open Markets")
+        print(" 8: Exit")
         
         choice = input("> ").strip()
         
@@ -1102,9 +1104,138 @@ if __name__ == "__main__":
         session_max_offset = 0
         target_exclude_mode = "none" # Default initialization
         
-        if choice == "6":
+        if choice == "8":
             print("Exiting program.")
             break
+            
+        elif choice == "7":
+            history = load_history()
+            open_preds_dict = history.get("predicted", {})
+            if not open_preds_dict:
+                print("No open predictions to resolve.")
+                continue
+                
+            print("\n--- MANUALLY RESOLVE MARKETS ---")
+            for m_id, preds in open_preds_dict.items():
+                preds_list = ensure_list(preds)
+                q = preds_list[0].get("question", "Unknown")
+                print(f" ID: {m_id} | {q}")
+                
+            sel = input("\nEnter the Market ID or Custom ID to resolve (or hit enter to cancel): ").strip()
+            if not sel: continue
+            
+            if sel not in open_preds_dict:
+                print(f"[!] ID '{sel}' not found in open predictions.")
+                continue
+                
+            target_id = sel
+            preds = open_preds_dict[target_id]
+            print(f"\nResolving: {ensure_list(preds)[0].get('question')}")
+            print(" 1: YES")
+            print(" 2: NO")
+            print(" 3: HALF")
+            out_sel = input("> ").strip()
+            if out_sel == "1": outcome = 1.0
+            elif out_sel == "2": outcome = 0.0
+            elif out_sel == "3": outcome = 0.5
+            else:
+                print("Cancelled.")
+                continue
+                
+            if "resolved" not in history:
+                history["resolved"] = {}
+            if target_id not in history["resolved"]:
+                history["resolved"][target_id] = []
+                
+            for p in ensure_list(preds):
+                p["outcome"] = outcome
+                history["resolved"][target_id].append(p)
+                
+            del history["predicted"][target_id]
+            save_history(stringify_overflow(history))
+            print("[+] Market manually resolved and saved.")
+            continue
+            
+        elif choice == "6":
+            print("\n--- CUSTOM MARKET CALCULATOR ---")
+            history = load_history()
+            base_ego = calculate_base_ego(history)
+            
+            try:
+                m_input = input("Market Probability Bounds % (e.g., 42-52 or 47): ").strip()
+                m_lower, m_upper = parse_user_input(m_input)
+                
+                u_input = input("User Probability Bounds % (e.g., 16-42 or 29): ").strip()
+                lower, upper = parse_user_input(u_input)
+                
+                fee_input = input("Fee Rate % (default 3.0 Polymarket Sports): ").strip()
+                if fee_input:
+                    fee_rate = float(fee_input) / 100.0
+                else:
+                    fee_rate = 0.03
+                    
+                days_input = input("Days until resolution (default 0 for no APY): ").strip()
+                days_until = float(days_input) if days_input else 0.0
+                
+                bankroll_input = input(f"Bankroll (default ${BANKROLL:,.2f}): ").strip()
+                if bankroll_input:
+                    calc_bankroll = float(bankroll_input)
+                else:
+                    calc_bankroll = BANKROLL
+                    
+                action, true_price, raw_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
+                    lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego
+                )
+                
+                _, apy = calculate_annualized_yield(edge, true_price, days_until)
+                
+                
+                print(f"\n--- CALCULATION RESULTS ---")
+                if action in ["YES", "NO"]:
+                    print(f"ACTION       : BUY {action} @ {true_price*100:.1f}%")
+                    print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
+                    print(f"DYNAMIC EGO  : {dynamic_ego:.2f} (Base {base_ego:.2f})")
+                    if days_until > 0: print(f"APY          : {apy*100:.2f}%")
+                    print(f"KELLY %      : {raw_kelly*100:.2f}% of bankroll")
+                    print(f"ALLOCATION   : ${final_alloc:,.2f}")
+                    
+                    save_q = input("\nSave this custom market to history? (y/n): ").strip().lower()
+                    if save_q == 'y':
+                        q_title = input("Enter a title for this market: ").strip()
+                        if not q_title: q_title = "Custom Market"
+                        
+                        custom_id = f"custom_{int(datetime.now().timestamp())}"
+                        if "predicted" not in history:
+                            history["predicted"] = {}
+                        if custom_id not in history["predicted"]:
+                            history["predicted"][custom_id] = []
+                            
+                        history["predicted"][custom_id].append({
+                            "question": f"[CUSTOM] {q_title}",
+                            "slug": "custom",
+                            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            "pu": (lower + upper) / 2.0,
+                            "pm": (m_lower + m_upper) / 2.0,
+                            "dynamic_ego": dynamic_ego,
+                            "kelly": raw_kelly,
+                            "edge": edge,
+                            "apy": apy,
+                            "conditionId": "custom"
+                        })
+                        save_history(stringify_overflow(history))
+                        print("[+] Saved to predicted history.")
+                        
+                else:
+                    if action == "THIN_EDGE": reason = f"Edge below {MIN_EDGE*100}% threshold"
+                    elif action == "NONE": reason = "Trapped inside bid-ask spread"
+                    else: reason = "Unknown"
+                    print(f"ACTION       : $0 Allocation ({reason})")
+                    print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
+                    print(f"DYNAMIC EGO  : {dynamic_ego:.2f} (Base {base_ego:.2f})")
+                
+            except ValueError as e:
+                print(f"\n[!] Error: {e}. Please try again.\n")
+            continue
             
         elif choice == "5":
             history = import_polymarket_positions(POLYGON_WALLET, load_history())
