@@ -1114,7 +1114,7 @@ if __name__ == "__main__":
             history = load_history()
             open_preds_dict = history.get("predicted", {})
             if not open_preds_dict:
-                print("No open predictions to resolve.")
+                print("[!] No open predictions to resolve.")
                 continue
                 
             print("\n--- MANUALLY RESOLVE MARKETS ---")
@@ -1141,7 +1141,7 @@ if __name__ == "__main__":
             elif out_sel == "2": outcome = 0.0
             elif out_sel == "3": outcome = 0.5
             else:
-                print("Cancelled.")
+                print("[!] Invalid selection. Please select from 1, 2, or 3")
                 continue
                 
             if "resolved" not in history:
@@ -1267,7 +1267,7 @@ if __name__ == "__main__":
                 if os.path.exists(HISTORY_FILE): os.remove(HISTORY_FILE)
                 print("All data deleted.")
             else:
-                print("Data deletion cancelled.")
+                print("[!] Data deletion cancelled.")
             continue
             
         elif choice == "3":
@@ -1281,7 +1281,7 @@ if __name__ == "__main__":
                     targets.append(item.split("?")[0])
             
             if not targets:
-                print("No valid inputs parsed. Returning to main menu.\n")
+                print("[!] No valid inputs parsed. Returning to main menu.\n")
                 continue
             else:
                 print(f"Parsed Targets ({len(targets)}): {', '.join(targets)}")
@@ -1326,7 +1326,7 @@ if __name__ == "__main__":
                         session_max_offset = platform_max_offset
                         
                     break
-                print("Invalid selection. Please choose 1 or 2.")
+                print("[!] Invalid selection. Please choose 1 or 2.")
                 
         elif choice == "2":
             while True:
@@ -1335,10 +1335,10 @@ if __name__ == "__main__":
                     op_mode = "review"
                     sub_mode = {"1": "predicted", "2": "skipped", "3": "resolved", "4": "all"}[review_mode]
                     break
-                print("Invalid selection. Please choose 1, 2, 3, or 4.")
+                print("[!] Invalid selection. Please choose 1, 2, 3, or 4.")
                 
         else:
-            print("Invalid selection. Please choose 1-6.")
+            print("[!] Invalid selection. Please choose 1-6.")
             continue
             
         portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset, exclude_mode=target_exclude_mode)
