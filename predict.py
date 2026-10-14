@@ -139,9 +139,9 @@ def import_polymarket_positions(wallet_address, history):
         portfolio_value += value
         
     BANKROLL = cash_balance + portfolio_value
-    print(f"[+] Live Bankroll Updated: ${BANKROLL:,.2f} (Cash: ${cash_balance:,.2f} | Portfolio: ${portfolio_value:,.2f})")
+    print(f"Live Bankroll Updated: ${BANKROLL:,.2f} (Cash: ${cash_balance:,.2f} | Portfolio: ${portfolio_value:,.2f})")
     
-    print(f"[+] Found {len(positions)} positions. Importing new ones...")
+    print(f"Found {len(positions)} positions. Importing new ones...")
     imported_predicted = 0
     imported_resolved = 0
     
@@ -345,9 +345,9 @@ def update_resolutions(history):
 def print_review_table(history, sub_mode):
     TABLE_CONFIGS = {
         "predicted": {
-            "headers": ["Date", "Question", "Kelly", "APY", "Edge", "pu", "pm"],
-            "widths": [16, 60, 8, 8, 8, 6, 6],
-            "aligns": ["left", "left", "right", "right", "right", "right", "right"],
+            "headers": ["Date", "Question", "Kelly", "pu", "pm"],
+            "widths": [16, 60, 8, 6, 6],
+            "aligns": ["left", "left", "right", "right", "right"],
             "q_idx": 1
         },
         "skipped": {
@@ -356,6 +356,12 @@ def print_review_table(history, sub_mode):
             "aligns": ["left", "left"],
             "q_idx": 1
         },
+        "predicted_skipped": {
+            "headers": ["Mode", "Date", "Question", "Kelly", "pu", "pm"],
+            "widths": [10, 16, 60, 8, 6, 6],
+            "aligns": ["left", "left", "left", "right", "right", "right"],
+            "q_idx": 2
+        },
         "resolved": {
             "headers": ["Date", "Question", "Kelly", "pu", "pm", "Outcome"],
             "widths": [16, 60, 8, 6, 6, 8],
@@ -363,9 +369,9 @@ def print_review_table(history, sub_mode):
             "q_idx": 1
         },
         "all": {
-            "headers": ["Mode", "Date", "Question", "Kelly", "Edge", "Outcome"],
-            "widths": [10, 16, 60, 8, 8, 8],
-            "aligns": ["left", "left", "left", "right", "right", "left"],
+            "headers": ["Mode", "Date", "Question", "Kelly", "pu", "pm", "Outcome"],
+            "widths": [10, 16, 60, 8, 6, 6, 8],
+            "aligns": ["left", "left", "left", "right", "right", "right", "left"],
             "q_idx": 2
         }
     }
@@ -374,7 +380,7 @@ def print_review_table(history, sub_mode):
     rows = []
     
     # Gather predicted
-    if sub_mode in ["predicted", "all"]:
+    if sub_mode in ["predicted", "predicted_skipped", "all"]:
         for market_id, value in history.get("predicted", {}).items():
             preds = ensure_list(value)
             for pred in preds:
@@ -393,7 +399,7 @@ def print_review_table(history, sub_mode):
                 })
                 
     # Gather skipped
-    if sub_mode in ["skipped", "all"]:
+    if sub_mode in ["skipped", "predicted_skipped", "all"]:
         for market_id, value in history.get("skipped", {}).items():
             rows.append({
                 "Mode": "skipped",
@@ -426,16 +432,8 @@ def print_review_table(history, sub_mode):
 
     # 2. Get Sorting Option
     sort_by = "date"
-    if sub_mode == "predicted":
-        print("\nSort 'predicted' by:")
-        print(" 1: Date (default)")
-        print(" 2: Kelly")
-        print(" 3: APY")
-        print(" 4: Edge")
-        sort_choice = input("> ").strip()
-        sort_by = {"2": "kelly", "3": "apy", "4": "edge"}.get(sort_choice, "date")
-    elif sub_mode == "resolved":
-        print("\nSort 'resolved' by:")
+    if sub_mode in ["predicted", "predicted_skipped", "resolved", "all"]:
+        print(f"\nSort '{sub_mode}' by:")
         print(" 1: Date (default)")
         print(" 2: Kelly")
         sort_choice = input("> ").strip()
@@ -445,11 +443,13 @@ def print_review_table(history, sub_mode):
     if sort_by == "date":
         rows.sort(key=lambda x: x.get("Date", "unknown") if x.get("Date", "unknown") != "unknown" else "", reverse=True)
     elif sort_by == "kelly":
-        rows.sort(key=lambda x: x.get("Kelly", 0.0), reverse=True)
-    elif sort_by == "apy":
-        rows.sort(key=lambda x: x.get("APY", 0.0), reverse=True)
-    elif sort_by == "edge":
-        rows.sort(key=lambda x: x.get("Edge", 0.0), reverse=True)
+        rows.sort(
+            key=lambda x: (
+                0 if x.get("Kelly") is None else 1,
+                x.get("Kelly") if x.get("Kelly") is not None else -float("inf")
+            ),
+            reverse=True
+        )
 
     # 4. Format and Print Table manually (with Question hyperlinked to Web Link)
     config = TABLE_CONFIGS.get(sub_mode, TABLE_CONFIGS["all"])
@@ -496,13 +496,18 @@ def print_review_table(history, sub_mode):
         
         # Populate row values based on sub_mode
         if sub_mode == "predicted":
-            vals = [r["Date"], r["Question"], kelly_str, apy_str, edge_str, pu_str, pm_str]
+            vals = [r["Date"], r["Question"], kelly_str, pu_str, pm_str]
         elif sub_mode == "skipped":
             vals = [r["Date"], r["Question"]]
+        elif sub_mode == "predicted_skipped":
+            if r["Mode"] == "predicted":
+                vals = [r["Mode"].upper(), r["Date"], r["Question"], kelly_str, pu_str, pm_str]
+            else:  # skipped rows have no kelly/pu/pm
+                vals = [r["Mode"].upper(), r["Date"], r["Question"], "-", "-", "-"]
         elif sub_mode == "resolved":
             vals = [r["Date"], r["Question"], kelly_str, pu_str, pm_str, outcome_str]
         else: # "all"
-            vals = [r["Mode"].upper(), r["Date"], r["Question"], kelly_str, edge_str, outcome_str]
+            vals = [r["Mode"].upper(), r["Date"], r["Question"], kelly_str, pu_str, pm_str, outcome_str]
             
         row_parts = []
         for i, (v, w, a) in enumerate(zip(vals, widths, aligns)):
@@ -713,30 +718,54 @@ def validate_market(m, history, mode, exclude_mode="none"):
         res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
         seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
 
-        if seconds_left > 0:
-            days_until = seconds_left / 86400.0
-            if days_until < MIN_DAYS or days_until > MAX_DAYS:
-                return False, f"Time horizon ({days_until:.1f} days) outside bounds"
+        if seconds_left <= 0:
+            return False, "Market has expired"
+        
+        days_until = seconds_left / 86400.0
+        if days_until < MIN_DAYS or days_until > MAX_DAYS:
+            return False, f"Time horizon ({days_until:.1f} days) outside bounds"
     except:
         return False, "Invalid end date format"
             
     return True, "Valid"
 
-def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0, exclude_mode="none"):
+def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0, exclude_mode="none", discovery_order="volume"):
     if mode == "discover":
         seen_categories = set()
+        seen_market_ids = set()
         while True:
             offset = random.randint(0, max_offset // 100) * 100
             print(f"[*] Fetching market...",  end="\r")
+            
+            if discovery_order == "multi":
+                order_param, ascending_param = random.choice([
+                    ("volume", "false"),        # High volume
+                    ("volume", "true"),         # Low volume / niche
+                    ("volume24hr", "false"),    # High 24h volume
+                    ("liquidity", "false"),     # Deep liquidity
+                    ("endDate", "true"),        # Ending soonest
+                    ("endDate", "false"),       # Far horizon
+                    ("competitive", "false"),   # Close 50/50 odds
+                    ("startDate", "false")      # Freshly listed
+                ])
+            elif discovery_order == "volume_asc":
+                order_param, ascending_param = "volume", "true"
+            elif discovery_order == "startDate":
+                order_param, ascending_param = "startDate", "false"
+            else:
+                order_param = discovery_order
+                ascending_param = "true" if discovery_order == "endDate" else "false"
+                
             try:
-                events = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}").json()
+                events = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}&order={order_param}&ascending={ascending_param}").json()
             except Exception:
                 continue
             
-            if not events: continue
+            if not events or not isinstance(events, list): continue
             random.shuffle(events)
             
             for event in events:
+                if not isinstance(event, dict): continue
                 # --- CATEGORY FILTERING ---
                 if category and category.lower() != "all":
                     tags = [t.get('label', '').lower() for t in event.get('tags', []) if isinstance(t, dict)]
@@ -751,13 +780,12 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                             print(f"[+] Category Matched: '{full_name}'")
                             seen_categories.add(full_name)
 
-                    # Print all seen Categories
-                    # if seen_categories:
-                    #     print(f"Current Matched Categories: {', '.join(sorted(seen_categories))}")
-
-                        
                 valid_markets = []
                 for m in event.get('markets', []):
+                    m_id = m.get('id')
+                    if m_id in seen_market_ids:
+                        continue
+                        
                     m['parent_slug'] = event.get('slug', 'unknown')
                     m['parent_name'] = event.get('title', 'unknown')
                     
@@ -768,7 +796,10 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                         print(f"[-] Ignored Categorical Market: '{m.get('question')}' | Reason: {reason}")
                         print(f"URL: https://polymarket.com/market/{m.get('id')}\n")
                 
-                if valid_markets: yield random.choice(valid_markets) 
+                if valid_markets:
+                    chosen_m = random.choice(valid_markets)
+                    seen_market_ids.add(chosen_m.get('id'))
+                    yield chosen_m 
                     
     elif mode == "target":
         if not target_slugs:
@@ -778,11 +809,12 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
         for slug in target_slugs:
             try:
                 events = api.get(f"{GAMMA_API}/events?slug={slug}").json()
-                if not events:
+                if not events or not isinstance(events, list):
                     print(f"[-] Invalid or empty data returned for slug: {slug}")
                     continue
                     
                 for event in events:
+                    if not isinstance(event, dict): continue
                     for m in event.get('markets', []):
                         m['parent_slug'] = event.get('slug', 'unknown')
                         m['parent_name'] = event.get('title', 'unknown')
@@ -794,8 +826,8 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 
     elif mode == "review":
         target_ids = []
-        if sub_mode in ["predicted", "all"]: target_ids.extend(list(history.get("predicted", {}).keys()))
-        if sub_mode in ["skipped", "all"]: target_ids.extend(list(history.get("skipped", {}).keys()))
+        if sub_mode in ["predicted", "predicted_skipped", "all"]: target_ids.extend(list(history.get("predicted", {}).keys()))
+        if sub_mode in ["skipped", "predicted_skipped", "all"]: target_ids.extend(list(history.get("skipped", {}).keys()))
             
         if not target_ids:
             print("\n[!] History is empty. No markets available to review.")
@@ -804,6 +836,10 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
         random.shuffle(target_ids)
         for market_id in target_ids:
             try:
+                # Custom markets have no Polymarket API endpoint — skip lookup
+                if str(market_id).startswith("custom_"):
+                    continue
+                
                 m = api.get(f"{GAMMA_API}/markets/{market_id}").json()
                 if m:
                     m['parent_slug'] = m.get('slug', 'unknown') 
@@ -813,8 +849,8 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     if is_valid: 
                         yield m
                     else:
-                        if market_id in history.get("skipped", {}) and ("closed" in reason or "paused" in reason):
-                            print(f"[+] Auto-Purged Dead Skipped Market: '{m.get('question')}'")
+                        if market_id in history.get("skipped", {}) and ("closed" in reason or "paused" in reason or "has expired" in reason):
+                            print(f"[-] Auto-Purged Dead Skipped Market: '{m.get('question')}'")
                             del history["skipped"][market_id]
                         elif market_id in history.get("predicted", {}) and ("paused" in reason):
                             print(f"[-] Review Paused (Awaiting UMA Resolution): '{m.get('question')}'")
@@ -823,7 +859,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
             except Exception:
                 continue
 
-def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0, exclude_mode="none"):
+def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0, exclude_mode="none", discovery_order="volume"):
     global BANKROLL
     
     # Live wallet bankroll update
@@ -832,7 +868,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         balance = get_wallet_usdc_balance(POLYGON_WALLET)
         if balance is not None:
             BANKROLL = balance
-            print(f"[+] Wallet USDC Balance successfully loaded: ${BANKROLL:,.2f}")
+            print(f"Wallet USDC Balance successfully loaded: ${BANKROLL:,.2f}")
         else:
             print(f"[!] Failed to fetch live wallet balance. Falling back to default: ${BANKROLL:,.2f}")
             
@@ -842,28 +878,31 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
     if mode == "review":
         print_review_table(history, sub_mode)
         
-        has_active_markets = False
-        if sub_mode in ["predicted", "all"] and history.get("predicted"):
-            has_active_markets = True
-        if sub_mode in ["skipped", "all"] and history.get("skipped"):
-            has_active_markets = True
+        active_market_count = 0
+        if sub_mode in ["predicted", "predicted_skipped", "all"]:
+            active_market_count += len(history.get("predicted", {}))
+        if sub_mode in ["skipped", "predicted_skipped", "all"]:
+            active_market_count += len(history.get("skipped", {}))
+        has_active_markets = active_market_count > 0
             
         if not has_active_markets:
-            print("[*] No active/open markets to review in this sub-mode. Returning to main menu.")
+            print("[*] No active/open markets to predict in this sub-mode. Returning to main menu.")
             return None
             
-        review_choice = input("Do you want to run a prediction review session on the active markets in this selection? (y/n): ").strip().lower()
+        review_choice = input(f"Do you want to run a prediction session on the {active_market_count} active markets in this selection? (y/n): ").strip().lower()
         if review_choice != 'y':
             return None
             
     base_ego = calculate_base_ego(history)
     
     print(f"\n--- Starting Session [{mode.upper()} - {sub_mode.upper()}] ---")
-    if mode == "discover": print(f"Category Filter: {category.upper()}")
-    print(f"Bankroll       : ${BANKROLL:,.2f}")
-    print(f"Base Ego       : {base_ego:.3f} (Brier Score Ratio)")
+    if mode == "discover":
+        print(f"Category Filter : {category.upper()}")
+        print(f"Discovery Vector: {discovery_order.upper()}")
+    print(f"Bankroll        : ${BANKROLL:,.2f}")
+    print(f"Base Ego        : {base_ego:.3f} (Brier Score Ratio)")
     
-    market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset, exclude_mode)
+    market_stream = generate_market_stream(mode, sub_mode, target_slugs, history, category, max_offset, exclude_mode, discovery_order)
 
     portfolio_data = []
     session_trades = {}
@@ -1105,6 +1144,7 @@ if __name__ == "__main__":
         category = "All"
         session_max_offset = 0
         target_exclude_mode = "none" # Default initialization
+        discovery_order = "volume"
         
         if choice == "8":
             print("Exiting program.")
@@ -1132,16 +1172,24 @@ if __name__ == "__main__":
                 
             target_id = sel
             preds = open_preds_dict[target_id]
-            print(f"\nResolving: {ensure_list(preds)[0].get('question')}")
-            print(" 1: YES")
-            print(" 2: NO")
-            print(" 3: HALF")
-            out_sel = input("> ").strip()
-            if out_sel == "1": outcome = 1.0
-            elif out_sel == "2": outcome = 0.0
-            elif out_sel == "3": outcome = 0.5
-            else:
-                print("[!] Invalid selection. Please select from 1, 2, or 3")
+            outcome = None
+            while True:
+                print(f"\nResolving: {ensure_list(preds)[0].get('question')} \nSelect outcome or hit enter to cancel")
+                print(" 1: YES")
+                print(" 2: NO")
+                print(" 3: HALF")
+                out_sel = input("> ").strip()
+                if out_sel == "": break
+                if out_sel == "1": outcome = 1.0
+                elif out_sel == "2": outcome = 0.0
+                elif out_sel == "3": outcome = 0.5
+                else:
+                    print("[!] Invalid selection. Please select from 1, 2, or 3")
+                    continue
+                break
+                
+            if outcome is None:
+                print("[!] Resolve cancelled.")
                 continue
                 
             if "resolved" not in history:
@@ -1302,12 +1350,35 @@ if __name__ == "__main__":
             category_input = input("\nEnter Category Tag (e.g., 'Politics', 'Crypto') or hit enter for 'All': ").strip()
             category = category_input if category_input else "All"
             
+            # Select Discovery Vector (Default = Volume/Normal)
+            print("\nSelect Discovery Vector:")
+            print(" 1: Volume (Default - Top volume markets)")
+            print(" 2: 24h Volume (Recent trending/breakout markets)")
+            print(" 3: Liquidity (Deepest orderbooks)")
+            print(" 4: Ending Soonest (Short time horizon)")
+            print(" 5: Competitive (Contested 50/50 odds)")
+            print(" 6: Low Volume / Niche (Untapped / long-tail markets)")
+            print(" 7: Newest Listed (Freshly created markets)")
+            print(" 8: Multi-Vector (Full spectrum rotation across all vectors)")
+            vec_choice = input("> ").strip()
+            vec_map = {
+                "1": "volume",
+                "2": "volume24hr",
+                "3": "liquidity",
+                "4": "endDate",
+                "5": "competitive",
+                "6": "volume_asc",
+                "7": "startDate",
+                "8": "multi"
+            }
+            discovery_order = vec_map.get(vec_choice, "volume")
+            
             # Fetch Brink to establish dynamic boundary checks
             platform_max_offset = find_platform_brink()
             max_pages = (platform_max_offset // 100) + 1
             
             while True:
-                market_mode = input(f"\nDiscover Mode - Select Page Limit:\n 1: All Active Markets (Full Platform, {max_pages} pages)\n 2: Custom Top Pages (1 to {max_pages})\n> ").strip()
+                market_mode = input(f"\nDiscover Mode - Select Page Limit:\n 1: Max Reach ({max_pages} pages / ~{max_pages*100} events for selected vector)\n 2: Custom Top Pages (1 to {max_pages})\n> ").strip()
                 if market_mode in ["1", "2"]:
                     op_mode = "discover"
                     sub_mode = "all" if market_mode == "1" else "custom"
@@ -1330,18 +1401,18 @@ if __name__ == "__main__":
                 
         elif choice == "2":
             while True:
-                review_mode = input("\nReview Mode - Select Sub-Mode:\n 1: 'Predicted' Markets\n 2: 'Skipped' Markets\n 3: 'Resolved' Markets\n 4: All (Predicted + Skipped + Resolved)\n> ").strip()
-                if review_mode in ["1", "2", "3", "4"]:
+                review_mode = input("\nReview Mode - Select Sub-Mode:\n 1: 'Predicted' Markets\n 2: 'Skipped' Markets\n 3: 'Resolved' Markets\n 4: 'Predicted' + 'Skipped' Markets\n 5: All (Predicted + Skipped + Resolved)\n> ").strip()
+                if review_mode in ["1", "2", "3", "4", "5"]:
                     op_mode = "review"
-                    sub_mode = {"1": "predicted", "2": "skipped", "3": "resolved", "4": "all"}[review_mode]
+                    sub_mode = {"1": "predicted", "2": "skipped", "3": "resolved", "4": "predicted_skipped", "5": "all"}[review_mode]
                     break
-                print("[!] Invalid selection. Please choose 1, 2, 3, or 4.")
+                print("[!] Invalid selection. Please choose 1, 2, 3, 4, or 5.")
                 
         else:
             print("[!] Invalid selection. Please choose 1-6.")
             continue
             
-        portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset, exclude_mode=target_exclude_mode)
+        portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset, exclude_mode=target_exclude_mode, discovery_order=discovery_order)
         
         if portfolio is not None and not portfolio.empty:
             print("\n--- Final Session Allocations ---")
