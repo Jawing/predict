@@ -4,13 +4,13 @@ import json
 import os
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
 
 # --- CONFIGURATION ---
 HISTORY_FILE = "prediction_history.json"
-BANKROLL = 42.00
+BANKROLL = 100.00
 GAMMA_API = "https://gamma-api.polymarket.com"
 POLYGON_WALLET = ""  # Set your wallet address (0x...) to auto-fetch USDC balance
 
@@ -53,17 +53,26 @@ def get_wallet_usdc_balance(wallet_address):
 def calculate_vwap(asks, target_usdc):
     if not asks or target_usdc <= 0:
         return 0.0, 0.0
-    total_shares = 0.0
-    remaining_usdc = target_usdc
-    total_spent = 0.0
+    valid_asks = []
     for ask in asks:
         try:
             price = float(ask['price'])
             size = float(ask['size'])
+            if price > 0 and size > 0:
+                valid_asks.append((price, size))
         except Exception:
             continue
-        if price <= 0:
-            continue
+    if not valid_asks:
+        return 0.0, 0.0
+
+    # CLOB API returns asks in descending order (highest price first).
+    # To execute a buy order, sort ascending to consume the cheapest asks first.
+    valid_asks.sort(key=lambda x: x[0])
+
+    total_shares = 0.0
+    remaining_usdc = target_usdc
+    total_spent = 0.0
+    for price, size in valid_asks:
         max_usdc_at_this_level = price * size
         if remaining_usdc >= max_usdc_at_this_level:
             total_shares += size
@@ -571,7 +580,8 @@ def calculate_annualized_yield(edge, true_price, days_until):
     # 2. Annualized Yield (APY - Compounding)
     # If the edge is negative, the APY will geometrically compound the loss
     try:
-        apy = ((1 + roi) ** (365.0 / days_until)) - 1
+        apy = -1.0 if roi <= -1.0 else ((1 + roi) ** (365.0 / days_until)) - 1
+        if isinstance(apy, complex): apy = -1.0
     except:
         apy = 0.0
         
@@ -655,7 +665,7 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     edge = win_prob - true_price
 
     # 7. Uncapped Fractional Kelly Allocation
-    raw_kelly = max(0, edge / (1 - true_price))
+    raw_kelly = max(0.0, edge / (1 - true_price)) if true_price < 1.0 else 0.0
     final_allocation = raw_kelly * bankroll
     
     if edge < custom_min_edge:
@@ -757,7 +767,12 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 ascending_param = "true" if discovery_order == "endDate" else "false"
                 
             try:
-                events = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}&order={order_param}&ascending={ascending_param}").json()
+                # Push MIN_DAYS/MAX_DAYS window to the API so out-of-range markets are
+                # never fetched. end_date_min also prevents returning expired events.
+                _now = datetime.now(timezone.utc)
+                _min_dt = (_now + timedelta(days=MIN_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _max_dt = (_now + timedelta(days=MAX_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                events = api.get(f"{GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}&order={order_param}&ascending={ascending_param}&end_date_min={_min_dt}&end_date_max={_max_dt}").json()
             except Exception:
                 continue
             
@@ -971,7 +986,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         print(f"Market   : {question}")
         print(f"Resolves : {exact_date_str} ({days_str})\n")
  
-        user_input = input("Enter % bounds ('16-51' or '42'), 's' (skip), 'r' (redo), 'q' (quit): ").strip()
+        user_input = input("Enter % bounds ('36-48' or '42'), 's' (skip), 'r' (redo), 'q' (quit): ").strip()
  
         if user_input.lower() == 'q':
             print("\nSaving and quitting session...")
@@ -1013,15 +1028,24 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         
         try:
             lower, upper = parse_user_input(user_input)
-            fee_rate = m.get('feeSchedule', {}).get('rate', 0.05)
+            fee_rate = (m.get('feeSchedule') or {}).get('rate')
+            if fee_rate is None:
+                try:
+                    f = float(m.get('fee') or 0)
+                    fee_rate = f / 1e18 if f > 1 else f
+                except:
+                    fee_rate = 0.0
             
             action, true_price, raw_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
                 lower, upper, pm_bid, pm_ask, fee_rate, BANKROLL, base_ego
             )
             
-            res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
-            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
-            days_until = seconds_left / 86400.0
+            try:
+                res_dt = datetime.fromisoformat(m.get('endDate', '').replace('Z', '+00:00'))
+                seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+                days_until = max(0.0, seconds_left / 86400.0)
+            except:
+                days_until = 0.0
 
             roi, apy = calculate_annualized_yield(edge, true_price, days_until)
 
@@ -1037,8 +1061,15 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 if clob_ids_str:
                     try:
                         clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-                        # Index 0 is YES, Index 1 is NO
-                        token_id = clob_ids[0] if action == "YES" else clob_ids[1]
+                        token_id = None
+                        tokens = m.get('tokens', [])
+                        if tokens and len(tokens) == len(clob_ids):
+                            for idx, tok in enumerate(tokens):
+                                if tok.get('outcome', '').upper() == action:
+                                    token_id = clob_ids[idx]
+                                    break
+                        if not token_id:
+                            token_id = clob_ids[0] if action == "YES" else clob_ids[1]
                         r = api.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
                         if r.status_code == 200:
                             book = r.json()
@@ -1049,13 +1080,14 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                     vwap, total_spent = calculate_vwap(asks_list, final_alloc)
                     if vwap > 0:
                         vwap_true = vwap + (fee_rate * vwap * (1.0 - vwap))
-                        slippage = vwap_true - true_price
+                        slippage = max(0.0, vwap_true - true_price)
                         
                         # Re-calculate edge and APY using VWAP price
                         win_prob = true_price + edge
                         adjusted_edge = win_prob - vwap_true
                         _, adjusted_apy = calculate_annualized_yield(adjusted_edge, vwap_true, days_until)
-
+                        if adjusted_edge < MIN_EDGE:
+                            action = "THIN_EDGE"
             # 1. Ensure the market ID key contains a list
             if market_id not in history["predicted"]:
                 history["predicted"][market_id] = []
@@ -1088,14 +1120,12 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 session_trades[market_id] = final_alloc
                 
                 print(f"ACTION       : BUY {action} @ {true_price*100:.1f}%")
-                if slippage > 0:
+                if slippage > 0.0001:
                     print(f"VWAP PRICE   : {vwap_true*100:.2f}% (Slippage: +{slippage*100:.2f}%)")
                     print(f"ADJUSTED EDGE: {adjusted_edge*100:.2f}% (Target: {edge*100:.2f}%)")
                     print(f"ADJUSTED APY : {adjusted_apy*100:.2f}% (Target: {apy*100:.2f}%)")
-                    if adjusted_edge < MIN_EDGE:
-                        print(f"[WARNING] Slippage reduces edge below MIN_EDGE ({MIN_EDGE*100:.1f}%)!")
                 else:
-                    print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
+                    print(f"USER EDGE    : {adjusted_edge*100:.2f}% (After Fees & Spread)")
                     print(f"APY          : {apy*100:.2f}% (Compounded)")
                     
                 print(f"KELLY %      : {raw_kelly*100:.2f}% of bankroll")
@@ -1106,6 +1136,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                     "Action": action,
                     "Ego": f"{dynamic_ego:.2f}",
                     "Price": f"{vwap_true*100:.1f}%",
+                    "Kelly": f"{raw_kelly*100:.2f}%",
                     "Alloc": f"${final_alloc:,.2f}"
                 })
             else:
@@ -1114,7 +1145,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
                 else: reason = "Unknown"
                 
                 print(f"ACTION       : $0 Allocation ({reason})")
-                print(f"USER EDGE    : {edge*100:.2f}% (After Fees & Spread)")
+                print(f"USER EDGE    : {adjusted_edge*100:.2f}% (After Fees & Spread)")
             
             print(f"EXPOSURE     : {cumulative_exposure*100:.1f}% of Bankroll Used")
             print(f"SESSION DATA : {len(session_trades)} predictions | Total Allocated: ${sum(session_trades.values()):,.2f}\n")
@@ -1127,16 +1158,251 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
     save_history(stringify_overflow(history))
     return pd.DataFrame(portfolio_data)
 
+def delete_specific_markets(history):
+    pred_count = len(history.get("predicted", {}))
+    skip_count = len(history.get("skipped", {}))
+    res_count = len(history.get("resolved", {}))
+    
+    print("\nSelect Category to Delete From:")
+    print(f" 1: 'Predicted' Markets ({pred_count})")
+    print(f" 2: 'Skipped' Markets ({skip_count})")
+    print(f" 3: 'Resolved' Markets ({res_count})")
+    print(f" 4: All Categories ({pred_count + skip_count + res_count})")
+    print(" 5: Cancel")
+    
+    cat_sel = input("> ").strip()
+    if cat_sel == "1":
+        categories = ["predicted"]
+    elif cat_sel == "2":
+        categories = ["skipped"]
+    elif cat_sel == "3":
+        categories = ["resolved"]
+    elif cat_sel == "4":
+        categories = ["predicted", "skipped", "resolved"]
+    else:
+        print("[!] Deletion cancelled.")
+        return
+
+    entries = []
+    for cat in categories:
+        cat_data = history.get(cat, {})
+        for market_id, val in cat_data.items():
+            if cat in ["predicted", "resolved"]:
+                preds = ensure_list(val)
+                for idx, p in enumerate(preds):
+                    entries.append({
+                        "category": cat,
+                        "market_id": str(market_id),
+                        "pred_idx": idx,
+                        "total_preds": len(preds),
+                        "question": p.get("question", "Unknown"),
+                        "date": p.get("date", "Unknown"),
+                        "slug": p.get("slug", "")
+                    })
+            else:  # skipped
+                q = val.get("question", "Unknown") if isinstance(val, dict) else "Unknown"
+                d = val.get("date", "Unknown") if isinstance(val, dict) else "Unknown"
+                s = val.get("slug", "") if isinstance(val, dict) else ""
+                entries.append({
+                    "category": "skipped",
+                    "market_id": str(market_id),
+                    "pred_idx": None,
+                    "total_preds": 1,
+                    "question": q,
+                    "date": d,
+                    "slug": s
+                })
+                
+    if not entries:
+        print("[!] No markets found in selected category.")
+        return
+
+    print(f"\n--- SELECT MARKETS TO DELETE ({len(entries)} items) ---")
+    for i, e in enumerate(entries, 1):
+        cat_tag = e["category"].upper()
+        sub_tag = f" (#{e['pred_idx']+1})" if e["total_preds"] > 1 else ""
+        q_text = e["question"]
+        if len(q_text) > 65:
+            q_text = q_text[:62] + "..."
+        print(f" [{i}] [{cat_tag}] ID: {e['market_id']}{sub_tag} | {e['date']} | {q_text}")
+
+    prompt_msg = "\nEnter item number(s) (e.g. 1, 3 or 1-3), Market ID, keyword, or 'q' to cancel:\n> "
+    user_input = input(prompt_msg).strip()
+    
+    if not user_input or user_input.lower() in ["q", "quit", "cancel", "exit"]:
+        print("[!] Deletion cancelled.")
+        return
+
+    to_delete = []
+    
+    if user_input.lower() == "all":
+        to_delete = entries
+    else:
+        # Check if direct match for Market ID
+        by_id = [e for e in entries if e["market_id"].lower() == user_input.lower()]
+        if by_id:
+            to_delete = by_id
+        else:
+            # Try parsing as numbers / ranges
+            tokens = user_input.replace(",", " ").split()
+            selected_indices = set()
+            is_numeric_parse = True
+            for token in tokens:
+                if "-" in token:
+                    parts = token.split("-")
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                        start, end = int(parts[0]), int(parts[1])
+                        if start > end:
+                            start, end = end, start
+                        for idx in range(start, end + 1):
+                            if 1 <= idx <= len(entries):
+                                selected_indices.add(idx)
+                    else:
+                        is_numeric_parse = False
+                        break
+                elif token.isdigit():
+                    idx = int(token)
+                    if 1 <= idx <= len(entries):
+                        selected_indices.add(idx)
+                else:
+                    is_numeric_parse = False
+                    break
+            
+            if is_numeric_parse and selected_indices:
+                to_delete = [entries[i - 1] for i in sorted(selected_indices)]
+            else:
+                # Try substring search across question / slug
+                matched = [e for e in entries if user_input.lower() in e["question"].lower() or user_input.lower() in e["slug"].lower()]
+                if matched:
+                    to_delete = matched
+                else:
+                    print(f"[!] No entries matching '{user_input}'.")
+                    return
+
+    if not to_delete:
+        print("[!] No valid items selected for deletion.")
+        return
+
+    print(f"\nItem(s) selected for deletion ({len(to_delete)}):")
+    for e in to_delete:
+        sub_tag = f" (#{e['pred_idx']+1})" if e["total_preds"] > 1 else ""
+        print(f" - [{e['category'].upper()}] ID: {e['market_id']}{sub_tag} | {e['question']}")
+        
+    confirm = input(f"\nConfirm deletion of {len(to_delete)} item(s) from history? (y/n): ").strip().lower()
+    if confirm != "y":
+        print("[!] Deletion cancelled.")
+        return
+
+    # Group deletions by (category, market_id)
+    by_market = {}
+    for e in to_delete:
+        key = (e["category"], e["market_id"])
+        if key not in by_market:
+            by_market[key] = []
+        by_market[key].append(e["pred_idx"])
+
+    for (cat, m_id), del_indices in by_market.items():
+        if cat == "skipped":
+            history.get("skipped", {}).pop(m_id, None)
+        else:
+            cat_dict = history.get(cat, {})
+            if m_id in cat_dict:
+                curr_list = ensure_list(cat_dict[m_id])
+                if None in del_indices or set(del_indices) >= set(range(len(curr_list))):
+                    cat_dict.pop(m_id, None)
+                else:
+                    new_list = [p for idx, p in enumerate(curr_list) if idx not in del_indices]
+                    if new_list:
+                        cat_dict[m_id] = new_list
+                    else:
+                        cat_dict.pop(m_id, None)
+
+    save_history(stringify_overflow(history))
+    print(f"[+] Successfully deleted {len(to_delete)} item(s) from prediction history.\n")
+
+def clear_specific_category(history):
+    pred_count = len(history.get("predicted", {}))
+    skip_count = len(history.get("skipped", {}))
+    res_count = len(history.get("resolved", {}))
+    
+    print("\nSelect Category to Clear:")
+    print(f" 1: 'Predicted' Markets ({pred_count})")
+    print(f" 2: 'Skipped' Markets ({skip_count})")
+    print(f" 3: 'Resolved' Markets ({res_count})")
+    print(" 4: Cancel")
+    
+    cat_sel = input("> ").strip()
+    cat_map = {"1": "predicted", "2": "skipped", "3": "resolved"}
+    if cat_sel not in cat_map:
+        print("[!] Cancelled.")
+        return
+        
+    target_cat = cat_map[cat_sel]
+    count = len(history.get(target_cat, {}))
+    if count == 0:
+        print(f"[!] '{target_cat}' is already empty.")
+        return
+        
+    confirm = input(f"WARNING: Type 'CONFIRM' to clear all {count} '{target_cat}' markets: ").strip()
+    if confirm == "CONFIRM":
+        history[target_cat] = {}
+        save_history(stringify_overflow(history))
+        print(f"[+] All '{target_cat}' markets cleared from history.\n")
+    else:
+        print("[!] Category clear cancelled.")
+
+def handle_delete_data():
+    history = load_history()
+    pred_count = len(history.get("predicted", {}))
+    skip_count = len(history.get("skipped", {}))
+    res_count = len(history.get("resolved", {}))
+    total_markets = pred_count + skip_count + res_count
+
+    print("\n--- DELETE DATA ---")
+    print(" 1: Delete all data (Full reset)")
+    print(f" 2: Selectively delete specific markets ({total_markets} in history)")
+    print(" 3: Clear specific category (Predicted, Skipped, or Resolved)")
+    print(" 4: Cancel")
+    
+    sub_choice = input("> ").strip()
+    
+    if sub_choice == "1":
+        confirm = input("WARNING: Type 'CONFIRM' to delete all local data: ").strip()
+        if confirm == "CONFIRM":
+            if os.path.exists(HISTORY_FILE): 
+                os.remove(HISTORY_FILE)
+            print("All data deleted.")
+        else:
+            print("[!] Data deletion cancelled.")
+            
+    elif sub_choice == "2":
+        if total_markets == 0:
+            print("[!] History is empty. No data to delete.")
+            return
+        delete_specific_markets(history)
+        
+    elif sub_choice == "3":
+        if total_markets == 0:
+            print("[!] History is empty. No data to delete.")
+            return
+        clear_specific_category(history)
+        
+    elif sub_choice in ["4", ""]:
+        print("[!] Deletion cancelled.")
+    else:
+        print("[!] Invalid selection.")
+
 if __name__ == "__main__":
     while True:
         print(" 1: Discover Markets")
         print(" 2: Review Markets")
         print(" 3: Target Specific URLs/Slugs")
-        print(" 4: Delete all data")
+        print(" 4: Delete Data (All or Selective)")
         print(" 5: Import Polymarket Wallet Positions")
         print(" 6: Custom Market Calculator")
         print(" 7: Manually Resolve Open Markets")
-        print(" 8: Exit")
+        print(" 8: Settings / Filters")
+        print(" 9: Exit")
         
         choice = input("> ").strip()
         
@@ -1146,9 +1412,48 @@ if __name__ == "__main__":
         target_exclude_mode = "none" # Default initialization
         discovery_order = "volume"
         
-        if choice == "8":
+        if choice == "9":
             print("Exiting program.")
             break
+            
+        elif choice == "8":
+            print("\n--- SETTINGS / FILTERS ---")
+            print(f" 1: Min Edge       = {MIN_EDGE*100:.2f}%  (skip bets below this edge)")
+            print(f" 2: Max Days       = {MAX_DAYS}  (ignore markets beyond this horizon)")
+            print(f" 3: Min Days       = {MIN_DAYS}  (ignore markets resolving sooner than this)")
+            print(f" 4: Extreme Odds   = {EXTREME_ODDS*100:.2f}%  (tail-risk filter — skip near 0% or 100%)")
+            print(f" 5: Bankroll       = ${BANKROLL:,.2f}  (manual override; overwritten by wallet import)")
+            print(f"\nEnter a setting number to edit, or hit enter to cancel.")
+            s_choice = input("> ").strip()
+            setting_map = {"1": "MIN_EDGE", "2": "MAX_DAYS", "3": "MIN_DAYS", "4": "EXTREME_ODDS", "5": "BANKROLL"}
+            if s_choice in setting_map:
+                param = setting_map[s_choice]
+                current_val = {"MIN_EDGE": MIN_EDGE, "MAX_DAYS": MAX_DAYS, "MIN_DAYS": MIN_DAYS,
+                               "EXTREME_ODDS": EXTREME_ODDS, "BANKROLL": BANKROLL}[param]
+                hint = {
+                    "MIN_EDGE": "e.g. 0.02 for 2% — set 0 to take any positive edge",
+                    "MAX_DAYS": "e.g. 90 — markets resolving beyond this are ignored",
+                    "MIN_DAYS": "e.g. 1 — skip markets resolving within 1 day (0 = no floor)",
+                    "EXTREME_ODDS": "e.g. 0.02 for 2% — skip markets priced below 2% or above 98%",
+                    "BANKROLL": "e.g. 100.00 — your total betting capital in USD"
+                }[param]
+                new_raw = input(f"New value for {param} (currently {current_val}) [{hint}]: ").strip()
+                if new_raw:
+                    try:
+                        new_val = float(new_raw)
+                        if param == "MIN_EDGE": MIN_EDGE = new_val
+                        elif param == "MAX_DAYS": MAX_DAYS = new_val
+                        elif param == "MIN_DAYS": MIN_DAYS = new_val
+                        elif param == "EXTREME_ODDS": EXTREME_ODDS = new_val
+                        elif param == "BANKROLL": BANKROLL = new_val
+                        print(f"[+] {param} updated to {new_val}.")
+                    except ValueError:
+                        print("[!] Invalid value — setting unchanged.")
+                else:
+                    print("[!] No change made.")
+            elif s_choice != "":
+                print("[!] Invalid selection.")
+            continue
             
         elif choice == "7":
             history = load_history()
@@ -1310,12 +1615,7 @@ if __name__ == "__main__":
             continue
             
         elif choice == "4":
-            confirm = input("WARNING: Type 'CONFIRM' to delete all local data: ")
-            if confirm == "CONFIRM":
-                if os.path.exists(HISTORY_FILE): os.remove(HISTORY_FILE)
-                print("All data deleted.")
-            else:
-                print("[!] Data deletion cancelled.")
+            handle_delete_data()
             continue
             
         elif choice == "3":
@@ -1409,7 +1709,7 @@ if __name__ == "__main__":
                 print("[!] Invalid selection. Please choose 1, 2, 3, 4, or 5.")
                 
         else:
-            print("[!] Invalid selection. Please choose 1-6.")
+            print("[!] Invalid selection. Please choose 1-9.")
             continue
             
         portfolio = run_prediction_session(mode=op_mode, sub_mode=sub_mode, target_slugs=targets, category=category, max_offset=session_max_offset, exclude_mode=target_exclude_mode, discovery_order=discovery_order)
