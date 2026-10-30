@@ -4,6 +4,8 @@ import json
 import os
 import random
 import re
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
@@ -28,27 +30,56 @@ def get_wallet_usdc_balance(wallet_address):
     if not wallet_address or not wallet_address.startswith("0x"):
         return None
     rpcs = [
-        "https://polygon-rpc.com",
-        "https://polygon.llamarpc.com",
-        "https://rpc.ankr.com/polygon"
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://1rpc.io/matic",
+        "https://polygon.drpc.org"
     ]
-    usdc_contract = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+    # Polymarket USD (pUSD collateral), Bridged USDC.e, and Native USDC on Polygon (all 6 decimals)
+    collateral_contracts = [
+        "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+    ]
     addr_clean = wallet_address.lower().replace('0x', '').zfill(64)
     data = '0x70a08231' + addr_clean
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [{"to": usdc_contract, "data": data}, "latest"],
-        "id": 1
-    }
+    batch_payload = [
+        {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": contract, "data": data}, "latest"],
+            "id": idx
+        }
+        for idx, contract in enumerate(collateral_contracts)
+    ]
     for rpc in rpcs:
         try:
-            resp = api.post(rpc, json=payload, timeout=3).json()
-            result_hex = resp.get("result", "0x0")
-            return int(result_hex, 16) / 10**6
+            resp = api.post(rpc, json=batch_payload, timeout=5).json()
+            if isinstance(resp, list):
+                valid_results = [item.get("result") for item in resp if isinstance(item, dict) and item.get("result") and "error" not in item]
+                if valid_results:
+                    return sum(int(r_hex, 16) / 10**6 for r_hex in valid_results if r_hex != "0x")
         except Exception:
             continue
     return None
+
+def get_wallet_portfolio_value(wallet_address, positions=None):
+    if not wallet_address or not wallet_address.startswith("0x"):
+        return 0.0
+    try:
+        val_resp = api.get(f"https://data-api.polymarket.com/value?user={wallet_address}", timeout=5).json()
+        if isinstance(val_resp, list) and len(val_resp) > 0 and "value" in val_resp[0]:
+            return float(val_resp[0]["value"] or 0.0)
+    except Exception:
+        pass
+    if positions:
+        total = 0.0
+        for pos in positions:
+            size = float(pos.get("size", 0.0))
+            avg_price = float(pos.get("avgPrice", 0.0))
+            value = float(pos.get("currentValue", pos.get("initialValue", size * avg_price)))
+            total += value
+        return total
+    return 0.0
 
 def calculate_vwap(asks, target_usdc):
     if not asks or target_usdc <= 0:
@@ -114,135 +145,338 @@ def refresh_prices_from_clob(m):
         pass
     return m
 
-def import_polymarket_positions(wallet_address, history):
+def get_market_clob_tokens(m):
+    clob_ids_str = m.get('clobTokenIds')
+    if not clob_ids_str:
+        return None, None
+    try:
+        clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
+        if not clob_ids:
+            return None, None
+        yes_token = clob_ids[0] if len(clob_ids) > 0 else None
+        no_token = clob_ids[1] if len(clob_ids) > 1 else None
+        return yes_token, no_token
+    except Exception:
+        return None, None
+
+def stream_clob_book(m, custom_token_id=None):
+    yes_token, no_token = get_market_clob_tokens(m)
+    print("\n--- CLOB ORDERBOOK & TOKEN IDs ---")
+    print(f"Market ID    : {m.get('id', 'unknown')}")
+    print(f"Condition ID : {m.get('conditionId', 'unknown')}")
+    print(f"YES Token ID : {yes_token or 'N/A'}")
+    print(f"NO Token ID  : {no_token or 'N/A'}")
+
+    if custom_token_id:
+        if custom_token_id.lower() in ("no", "2") and no_token:
+            target_token = no_token
+            token_label = "NO"
+        elif custom_token_id.lower() in ("yes", "1") and yes_token:
+            target_token = yes_token
+            token_label = "YES"
+        else:
+            target_token = custom_token_id
+            token_label = "CUSTOM" if target_token not in (yes_token, no_token) else ("YES" if target_token == yes_token else "NO")
+    else:
+        target_token = yes_token
+        token_label = "YES"
+
+    if not target_token:
+        print("[!] No valid CLOB Token ID available to query.\n")
+        return ""
+
+    print(f"Querying Book: [{token_label}] {target_token}")
+    print("[*] Live CLOB refresh active -- Press Enter to stop (or type % bounds / command + Enter)...")
+
+    is_running = True
+    captured_input = []
+
+    def wait_for_user():
+        nonlocal is_running
+        try:
+            user_text = input()
+            captured_input.append(user_text.strip())
+        except EOFError:
+            pass
+        is_running = False
+
+    listener = threading.Thread(target=wait_for_user, daemon=True)
+    listener.start()
+
+    while is_running:
+        try:
+            r = api.get(f"https://clob.polymarket.com/book?token_id={target_token}", timeout=5)
+            if r.status_code == 200:
+                book = r.json()
+                bids_raw = book.get('bids', [])
+                asks_raw = book.get('asks', [])
+                bids = [(float(b['price']), float(b['size'])) for b in bids_raw if float(b.get('price', 0)) > 0]
+                asks = [(float(a['price']), float(a['size'])) for a in asks_raw if float(a.get('price', 0)) > 0]
+
+                if bids:
+                    best_bid, bid_size = max(bids, key=lambda x: x[0])
+                else:
+                    best_bid, bid_size = 0.0, 0.0
+
+                if asks:
+                    best_ask, ask_size = min(asks, key=lambda x: x[0])
+                else:
+                    best_ask, ask_size = 1.0, 0.0
+
+                midpoint = (best_bid + best_ask) / 2.0
+                spread = max(0.0, best_ask - best_bid)
+
+                if target_token == yes_token:
+                    m['bestBid'] = best_bid
+                    m['bestAsk'] = best_ask
+                    m['outcomePrices'] = [midpoint, 1.0 - midpoint]
+                    m['cached_bid'], m['cached_ask'], m['cached_mid'] = best_bid, best_ask, midpoint
+                elif target_token == no_token:
+                    yes_bid = 1.0 - best_ask
+                    yes_ask = 1.0 - best_bid
+                    yes_mid = (yes_bid + yes_ask) / 2.0
+                    m['bestBid'] = yes_bid
+                    m['bestAsk'] = yes_ask
+                    m['outcomePrices'] = [yes_mid, 1.0 - yes_mid]
+                    m['cached_bid'], m['cached_ask'], m['cached_mid'] = yes_bid, yes_ask, yes_mid
+
+                now_str = datetime.now().strftime("%H:%M:%S")
+                status_line = (
+                    f"[{now_str} {token_label}] "
+                    f"Bid: {best_bid*100:.1f}% ({bid_size:,.0f} sh) | "
+                    f"Ask: {best_ask*100:.1f}% ({ask_size:,.0f} sh) | "
+                    f"Mid: {midpoint*100:.1f}% | Spread: {spread*100:.1f}%   "
+                )
+                print(status_line, end="\r", flush=True)
+            else:
+                print(f"[!] CLOB HTTP {r.status_code} for token {target_token[:16]}...   ", end="\r", flush=True)
+        except Exception as e:
+            print(f"[!] CLOB refresh error: {e}   ", end="\r", flush=True)
+
+        for _ in range(10):
+            if not is_running:
+                break
+            time.sleep(0.15)
+
+    print()
+    return captured_input[0] if captured_input else ""
+
+def resolve_position_market_metadata(pos, event_cache=None):
+    if event_cache is None:
+        event_cache = {}
+    cond_id = pos.get("conditionId")
+    event_id = pos.get("eventId")
+    pos_slug = pos.get("slug")
+    m = None
+
+    # 1. Lookup via parent Event ID (accurate & fast, caches multi-market events)
+    if event_id:
+        event_id_str = str(event_id)
+        if event_id_str not in event_cache:
+            try:
+                ev_resp = api.get(f"{GAMMA_API}/events/{event_id_str}", timeout=5).json()
+                event_cache[event_id_str] = ev_resp if isinstance(ev_resp, dict) else {}
+            except Exception:
+                event_cache[event_id_str] = {}
+        ev_data = event_cache.get(event_id_str, {})
+        for cand in ev_data.get("markets", []):
+            if cand.get("conditionId") == cond_id or (pos_slug and cand.get("slug") == pos_slug):
+                m = cand
+                break
+
+    # 2. Fallback: Lookup via market slug on Gamma API and verify conditionId
+    if not m and pos_slug:
+        try:
+            resp = api.get(f"{GAMMA_API}/markets?slug={pos_slug}", timeout=5).json()
+            if isinstance(resp, list):
+                for cand in resp:
+                    if cand.get("conditionId") == cond_id or cand.get("slug") == pos_slug:
+                        m = cand
+                        break
+        except Exception:
+            pass
+
+    # 3. Extract metadata using Gamma market or position fields directly
+    market_id = str(m.get("id")) if (m and m.get("id")) else str(cond_id)
+    question = (m.get("question") if m else None) or pos.get("title") or "unknown"
+    slug = pos.get("eventSlug") or pos.get("slug") or (m.get("slug") if m else "unknown")
+    end_date = (m.get("endDate") if m else None) or pos.get("endDate") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return m, market_id, question, slug, end_date
+
+def determine_redeemable_outcome(pos, m=None):
+    if m:
+        prices = parse_outcome_prices(m)
+        if len(prices) >= 2:
+            if prices[0] == 1.0:
+                return 1.0
+            elif prices[1] == 1.0:
+                return 0.0
+    try:
+        cur_price = float(pos.get("curPrice", 0.5))
+        outcome_idx = int(pos.get("outcomeIndex", 0))
+        if cur_price >= 0.99:
+            return 1.0 if outcome_idx == 0 else 0.0
+        elif cur_price <= 0.01:
+            return 0.0 if outcome_idx == 0 else 1.0
+    except Exception:
+        pass
+    outcome_str = pos.get("outcome", "Yes")
+    return 1.0 if outcome_str == "Yes" else 0.0 if outcome_str == "No" else 0.5
+
+def import_polymarket_positions(wallet_address, history, auto_sync=False):
     global BANKROLL
+    saved_wallet = history.get("wallet_address") or POLYGON_WALLET
     if not wallet_address:
-        wallet_address = input("Enter Polymarket wallet address (0x...): ").strip()
-    if not wallet_address.startswith("0x"):
+        if auto_sync and saved_wallet:
+            wallet_address = saved_wallet
+        else:
+            prompt_str = f"Enter Polymarket wallet address (0x...) [Press Enter for {saved_wallet}]: " if saved_wallet else "Enter Polymarket wallet address (0x...): "
+            user_w = input(prompt_str).strip()
+            wallet_address = user_w if user_w else saved_wallet
+
+    if not wallet_address or not wallet_address.startswith("0x"):
         print("[!] Invalid address format.")
         return history
-        
+
+    history["wallet_address"] = wallet_address
     base_ego = calculate_base_ego(history)
-        
-    print(f"[*] Fetching positions from Polymarket for {wallet_address}...")
+
+    print(f"[*] Syncing Polymarket wallet {wallet_address}...")
     try:
         url = f"https://data-api.polymarket.com/positions?user={wallet_address}"
         positions = api.get(url, timeout=10).json()
+        if not isinstance(positions, list):
+            positions = []
     except Exception as e:
         print(f"[!] Error fetching positions: {e}")
-        return history
-        
-    if not positions:
-        print("[*] No positions found on Polymarket for this user.")
-        return history
-        
-    print("[*] Calculating Live Portfolio Value...")
-    cash_balance = get_wallet_usdc_balance(wallet_address) or 0.0
-    portfolio_value = 0.0
-    
-    for pos in positions:
-        size = float(pos.get("size", 0.0))
-        avg_price = float(pos.get("avgPrice", 0.0))
-        # Polymarket data API often provides currentValue, otherwise fallback to cost basis (initialValue)
-        value = float(pos.get("currentValue", pos.get("initialValue", size * avg_price)))
-        portfolio_value += value
-        
+        positions = []
+
+    print("[*] Calculating Live Cash & Portfolio Values...")
+    cash_balance = get_wallet_usdc_balance(wallet_address)
+    if cash_balance is None:
+        cash_balance = history.get("wallet_summary", {}).get("cash", 0.0)
+    portfolio_value = get_wallet_portfolio_value(wallet_address, positions)
+
     BANKROLL = cash_balance + portfolio_value
+    history["wallet_summary"] = {
+        "cash": cash_balance,
+        "portfolio": portfolio_value,
+        "bankroll": BANKROLL,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    }
     print(f"Live Bankroll Updated: ${BANKROLL:,.2f} (Cash: ${cash_balance:,.2f} | Portfolio: ${portfolio_value:,.2f})")
-    
-    print(f"Found {len(positions)} positions. Importing new ones...")
+
+    if not positions:
+        print("[*] No positions returned from Polymarket positions endpoint.")
+        return history
+
+    print(f"Found {len(positions)} positions. Syncing updates and importing new ones...")
     imported_predicted = 0
     imported_resolved = 0
-    
+    updated_existing = 0
+    event_cache = {}
+
     for pos in positions:
         cond_id = pos.get("conditionId")
         if not cond_id:
             continue
-            
-        # Check if already in history (under predicted or resolved keys)
-        already_stored = False
-        for m_id, preds in history.get("predicted", {}).items():
-            preds_list = ensure_list(preds)
-            if any(p.get("conditionId") == cond_id for p in preds_list):
-                already_stored = True
-                break
-        if not already_stored:
-            for m_id, res in history.get("resolved", {}).items():
-                res_list = ensure_list(res)
-                if any(r.get("conditionId") == cond_id for r in res_list):
-                    already_stored = True
-                    break
-                    
-        if already_stored:
-            continue
-            
-        # Query Gamma API to resolve metadata
-        try:
-            resp = api.get(f"{GAMMA_API}/markets?conditionId={cond_id}", timeout=5).json()
-            if not resp or not isinstance(resp, list):
-                continue
-            m = resp[0]
-        except Exception:
-            continue
-            
-        market_id = m.get("id")
-        question = m.get("question")
-        slug = m.get("slug")
-        
-        # Calculate attributes
+
+        m, market_id, question, slug, end_date = resolve_position_market_metadata(pos, event_cache)
         avg_price = float(pos.get("avgPrice", 0.5))
         size = float(pos.get("size", 0.0))
         initial_val = float(pos.get("initialValue", size * avg_price))
-        
-        # Avoid zero division
         kelly_val = initial_val / BANKROLL if BANKROLL > 0 else 0.0
-        
+
+        try:
+            res_dt = datetime.fromisoformat(str(end_date).replace('Z', '+00:00'))
+            if res_dt.tzinfo is None:
+                res_dt = res_dt.replace(tzinfo=timezone.utc)
+            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+            days_until = seconds_left / 86400.0
+        except Exception:
+            days_until = 0.0
+
+        # Check if already stored in history (under predicted or resolved keys) and update live values
+        already_stored = False
+        for m_id in list(history.get("predicted", {}).keys()):
+            preds_list = ensure_list(history["predicted"][m_id])
+            matched = False
+            for p in preds_list:
+                if p.get("conditionId") == cond_id:
+                    already_stored = True
+                    matched = True
+                    p["question"] = question
+                    p["slug"] = slug
+                    p["pm"] = avg_price
+                    p["kelly"] = kelly_val
+                    p["edge"] = p.get("pu", avg_price) - avg_price
+                    _, p["apy"] = calculate_annualized_yield(p["edge"], avg_price, days_until)
+                    updated_existing += 1
+            if matched:
+                # Re-key if previously stored under wrong market_id (e.g. legacy conditionId bug)
+                target_key = market_id
+                if m_id != target_key:
+                    history["predicted"].pop(m_id, None)
+                    history["predicted"].setdefault(target_key, []).extend(preds_list)
+                if pos.get("redeemable"):
+                    outcome_val = determine_redeemable_outcome(pos, m)
+                    moved = ensure_list(history["predicted"].pop(target_key, []))
+                    for p in moved:
+                        p["outcome"] = outcome_val
+                    history["resolved"].setdefault(target_key, []).extend(moved)
+                break
+
+        if not already_stored:
+            for m_id in list(history.get("resolved", {}).keys()):
+                res_list = ensure_list(history["resolved"][m_id])
+                matched = False
+                for r in res_list:
+                    if r.get("conditionId") == cond_id:
+                        already_stored = True
+                        matched = True
+                        r["question"] = question
+                        r["slug"] = slug
+                        r["pm"] = avg_price
+                        r["kelly"] = kelly_val
+                        r["outcome"] = determine_redeemable_outcome(pos, m)
+                        updated_existing += 1
+                if matched and m_id != market_id:
+                    history["resolved"].pop(m_id, None)
+                    history["resolved"].setdefault(market_id, []).extend(res_list)
+                if matched:
+                    break
+
+        if already_stored:
+            continue
+
         outcome_str = pos.get("outcome", "Yes")
-        
+
         print(f"\n[IMPORT] Question: {question}")
-        print(f"         Outcome: {outcome_str}  |  Entry Price (pm): {avg_price*100:.1f}%")
-        
+        print(f"         Outcome: {outcome_str}  |  Entry Price (pm): {avg_price*100:.1f}%  |  Cost Basis: ${initial_val:,.2f}")
+
         pu_input = input("         Enter your subjective probability bounds % (e.g., 60-70 or 65) or press enter to skip: ").strip()
         try:
             if pu_input:
                 lower, upper = parse_user_input(pu_input)
             else:
                 lower, upper = avg_price, avg_price
-        except:
+        except Exception:
             lower, upper = avg_price, avg_price
-            
+
         pu_val = (lower + upper) / 2.0
         edge = pu_val - avg_price
-        
-        # Reverse-calculate dynamic_ego using the user bounds
+
         u_spread = upper - lower
-        m_spread = 0.0 # Unknown historic market spread, assuming fully tight
-        
+        m_spread = 0.0
         u_conviction = base_ego * (1.0 - u_spread)
         m_conviction = (1.0 - base_ego) * (1.0 - m_spread)
         if (u_conviction + m_conviction) > 0:
             dynamic_ego = u_conviction / (u_conviction + m_conviction)
         else:
             dynamic_ego = base_ego
-        
-        if outcome_str == "No":
-            # For 'No', the true subjective probability is 1 - pu. Wait, the user is buying 'No' shares at avgPrice.
-            # Usually, pu for 'No' would be interpreted as the probability of 'No' occurring.
-            # But in the database, `pu` is strictly the probability of `Yes`.
-            # If the user enters the probability of their outcome (No), we should normalize it.
-            # Let's just store the pu as entered if we assume the user understands pu is the probability of Yes.
-            pass
-        
-        # Calculate APY
-        try:
-            res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
-            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
-            days_until = seconds_left / 86400.0
-        except:
-            days_until = 0.0
-            
+
         _, apy = calculate_annualized_yield(edge, avg_price, days_until)
-        
+
         pred_entry = {
             "question": question,
             "slug": slug,
@@ -255,11 +489,9 @@ def import_polymarket_positions(wallet_address, history):
             "apy": apy,
             "conditionId": cond_id
         }
-        
-        # Put in resolved or predicted based on redeemable status
+
         if pos.get("redeemable"):
-            outcome_val = 1.0 if outcome_str == "Yes" else 0.0 if outcome_str == "No" else 0.5
-            pred_entry["outcome"] = outcome_val
+            pred_entry["outcome"] = determine_redeemable_outcome(pos, m)
             if market_id not in history["resolved"]:
                 history["resolved"][market_id] = []
             history["resolved"][market_id].append(pred_entry)
@@ -269,11 +501,12 @@ def import_polymarket_positions(wallet_address, history):
                 history["predicted"][market_id] = []
             history["predicted"][market_id].append(pred_entry)
             imported_predicted += 1
-            
-    print(f"\n[+] Import complete: {imported_predicted} open predictions and {imported_resolved} resolved predictions imported.")
+
+    print(f"\n[+] Sync complete: {imported_predicted} open imported, {imported_resolved} resolved imported, {updated_existing} existing updated.")
     return history
 
 def load_history():
+    global BANKROLL
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, 'r') as f: 
@@ -282,6 +515,10 @@ def load_history():
                     return {"predicted": {}, "skipped": {}, "resolved": {}}
                 if "resolved" not in data:
                     data["resolved"] = {}
+                if "wallet_summary" in data and isinstance(data["wallet_summary"], dict):
+                    saved_br = data["wallet_summary"].get("bankroll")
+                    if saved_br and saved_br > 0:
+                        BANKROLL = float(saved_br)
                 return data
         except json.JSONDecodeError:
             pass
@@ -533,6 +770,120 @@ def print_review_table(history, sub_mode):
                 
         print(" | ".join(row_parts))
     print("=" * len(header_str) + "\n")
+    if sub_mode in ["predicted", "predicted_skipped", "resolved", "all"]:
+        print_prediction_stats(history, sub_mode=sub_mode)
+
+def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
+    if base_ego is None:
+        resolved = history.get("resolved", {})
+        bs_u_total, bs_m_total, total_w = 0.0, 0.0, 0.0
+        for market_preds in resolved.values():
+            for data in ensure_list(market_preds):
+                w = data.get("kelly", 0.0)
+                if w <= 0:
+                    continue
+                outcome = data.get("outcome", 0)
+                bs_u_total += w * ((data.get("pu", 0.5) - outcome) ** 2)
+                bs_m_total += w * ((data.get("pm", 0.5) - outcome) ** 2)
+                total_w += w
+        if total_w > 0 and (bs_u_total + bs_m_total) > 0:
+            base_ego = bs_m_total / (bs_u_total + bs_m_total)
+        else:
+            base_ego = 0.50
+
+    preds_list = []
+    if sub_mode in ["predicted", "predicted_skipped", "all"]:
+        for m_preds in history.get("predicted", {}).values():
+            preds_list.extend(ensure_list(m_preds))
+    if sub_mode in ["resolved", "all"]:
+        for m_res in history.get("resolved", {}).values():
+            preds_list.extend(ensure_list(m_res))
+
+    if not preds_list:
+        return None
+
+    eps = 0.01
+    items = []
+    for p in preds_list:
+        pu = float(p.get("pu", 0.5))
+        pm = float(p.get("pm", 0.5))
+        kelly = max(0.0, float(p.get("kelly", 0.0)))
+        ego = float(p.get("dynamic_ego", base_ego))
+
+        pu_clip = float(np.clip(pu, eps, 1.0 - eps))
+        pm_clip = float(np.clip(pm, eps, 1.0 - eps))
+        logit_pu = math.log(pu_clip / (1.0 - pu_clip))
+        logit_pm = math.log(pm_clip / (1.0 - pm_clip))
+        logit_norm = (ego * logit_pu) + ((1.0 - ego) * logit_pm)
+        pu_norm = 1.0 / (1.0 + math.exp(-logit_norm))
+
+        if pu >= pm:
+            win_prob_bal = pu_norm
+            win_prob_u = pu
+            win_prob_m = pm
+        else:
+            win_prob_bal = 1.0 - pu_norm
+            win_prob_u = 1.0 - pu
+            win_prob_m = 1.0 - pm
+
+        var_i = win_prob_bal * (1.0 - win_prob_bal)
+        alloc_i = kelly * BANKROLL
+        items.append({
+            "kelly": kelly,
+            "alloc": alloc_i,
+            "win_prob_bal": win_prob_bal,
+            "win_prob_u": win_prob_u,
+            "win_prob_m": win_prob_m,
+            "var_i": var_i
+        })
+
+    total_kelly = sum(x["kelly"] for x in items)
+    total_alloc = sum(x["alloc"] for x in items)
+    active_items = [x for x in items if x["kelly"] > 0]
+
+    if total_kelly > 0 and active_items:
+        weights = [x["kelly"] / total_kelly for x in active_items]
+        used_items = active_items
+    else:
+        n_all = len(items)
+        weights = [1.0 / n_all for _ in items]
+        used_items = items
+
+    exp_win_bal = sum(w * x["win_prob_bal"] for w, x in zip(weights, used_items))
+    exp_win_u = sum(w * x["win_prob_u"] for w, x in zip(weights, used_items))
+    exp_win_m = sum(w * x["win_prob_m"] for w, x in zip(weights, used_items))
+
+    norm_variance = sum((w ** 2) * x["var_i"] for w, x in zip(weights, used_items))
+    norm_std_dev = math.sqrt(norm_variance)
+    sum_w_sq = sum(w ** 2 for w in weights)
+    effective_n = (1.0 / sum_w_sq) if sum_w_sq > 0 else 0.0
+
+    return {
+        "total_count": len(items),
+        "active_count": len(active_items),
+        "total_kelly": total_kelly,
+        "total_alloc": total_alloc,
+        "bankroll": BANKROLL,
+        "exp_win_bal": exp_win_bal,
+        "exp_win_u": exp_win_u,
+        "exp_win_m": exp_win_m,
+        "norm_variance": norm_variance,
+        "norm_std_dev": norm_std_dev,
+        "effective_n": effective_n
+    }
+
+def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
+    stats = calculate_prediction_stats(history, sub_mode=sub_mode, base_ego=base_ego)
+    if not stats:
+        return
+    print("--- PREDICTION BALANCING & VARIANCE STATS ---")
+    print(f"Predictions      : {stats['active_count']} active ({stats['total_count']} total) | Effective N: {stats['effective_n']:.2f}")
+    w_sum = history.get("wallet_summary")
+    if isinstance(w_sum, dict) and "cash" in w_sum and "portfolio" in w_sum:
+        print(f"Wallet Bankroll  : ${stats['bankroll']:,.2f} (Cash: ${w_sum['cash']:,.2f} | Positions: ${w_sum['portfolio']:,.2f})")
+    print(f"Allocated Capital: ${stats['total_alloc']:,.2f} / ${stats['bankroll']:,.2f} ({stats['total_kelly']*100:.1f}% Kelly)")
+    print(f"Expected Win Rate: {stats['exp_win_bal']*100:.2f}% Balanced (User: {stats['exp_win_u']*100:.2f}% | Market: {stats['exp_win_m']*100:.2f}%)")
+    print(f"Prob. Variance   : {stats['norm_variance']:.4f} (Std Dev: +/-{stats['norm_std_dev']*100:.2f}%)\n")
 
 def calculate_base_ego(history):
     resolved = history.get("resolved", {})
@@ -877,17 +1228,12 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
 def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, category="All", max_offset=0, exclude_mode="none", discovery_order="volume"):
     global BANKROLL
     
-    # Live wallet bankroll update
-    if POLYGON_WALLET:
-        print(f"[*] Fetching live USDC balance on Polygon for wallet {POLYGON_WALLET}...")
-        balance = get_wallet_usdc_balance(POLYGON_WALLET)
-        if balance is not None:
-            BANKROLL = balance
-            print(f"Wallet USDC Balance successfully loaded: ${BANKROLL:,.2f}")
-        else:
-            print(f"[!] Failed to fetch live wallet balance. Falling back to default: ${BANKROLL:,.2f}")
+    history = load_history()
+    active_wallet = POLYGON_WALLET or history.get("wallet_address")
+    if active_wallet:
+        history = import_polymarket_positions(active_wallet, history, auto_sync=True)
             
-    history = update_resolutions(load_history())
+    history = update_resolutions(history)
     save_history(stringify_overflow(history))
     
     if mode == "review":
@@ -986,7 +1332,18 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
         print(f"Market   : {question}")
         print(f"Resolves : {exact_date_str} ({days_str})\n")
  
-        user_input = input("Enter % bounds ('36-48' or '42'), 's' (skip), 'r' (redo), 'q' (quit): ").strip()
+        while True:
+            user_input = input("Enter % bounds ('36-48' or '42'), 'l' (live), 's' (skip), 'r' (redo), 'q' (quit): ").strip()
+            cmd_parts = user_input.split()
+            if cmd_parts and cmd_parts[0].lower() in ('l', 'live'):
+                custom_tok = cmd_parts[1] if len(cmd_parts) > 1 else None
+                follow_up = stream_clob_book(m, custom_token_id=custom_tok)
+                pm_bid, pm_ask, pm_mid = m['cached_bid'], m['cached_ask'], m['cached_mid']
+                if follow_up:
+                    user_input = follow_up
+                    break
+                continue
+            break
  
         if user_input.lower() == 'q':
             print("\nSaving and quitting session...")
@@ -1149,6 +1506,7 @@ def run_prediction_session(mode="discover", sub_mode="all", target_slugs=None, c
             
             print(f"EXPOSURE     : {cumulative_exposure*100:.1f}% of Bankroll Used")
             print(f"SESSION DATA : {len(session_trades)} predictions | Total Allocated: ${sum(session_trades.values()):,.2f}\n")
+            print_prediction_stats(history, sub_mode="predicted", base_ego=base_ego)
 
             current_index += 1 
                 
