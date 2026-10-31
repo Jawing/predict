@@ -388,12 +388,12 @@ def display_pager(markets, show_odds):
     while True:
         chunk = markets[current_idx : current_idx + PAGE_SIZE]
         
-        print("=" * 165)
+        print("=" * 173)
         header = f"{'Mkt Vol':<9} | {'24h Vol':<8} | {'Liq':<8} | {'Vel %':<5} | {'Spread':<6} | {'Ends In':<12} | "
-        if show_odds: header += f"{'Odds':<5} | "
+        if show_odds: header += f"{'Odds':<5} | {'Eff%':<5} | "
         header += f"{'Target URL Slug':<35} | Market Question"
         print(header)
-        print("=" * 165)
+        print("=" * 173)
         
         for m in chunk:
             m_vol_str = f"${m['m_vol']:,.0f}"
@@ -407,14 +407,18 @@ def display_pager(markets, show_odds):
             time_str = format_time_remaining(m['seconds'])
 
             odds_str = f"{m['odds']*100:.1f}%"
+            eff_str = f"{4.0 * m['odds'] * (1.0 - m['odds']) * 100:.1f}%"
+            url = f"https://polymarket.com/event/{m['target_slug']}"
+            slug_link = f"\033]8;;{url}\033\\{m['target_slug']:<35}\033]8;;\033\\"
+            q_link = f"\033]8;;{url}\033\\{m['question']}\033]8;;\033\\"
             
             row = f"{m_vol_str:<9} | {h24_str:<8} | {liq_str:<8} | {vel_str:<5} | {spr_str:<6} | {time_str:<12} | "
-            if show_odds: row += f"{odds_str:<5} | "
-            row += f"{m['target_slug']:<35} | {m['question']}"
+            if show_odds: row += f"{odds_str:<5} | {eff_str:<5} | "
+            row += f"{slug_link} | {q_link}"
             
             print(row)
             
-        print("=" * 165)
+        print("=" * 173)
         
         end_idx = min(current_idx + len(chunk), total_markets)
         prompt = f"\n[Showing {end_idx}/{total_markets}] [Right/Down/n] Next | [Left/Up/p] Prev | [q/Esc] Main Menu: "
