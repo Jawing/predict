@@ -1,49 +1,51 @@
 # Predict
 
-A CLI toolkit for exploring Polymarket and managing predictions.
+A quantitative CLI engine for discovering Polymarket opportunities, sizing predictions, and managing portfolios.
 
 ## Overview
 
-- `predict.py` - Main CLI for discovering markets, reviewing and managing prediction history.
-- `analyse.py` - Analytics tool for summarizing active markets, categories and computing metrics.
+`predict.py` is an interactive terminal tool that connects directly to Polymarket to help you find mispriced markets, size bets with mathematically optimal Kelly allocation, and track live positions across multiple wallets.
 
 ## Features
 
-- Calculate allocations using confidence weighted [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) 
-- Filter markets by prediction edge, time and odds
-- Saves predictions locally and compare [Brier scores](https://en.wikipedia.org/wiki/Brier_score)
+- **Balanced Kelly Sizing**: Sizes bets using the square-root Fisher geodesic (`gamma = 0.5`) to maximize compound growth while protecting against tail drawdowns.
+- **Calibrated Beliefs**: Adjusts your confidence using Bayesian log-odds pooling weighted by your historical Brier score accuracy (`Ego`).
+- **Real-Time CLOB Execution**: Walks live order-book depth to calculate exact VWAP prices, slippage, fees, and compounding APY.
+- **Multi-Wallet & Paper Profiles**: Track live Polygon wallets (`0x...`) with on-chain USDC sync, or create local paper-trading sandboxes with custom aliases.
+- **9 Discovery Vectors**: Scan markets by Volume, 24h Trending, Liquidity, Soonest, Competitive (50/50), Low Volume, Newest, or Multi-Vector.
+- **Portfolio & Tranche Management**: Review open positions, add tranches on pullbacks, and stage limit sells when targets are reached.
 
 ## Setup
 
-Install [Python](https://www.python.org/) and dependencies:
-
-```powershell
+1. Install dependencies:
+```bash
 pip install -r requirements.txt
 ```
 
-Run the CLI
-
-```powershell
+2. Run the CLI:
+```bash
 python predict.py
 ```
 
-## Configuration Settings for `predict.py`
-- `HISTORY_FILE = "prediction_history.json"`
-  - Local file used to store prediction history, skipped markets, and resolved outcomes.
-- `BANKROLL = 42.00`
-  - The total capital base used for allocation calculations.
-- `GAMMA_API = "https://gamma-api.polymarket.com"`
-  - Polymarket Gamma API base URL used for data fetches.
-- `MIN_EDGE = 0.01`
-  - Requires at least a 1% estimated edge before considering a trade.
-- `MAX_DAYS = 420`
-  - Excludes markets that resolve beyond 420 days to avoid overly long capital lock-up.
-- `MIN_DAYS = 0`
-  - Excludes markets resolving within fewer than 0 days (currently no minimum time horizon).
-- `EXTREME_ODDS = 0.01`
-  - Filters out extreme tail markets priced below 1% or above 99%.
+## Main Menu Options
 
-## Planned
+- `1: Discover Markets`: Scan Polymarket using 9 discovery vectors up to 2,000 events deep.
+- `2: Review Portfolio`: View open positions, stats, and add tranches or limit sells by row number.
+- `3: Target Specific URLs`: Paste any Polymarket event URL or slug to analyze and size instantly.
+- `4: Wallet Profiles`: Sync on-chain USDC balances, import open positions, or switch between wallet and paper accounts.
+- `5: Tools & Settings`: Access the custom market calculator, manage stored data, or adjust threshold filters.
 
-- Sync with Polymarket Portfolio
+## Configuration
 
+Settings can be edited in `config.py` or interactively via **Option 5 -> 3**:
+
+- `KELLY_GAMMA = 0.5`: Sizing mode (`0.5` = Balanced Kelly, `1.0` = Full Efficient, `0.0` = Normal Kelly).
+- `BANKROLL = 100.00`: Default capital base (automatically updated when syncing a live wallet).
+- `MIN_EDGE = 0.00`: Minimum required edge before considering a trade (e.g. `0.02` for 2%).
+- `MIN_DAYS = 0`: Minimum market duration in days.
+- `MAX_DAYS = 420`: Maximum market duration in days.
+- `EXTREME_ODDS = 0.00`: Tail filter to ignore extreme odds near 0% or 100%.
+
+## License
+
+MIT
