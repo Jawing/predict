@@ -4,16 +4,16 @@ A quantitative CLI engine for discovering Polymarket opportunities, sizing predi
 
 ## Overview
 
-`predict.py` is an interactive terminal tool that connects directly to Polymarket to help you find mispriced markets, size bets with mathematically optimal Kelly allocation, and track live positions across multiple wallets.
+`predict.py` is an interactive terminal tool that connects directly to Polymarket to help you find mispriced markets, size bets with optimal Kelly allocation, and track live positions across multiple portfolios.
 
 ## Features
 
-- **Balanced Kelly Sizing**: Sizes bets using the square-root Fisher geodesic (`gamma = 0.5`) to maximize compound growth while protecting against tail drawdowns.
-- **Calibrated Beliefs**: Adjusts your confidence using Bayesian log-odds pooling weighted by your historical Brier score accuracy (`Ego`).
+- **Balanced Kelly Sizing**: Sizes bets using the square-root Fisher geodesic to maximize compound growth while protecting against tail drawdowns.
+- **Calibrated Beliefs**: Adjusts your confidence using Bayesian log-odds pooling weighted by your historical Brier score accuracy.
 - **Real-Time CLOB Execution**: Walks live order-book depth to calculate exact VWAP prices, slippage, fees, and compounding APY.
-- **Multi-Wallet & Paper Profiles**: Track live Polygon wallets (`0x...`) with on-chain USDC sync, or create local paper-trading sandboxes with custom aliases.
-- **9 Discovery Vectors**: Scan markets by Volume, 24h Trending, Liquidity, Soonest, Competitive (50/50), Low Volume, Newest, or Multi-Vector.
-- **Portfolio & Tranche Management**: Review open positions, add tranches on pullbacks, and stage limit sells when targets are reached.
+- **Multi-Wallet & Paper Profiles**: Track live Polymarket portfolios, or create local paper-trading sandboxes.
+- **Discovery Vectors**: Scan markets by Volume, 24h Trending, Liquidity, Soonest, Competitive (50/50), Low Volume, Newest, or Multi-Vector.
+- **Portfolio Management**: Review open positions, add tranches on pullbacks, and stage limit sells when targets are reached.
 
 ## Setup
 
@@ -45,7 +45,3 @@ Settings can be edited in `config.py` or interactively via **Option 5 -> 3**:
 - `MIN_DAYS = 0`: Minimum market duration in days.
 - `MAX_DAYS = 420`: Maximum market duration in days.
 - `EXTREME_ODDS = 0.00`: Tail filter to ignore extreme odds near 0% or 100%.
-
-## License
-
-MIT
