@@ -29,6 +29,22 @@ from market import (
 from views import print_review_table, print_prediction_stats
 
 
+def format_velocity_display(edge, price, days):
+    """Formats velocity with dynamic precision to avoid +0.00% on small daily edges, including APY."""
+    if days <= 0 or price <= 0 or abs(edge) < 1e-9:
+        return "Immediate / N/A"
+    daily_edge = edge / max(0.05, days)
+    daily_roi = (edge / price) / max(0.05, days)
+    d_edge_pct = daily_edge * 100.0
+    d_roi_pct = daily_roi * 100.0
+    edge_str = f"{d_edge_pct:+.4f}%" if abs(d_edge_pct) < 0.01 else f"{d_edge_pct:+.2f}%"
+    roi_str = f"{d_roi_pct:+.4f}%" if abs(d_roi_pct) < 0.01 else f"{d_roi_pct:+.2f}%"
+    ann_edge = (edge / max(0.05, days)) * 365.0 * 100.0
+    _, apy = calculate_annualized_yield(edge, price, days)
+    apy_str = f"{apy*100:+.1f}% APY" if -1.0 <= apy <= 100.0 else f"{ann_edge:+.1f}% Ann Edge"
+    return f"{edge_str} edge/day ({roi_str} ROI/day | {apy_str} | {days:.1f}d horizon)"
+
+
 def run_prediction_session(
     mode="discover",
     sub_mode="all",
@@ -37,6 +53,7 @@ def run_prediction_session(
     max_offset=0,
     exclude_mode="none",
     discovery_order="volume",
+    target_market_id=None,
 ):
     global BANKROLL
 
@@ -78,11 +95,13 @@ def run_prediction_session(
         max_offset,
         exclude_mode,
         discovery_order,
+        target_market_id=target_market_id,
     )
 
     portfolio_data = []
     session_trades = {}
     session_markets = []
+    session_candidates = []
     current_index = 0
 
     while True:
@@ -168,6 +187,9 @@ def run_prediction_session(
                 prev_m = session_markets[current_index]
                 prev_market_id = prev_m.get("id")
 
+                if session_candidates and session_candidates[-1].get("market_id") == prev_market_id:
+                    session_candidates.pop()
+
                 if prev_market_id in session_trades:
                     refund_amount = session_trades.pop(prev_market_id)
                     cumulative_exposure -= (refund_amount / current_bankroll) if current_bankroll > 0 else 0.0
@@ -209,9 +231,41 @@ def run_prediction_session(
                 except:
                     fee_rate = 0.0
 
-            action, true_price, raw_kelly, eff_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
+            existing_preds = ensure_list(history.get("predicted", {}).get(market_id, []))
+            is_existing = len(existing_preds) > 0
+            live_held_val = 0.0
+            held_shares = 0.0
+            if is_existing:
+                for p in existing_preds:
+                    sh = float(p.get("shares", 0.0) or 0.0)
+                    is_p_no = (p.get("position", "Yes") == "No")
+                    p_live = (1.0 - pm_mid) if is_p_no else pm_mid
+                    if sh > 0:
+                        held_shares += sh
+                        live_held_val += sh * p_live
+                    elif p.get("cost_basis"):
+                        cb = float(p.get("cost_basis", 0.0) or 0.0)
+                        entry_p = float(p.get("pm", p_live) or p_live)
+                        live_held_val += cb * (p_live / entry_p if entry_p > 0 else 1.0)
+                        if entry_p > 0:
+                            held_shares += cb / entry_p
+                    else:
+                        live_held_val += float(p.get("kelly", 0.0) or 0.0) * current_bankroll
+
+            # True live Mark-to-Market fraction of current bankroll
+            held_mtm_k = (live_held_val / current_bankroll) if (current_bankroll > 0 and live_held_val > 0) else sum(float(p.get("kelly", 0.0) or 0.0) for p in existing_preds)
+
+            action, true_price, raw_kelly, eff_kelly, full_alloc, dynamic_ego, edge = calculate_allocation(
                 lower, upper, pm_bid, pm_ask, fee_rate, current_bankroll, base_ego
             )
+
+            # If position already exists, allocate only the incremental tranche delta needed to reach Target Eff-Kelly
+            if is_existing and held_mtm_k > 0:
+                delta_k = max(0.0, eff_kelly - held_mtm_k)
+                final_alloc = delta_k * current_bankroll
+            else:
+                delta_k = eff_kelly
+                final_alloc = full_alloc
 
             try:
                 res_dt = datetime.fromisoformat(m.get("endDate", "").replace("Z", "+00:00"))
@@ -269,85 +323,290 @@ def run_prediction_session(
                         if adjusted_edge < MIN_EDGE:
                             action = "THIN_EDGE"
 
-            if market_id not in history["predicted"]:
-                history["predicted"][market_id] = []
-            else:
-                history["predicted"][market_id] = ensure_list(history["predicted"][market_id])
-
             pu_mid_val = (lower + upper) / 2.0
             lm = calculate_logistic_metrics(
-                pu_mid_val, pm_mid, dynamic_ego, held_kelly=raw_kelly, fee_rate=fee_rate
+                pu_mid_val, pm_mid, dynamic_ego, held_kelly=eff_kelly if is_existing else raw_kelly, fee_rate=fee_rate
             )
 
-            history["predicted"][market_id].append({
-                "question": question,
-                "slug": event_slug,
-                "date": today_str,
-                "pu": pu_mid_val,
-                "pm": pm_mid,
-                "dynamic_ego": dynamic_ego,
-                "kelly": raw_kelly,
-                "edge": adjusted_edge,
-                "apy": adjusted_apy,
-                "conditionId": m.get("conditionId"),
-                "position": action.capitalize() if action in ("YES", "NO") else ("Yes" if lm["is_yes"] else "No"),
-                "source": "local",
-            })
+            pos_side = action.capitalize() if action in ("YES", "NO") else ("Yes" if lm["is_yes"] else "No")
+            is_pos_no = (pos_side == "No")
+            stored_pu = round(1.0 - pu_mid_val, 6) if is_pos_no else round(pu_mid_val, 6)
+            stored_pm = round(true_price if true_price > 0 else (1.0 - pm_mid), 6) if is_pos_no else round(pm_mid, 6)
+            stored_cur_pm = round(1.0 - pm_mid, 6) if is_pos_no else round(pm_mid, 6)
+            if is_pos_no:
+                lm = calculate_logistic_metrics(
+                    stored_pu, stored_pm, dynamic_ego, held_kelly=eff_kelly if is_existing else raw_kelly,
+                    cur_pm=stored_cur_pm, fee_rate=fee_rate
+                )
 
-            history["skipped"].pop(market_id, None)
+            if not is_existing and lm["regime"] == "AGAINST":
+                lm["regime"] = "ACTIVE"
 
+            if is_existing:
+                primary_p = existing_preds[0].copy()
+                primary_p["pu"] = stored_pu
+                primary_p["cur_pm"] = stored_cur_pm
+                primary_p["dynamic_ego"] = dynamic_ego
+                primary_p["edge"] = adjusted_edge
+                primary_p["apy"] = adjusted_apy
+                primary_p["date"] = today_str
+                if delta_k >= 0.005:
+                    primary_p["kelly"] = raw_kelly
+                    new_shares = final_alloc / true_price if true_price > 0 else 0.0
+                    old_cb = float(primary_p.get("cost_basis", 0.0) or 0.0)
+                    old_sh = float(primary_p.get("shares", 0.0) or (old_cb / float(primary_p.get("pm", stored_pm))))
+                    tot_sh = old_sh + new_shares
+                    tot_cb = old_cb + final_alloc
+                    primary_p["cost_basis"] = round(tot_cb, 4)
+                    primary_p["shares"] = round(tot_sh, 4)
+                    primary_p["pm"] = round(tot_cb / tot_sh, 6) if tot_sh > 0 else stored_pm
+                    primary_p["tranche_added"] = final_alloc
+                elif primary_p.get("kelly") is None or float(primary_p.get("kelly", 0.0)) <= 0:
+                    primary_p["kelly"] = raw_kelly
+                candidate_to_commit = primary_p
+            else:
+                candidate_to_commit = {
+                    "question": question,
+                    "slug": event_slug,
+                    "date": today_str,
+                    "pu": stored_pu,
+                    "pm": stored_pm,
+                    "cur_pm": stored_cur_pm,
+                    "dynamic_ego": dynamic_ego,
+                    "kelly": raw_kelly,
+                    "edge": adjusted_edge,
+                    "apy": adjusted_apy,
+                    "conditionId": m.get("conditionId"),
+                    "position": pos_side,
+                    "source": "local",
+                }
+
+            norm_target = lm["target_win_m"]
+            side_tag = f" ({pos_side})" if is_pos_no else ""
             print(f"\n--- MARKET ANALYSIS ---")
             print(
                 f"Spread       : Bid {pm_bid*100:.1f}% | Ask {pm_ask*100:.1f}% (Spread: {(pm_ask - pm_bid)*100:.1f}%)"
             )
             print(
-                f"Conviction   : User [{lower*100:.1f}%-{upper*100:.1f}%] -> Active Target: {lm['pu_norm']*100:.1f}% (Ego: {dynamic_ego:.2f})"
+                f"Conviction   : User [{lower*100:.1f}%-{upper*100:.1f}%] -> Active Target: {norm_target*100:.1f}%{side_tag} (Ego: {dynamic_ego:.2f})"
             )
-            print(
-                f"Efficiency   : {lm['eff_m']*100:.1f}% [4p(1-p)] | Regime: {lm['regime']} ({lm['dist_to_decel']*100:+.1f}% to 78.9% Decel)"
-            )
+            ref_px = stored_pm if not is_existing else stored_cur_pm
+            dist_tgt = norm_target - ref_px
+            runway_str = f"{dist_tgt*100:+.1f}% to Target ({norm_target*100:.1f}%)"
+            print(f"Runway       : {runway_str} | Efficiency: {lm['eff_live']*100:.1f}% ({lm['regime']})")
+
+            vel_str = format_velocity_display(adjusted_edge, vwap_true, days_until)
+            print(f"Velocity     : {vel_str}")
 
             if action in ["YES", "NO"]:
-                cumulative_exposure += final_alloc / current_bankroll
-                session_trades[market_id] = final_alloc
+                if is_existing and (held_mtm_k > 0 or live_held_val > 0):
+                    target_alloc = eff_kelly * current_bankroll
+                    if delta_k >= 0.005:
+                        action_label = f"ADD TRANCHE +{delta_k*100:.1f}% (${final_alloc:,.2f}) {action} @ {true_price*100:.1f}%"
+                    else:
+                        excess_usd = max(0.0, live_held_val - target_alloc)
+                        excess_str = f" | Over-Target: +${excess_usd:,.2f}" if excess_usd > 0.05 else ""
+                        action_label = f"HOLD (Held {held_mtm_k*100:.1f}% >= Target {eff_kelly*100:.1f}%{excess_str})"
+                    print(f"Action       : {action_label} | Net Edge: {adjusted_edge*100:+.2f}%")
+                    sh_tag = f" | {held_shares:,.1f} shares" if held_shares > 0 else ""
+                    print(f"Existing Pos : {held_mtm_k*100:.2f}% MTM (${live_held_val:,.2f}{sh_tag})")
+                    print(f"Target Kelly : {eff_kelly*100:.2f}% Eff-Kelly (${target_alloc:,.2f}) | Tranche Delta: +{delta_k*100:.2f}% (${final_alloc:,.2f})")
+                else:
+                    slip_note = f" (Slippage: +{slippage*100:.2f}%)" if slippage > 0.0001 else ""
+                    print(f"Action       : BUY {action} @ {vwap_true*100:.1f}% VWAP{slip_note} | Net Edge: {adjusted_edge*100:+.2f}%")
+                    print(f"Kelly Target : {raw_kelly*100:.2f}% Raw-Kelly | Eff-Kelly: {eff_kelly*100:.2f}% (${final_alloc:,.2f})")
+                    print(f"Allocation   : ${final_alloc:,.2f} ({eff_kelly*100:.2f}% Eff-Kelly)")
 
-                print(f"Action       : BUY {action} @ {true_price*100:.1f}% | Edge: {adjusted_edge*100:+.2f}%" + (f" | APY: {adjusted_apy*100:.1f}%" if days_until > 0 else ""))
-                if slippage > 0.0001:
-                    print(f"Execution    : VWAP {vwap_true*100:.2f}% (Slippage: +{slippage*100:.2f}%)")
-                print(f"Kelly Target : {raw_kelly*100:.2f}% (${raw_kelly*current_bankroll:,.2f}) | Eff-Kelly: {eff_kelly*100:.2f}% (${final_alloc:,.2f})")
-                print(f"Allocation   : ${final_alloc:,.2f} ({eff_kelly*100:.2f}% Eff-Kelly) | Exposure: {cumulative_exposure*100:.1f}%")
-
-                portfolio_data.append({
-                    "Question": question[:50] + "..",
-                    "Action": action,
-                    "Ego": f"{dynamic_ego:.2f}",
-                    "Price": f"{vwap_true*100:.1f}%",
-                    "Kelly": f"{raw_kelly*100:.2f}%",
-                    "EffKelly": f"{eff_kelly*100:.2f}%",
-                    "Alloc": f"${final_alloc:,.2f}",
-                })
+                    ws = history.get("wallet_summary", {})
+                    wallet_cash = float(ws.get("cash", current_bankroll) or current_bankroll) if isinstance(ws, dict) else current_bankroll
+                    if final_alloc > wallet_cash + 0.50:
+                        shortfall = final_alloc - wallet_cash
+                        print(f"Cash Alert   : Target allocation exceeds cash by ${shortfall:,.2f} (Available Cash: ${wallet_cash:,.2f})")
+                        rebal_candidates = []
+                        for m_id, p_list in history.get("predicted", {}).items():
+                            for p_item in ensure_list(p_list):
+                                if p_item.get("source") == "wallet":
+                                    p_ed = float(p_item.get("edge", 0.0) or 0.0)
+                                    p_sh = float(p_item.get("shares", 0.0) or 0.0)
+                                    p_cp = float(p_item.get("cur_pm", p_item.get("pm", 0.5)))
+                                    p_val = p_sh * p_cp
+                                    if p_val > 1.0:
+                                        rebal_candidates.append((p_val, p_ed, p_item.get("question", "")))
+                        rebal_candidates.sort(key=lambda x: x[1])
+                        if rebal_candidates:
+                            c_val, c_edge, c_q = rebal_candidates[0]
+                            c_q_disp = (c_q[:35] + "...") if len(c_q) > 38 else c_q
+                            print(f"  -> Rebalance Suggestion: Liquidate/Trim {c_q_disp} [Edge: {c_edge*100:+.1f}% | Equity: ${c_val:,.2f}]")
             else:
-                if action == "THIN_EDGE":
+                if lm["live_active_edge"] <= 0:
+                    reason = f"Price {pm_mid*100:.1f}% at/above target {lm['pu_norm']*100:.1f}% (Exit Signal: SELL)"
+                elif action == "THIN_EDGE":
                     reason = f"Edge below {MIN_EDGE*100}% threshold"
                 elif action == "NONE":
                     reason = "Trapped inside bid-ask spread"
                 else:
                     reason = "Unknown"
-
                 print(f"Action       : $0 ({reason}) | Edge: {adjusted_edge*100:+.2f}%")
+                if is_existing and live_held_val > 0:
+                    sh_tag = f" | {held_shares:,.1f} shares" if held_shares > 0 else ""
+                    print(f"Existing Pos : {held_mtm_k*100:.2f}% MTM (${live_held_val:,.2f}{sh_tag}) | Target: 0.00% ($0.00)")
 
-            print(
-                f"Session      : {len(session_trades)} placed (${sum(session_trades.values()):,.2f} total) | Bankroll: ${current_bankroll:,.2f}\n"
-            )
-            print_prediction_stats(history, sub_mode="predicted", base_ego=base_ego)
+            if action in ["YES", "NO"] and adjusted_edge > 0 and final_alloc > 0:
+                k_disp = delta_k if (is_existing and held_mtm_k > 0) else eff_kelly
+                cand = {
+                    "market_id": market_id,
+                    "question": question,
+                    "slug": event_slug,
+                    "action": action,
+                    "side": pos_side,
+                    "price": vwap_true,
+                    "raw_kelly": raw_kelly,
+                    "eff_kelly": k_disp,
+                    "delta_k": delta_k,
+                    "alloc": final_alloc,
+                    "edge": adjusted_edge,
+                    "apy": adjusted_apy,
+                    "dynamic_ego": dynamic_ego,
+                    "is_existing": is_existing,
+                    "held_val": live_held_val,
+                    "held_mtm_k": held_mtm_k,
+                    "held_shares": held_shares,
+                    "payload": candidate_to_commit,
+                    "days_until": days_until,
+                    "regime": lm["regime"],
+                    "target": norm_target,
+                    "selected": True,
+                }
+                session_candidates = [c for c in session_candidates if c["market_id"] != market_id]
+                session_candidates.append(cand)
+
+                staged_alloc = sum(c["alloc"] for c in session_candidates)
+                staged_k = sum(c["eff_kelly"] for c in session_candidates)
+                c_cnt = len(session_candidates)
+                print(f"Status       : [+] Staged ({c_cnt} candidate{'s' if c_cnt > 1 else ''} | ${staged_alloc:,.2f} / ${current_bankroll:,.2f} [{staged_k*100:.1f}% Kelly])\n")
+
+                if staged_alloc >= current_bankroll:
+                    print("=" * 80)
+                    print(f"[!] CAPITAL POOL SATURATED: Staged candidates reach ${staged_alloc:,.2f} ({staged_alloc/current_bankroll*100:.1f}% of Bankroll).")
+                    c_choice = input("    Continue scanning [Enter] | Finalize & Review candidates now [f/q]: ").strip().lower()
+                    if c_choice in ("f", "q", "done", "exit"):
+                        print("\n[*] Finalizing session to review candidate pool...")
+                        break
+                    print("=" * 80 + "\n")
+            else:
+                print(f"Status       : [-] Pass (Edge: {adjusted_edge*100:+.2f}%)\n")
 
             current_index += 1
 
         except ValueError as e:
             print(f"\n[!] Error: {e}. Please try again.\n")
 
+    _review_and_commit_candidates(
+        session_candidates=session_candidates,
+        history=history,
+        current_bankroll=current_bankroll,
+        portfolio_data=portfolio_data,
+        session_trades=session_trades
+    )
+
     save_history(stringify_overflow(history))
     return pd.DataFrame(portfolio_data)
+
+
+def _review_and_commit_candidates(session_candidates, history, current_bankroll, portfolio_data, session_trades):
+    """Presents staged session candidates sorted by edge with smart default recommendation within Kelly limits."""
+    if not session_candidates:
+        print("\n[*] Session completed with 0 candidates staged.")
+        return
+
+    # Pure alpha sort: highest edge first
+    session_candidates.sort(key=lambda c: float(c.get("edge", 0.0) or 0.0), reverse=True)
+
+    ws = history.get("wallet_summary", {})
+    wallet_cash = float(ws.get("cash", current_bankroll) or current_bankroll) if isinstance(ws, dict) else current_bankroll
+
+    # Default recommendation: Greedily select top candidates up to 100% bankroll
+    cum_k = 0.0
+    cum_alloc = 0.0
+    for idx, c in enumerate(session_candidates):
+        alloc = float(c.get("alloc", 0.0))
+        k_val = float(c.get("eff_kelly", 0.0))
+        # Preselect if first candidate or if adding it stays within 100% bankroll
+        if idx == 0 or (cum_alloc + alloc <= current_bankroll + 1.0):
+            c["selected"] = True
+            c["recommended"] = True
+            cum_alloc += alloc
+            cum_k += k_val
+        else:
+            c["selected"] = False
+            c["recommended"] = False
+
+    while True:
+        box_len = 106
+        print("\n" + "=" * box_len)
+        print(" " * 36 + "[ SESSION CANDIDATES REVIEW ]")
+        print("-" * box_len)
+        print("  # | Sel | Side | Edge    | Eff-Kelly | Allocation | Cumulative | Question")
+        print("----+-----+------+---------+-----------+------------+------------+-----------------------------------------------")
+        running_tot = 0.0
+        for i, c in enumerate(session_candidates, 1):
+            sel_mark = "[*]" if c["selected"] else "[ ]"
+            running_tot += c["alloc"] if c["selected"] else 0.0
+            q_txt = c["question"]
+            q_disp = (q_txt[:43] + "...") if len(q_txt) > 46 else q_txt
+            exceed_tag = " (Exceeds Bankroll)" if (running_tot > current_bankroll and c["selected"]) else ""
+            print(f" {i:2d} | {sel_mark} | {c['side']:<4} | {c['edge']*100:+6.2f}% | {c['eff_kelly']*100:8.2f}% | ${c['alloc']:>9,.2f} | ${running_tot:>9,.2f} | {q_disp}{exceed_tag}")
+        print("=" * box_len)
+
+        sel_candidates = [c for c in session_candidates if c["selected"]]
+        tot_sel_alloc = sum(c["alloc"] for c in sel_candidates)
+        tot_sel_k = sum(c["eff_kelly"] for c in sel_candidates)
+
+        cash_info = f" (Available Cash: ${wallet_cash:,.2f})" if (isinstance(ws, dict) and "cash" in ws) else ""
+        print(f"Capital State  : ${current_bankroll:,.2f} Bankroll{cash_info}")
+        print(f"Selected Pool  : {len(sel_candidates)} of {len(session_candidates)} candidates | ${tot_sel_alloc:,.2f} ({tot_sel_k*100:.1f}% Eff-Kelly)")
+        if tot_sel_alloc > current_bankroll + 1.0:
+            print(f"[!] Warning    : Selected allocation exceeds bankroll by ${tot_sel_alloc - current_bankroll:,.2f}")
+
+        act_prompt = f"\nActions: [Enter] Commit Selected  [1-{len(session_candidates)}] Toggle  [a] Select All  [q] Discard All\n> "
+        choice = input(act_prompt).strip().lower()
+
+        if choice == "":
+            if not sel_candidates:
+                print("[*] No candidates selected. Session ended without commits.")
+                break
+            for c in sel_candidates:
+                m_id = c["market_id"]
+                history.setdefault("predicted", {})[m_id] = [c["payload"]]
+                history.get("skipped", {}).pop(m_id, None)
+                session_trades[m_id] = c["alloc"]
+                portfolio_data.append({
+                    "Question": c["question"][:50] + "..",
+                    "Action": c["action"],
+                    "Ego": f"{c['dynamic_ego']:.2f}",
+                    "Price": f"{c['price']*100:.1f}%",
+                    "Kelly": f"{c['eff_kelly']*100:.2f}%",
+                    "EffKelly": f"{c['eff_kelly']*100:.2f}%",
+                    "Alloc": f"${c['alloc']:,.2f}",
+                })
+            save_history(stringify_overflow(history))
+            print(f"\n[+] Successfully committed {len(sel_candidates)} candidate(s) to active portfolio (${tot_sel_alloc:,.2f} total).")
+            break
+        elif choice == "q":
+            print("\n[*] Discarded all staged candidates (0 committed).")
+            break
+        elif choice == "a":
+            all_sel = all(c["selected"] for c in session_candidates)
+            for c in session_candidates:
+                c["selected"] = not all_sel
+        elif choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(session_candidates):
+                session_candidates[idx]["selected"] = not session_candidates[idx]["selected"]
+            else:
+                print(f"[!] Choice out of range (1-{len(session_candidates)}).")
+        else:
+            print("[!] Invalid selection.")
 
 
 def custom_calculator():
@@ -388,16 +647,17 @@ def custom_calculator():
             pu_mid_c, pm_mid_c, dynamic_ego, held_kelly=raw_kelly, fee_rate=fee_rate
         )
 
+        c_vel_str = format_velocity_display(edge, true_price, days_until)
+
         print(f"\n--- CALCULATION RESULTS ---")
         print(
             f"ACTIVE PROB  : {lm_c['pu_norm']*100:.2f}% (Eff: Market {lm_c['eff_m']*100:.1f}% | Active {lm_c['eff_norm']*100:.1f}% | Regime: {lm_c['regime']})"
         )
+        print(f"VELOCITY     : {c_vel_str}")
         if action in ["YES", "NO"]:
             print(
                 f"ACTION       : BUY {action} @ {true_price*100:.1f}% | Edge: {edge*100:+.2f}% | Ego: {dynamic_ego:.2f}"
             )
-            if days_until > 0:
-                print(f"APY          : {apy*100:.2f}%")
             print(
                 f"KELLY %      : {raw_kelly*100:.2f}% (${raw_kelly*calc_bankroll:,.2f}) | Eff-Kelly: {eff_kelly*100:.2f}% (${final_alloc:,.2f})"
             )
@@ -407,20 +667,178 @@ def custom_calculator():
         if input("\nSave custom prediction to history? (y/n) [Enter=n]: ").strip().lower() == "y":
             q_title = input("Enter title: ").strip() or "Custom Market"
             custom_id = f"custom_{int(datetime.now().timestamp())}"
+            pos_side_c = action.capitalize() if action in ("YES", "NO") else "Yes"
+            is_no_c = (pos_side_c == "No")
             history.setdefault("predicted", {}).setdefault(custom_id, []).append({
                 "question": f"[CUSTOM] {q_title}",
                 "slug": "custom",
                 "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "pu": pu_mid_c,
-                "pm": pm_mid_c,
+                "pu": round(1.0 - pu_mid_c, 6) if is_no_c else pu_mid_c,
+                "pm": round(true_price if true_price > 0 else (1.0 - pm_mid_c), 6) if is_no_c else pm_mid_c,
+                "cur_pm": round(1.0 - pm_mid_c, 6) if is_no_c else pm_mid_c,
                 "dynamic_ego": dynamic_ego,
                 "kelly": raw_kelly,
                 "edge": edge,
                 "apy": apy,
                 "conditionId": "custom",
+                "position": pos_side_c,
                 "source": "local",
             })
             save_history(stringify_overflow(history))
             print("[+] Saved to active predictions.")
     except ValueError as e:
         print(f"\n[!] Error: {e}.\n")
+
+
+def compare_asset_market():
+    """Interactive tool comparing binary prediction contracts vs. spot/perp asset holding."""
+    print("\n--- ASSET vs. BINARY PREDICTION LEVERAGE & EFFICIENCY ---")
+    title = input("Target / Question [e.g. 'ETH reaches $1500' or 'BTC reaches $100k']: ").strip() or "Asset Target"
+    s0_in = input("Current Spot Price S0 ($) [e.g. 2250]: ").strip()
+    k_in = input("Target Strike / Barrier K ($) [e.g. 1500]: ").strip()
+
+    try:
+        s0 = float(s0_in.replace("$", "").replace(",", ""))
+        k = float(k_in.replace("$", "").replace(",", ""))
+        if s0 <= 0 or k <= 0:
+            print("[!] Spot and strike prices must be positive numbers.")
+            return
+
+        is_downside = (k < s0)
+        asset_direction = "DOWNSIDE / SHORT" if is_downside else "UPSIDE / LONG"
+        asset_pct_move = abs(k - s0) / s0
+
+        side_in = input(f"Contract Side you want to buy: [1] YES (hits ${k:,.0f})  [2] NO (avoids ${k:,.0f}) [Enter=1]: ").strip()
+        is_no = (side_in == "2" or side_in.lower() in ("no", "n"))
+        contract_side = "NO" if is_no else "YES"
+
+        pm_in = input(f"Polymarket {contract_side} Price % (e.g. 88 or 0.88): ").strip()
+        pu_in = input(f"Your Subjective Probability % of {contract_side} winning [e.g. 98 or 0.98]: ").strip()
+        days_in = input("Days to Expiry / Horizon [Enter for 30]: ").strip()
+
+        pm_val = float(pm_in.replace("%", ""))
+        pm = pm_val / 100.0 if pm_val > 1.0 else pm_val
+
+        pu_val = float(pu_in.replace("%", ""))
+        pu = pu_val / 100.0 if pu_val > 1.0 else pu_val
+
+        days = float(days_in) if days_in else 30.0
+
+        if pm <= 0 or pm >= 1.0 or pu <= 0 or pu > 1.0:
+            print("[!] Probabilities must be between 0 and 100%.")
+            return
+
+        binary_roi = (1.0 - pm) / pm
+        pct_return = binary_roi * 100.0
+        edge = pu - pm
+        ev_binary_roi = (edge / pm) * 100.0
+        bin_daily_roi = (binary_roi / max(0.1, days)) * 100.0
+        ann_ev_roi = (ev_binary_roi / max(0.1, days)) * 365.0
+
+        # Standard Aave v3 parameters for major assets (ETH / WBTC)
+        # Long: Collateral in Asset (ETH/BTC), Debt in Stables (USDC/USDT). Liquidation Threshold (LT) ~ 82.5%
+        # Short: Collateral in Stables (USDC/USDT), Debt in Asset (ETH/BTC). Collateral LT ~ 85.0%
+        AAVE_LT_LONG = 0.825
+        AAVE_LT_SHORT = 0.850
+
+        # Direction of asset movement being evaluated:
+        # If YES on downside: short direction. Otherwise long direction.
+        is_short_strat = (not is_no and is_downside)
+
+        if not is_no:
+            leverage_mult = binary_roi / asset_pct_move if asset_pct_move > 0 else 0.0
+            bin_lev_str = f"{leverage_mult:.1f}x"
+            bin_req_str = f"{'-' if is_downside else '+'}{asset_pct_move*100:.1f}%"
+            bin_tgt_str = f"${k:,.2f}"
+            bin_liq_str = "NONE"
+            bin_risk_str = "Zero liquidation / No margin calls"
+        else:
+            leverage_mult = 1.0 / pm if pm > 0 else 1.0
+            bin_lev_str = f"{leverage_mult:.1f}x"
+            bin_req_str = f"Cush {asset_pct_move*100:.1f}%"
+            bin_tgt_str = f"${k:,.2f}"
+            bin_liq_str = "NONE"
+            bin_risk_str = f"Pays +{pct_return:.1f}% if flat/down/cushion"
+
+        table_rows = [
+            {
+                "strategy": f"Binary {contract_side} (Poly)",
+                "lev": bin_lev_str,
+                "req_move": bin_req_str,
+                "target_px": bin_tgt_str,
+                "liq_px": bin_liq_str,
+                "risk": bin_risk_str,
+            }
+        ]
+
+        strat_configs = [
+            ("Spot (Unleveraged)", 1.0),
+            ("Aave v4 Recollat (2x)", 2.0),
+            ("Aave v4 Recollat (3x)", 3.0),
+        ]
+
+        s_star_map = {}
+        s_liq_map = {}
+
+        for name, lev in strat_configs:
+            req_move_val = binary_roi / lev
+            if not is_short_strat:
+                s_star_val = s0 * (1.0 + req_move_val)
+                req_move_disp = f"+{req_move_val*100:.1f}%"
+            else:
+                s_star_val = s0 * max(0.0, 1.0 - req_move_val)
+                req_move_disp = f"-{req_move_val*100:.1f}%"
+            s_star_map[lev] = s_star_val
+
+            if lev == 1.0:
+                liq_disp = "NONE"
+                risk_disp = "Zero liquidation (loss only at $0)"
+                s_liq_map[lev] = 0.0
+            else:
+                if not is_short_strat:
+                    s_liq_val = s0 * (lev - 1.0) / (lev * AAVE_LT_LONG)
+                    drop_pct = (s_liq_val - s0) / s0 * 100.0
+                    liq_disp = f"${s_liq_val:,.2f} ({drop_pct:+.1f}%)"
+                    risk_tag = "HIGH RISK: " if lev >= 3.0 else ""
+                    risk_disp = f"{risk_tag}Liquidated at {drop_pct:.1f}% dip (82.5% LT)"
+                else:
+                    s_liq_val = s0 * (lev * AAVE_LT_SHORT) / (lev - 1.0)
+                    rally_pct = (s_liq_val - s0) / s0 * 100.0
+                    liq_disp = f"${s_liq_val:,.2f} ({rally_pct:+.1f}%)"
+                    risk_tag = "HIGH RISK: " if lev >= 3.0 else ""
+                    risk_disp = f"{risk_tag}Liquidated at {rally_pct:+.1f}% rally (85% LT)"
+                s_liq_map[lev] = s_liq_val
+
+            table_rows.append({
+                "strategy": name,
+                "lev": f"{lev:.1f}x",
+                "req_move": req_move_disp,
+                "target_px": f"${s_star_val:,.2f}",
+                "liq_px": liq_disp,
+                "risk": risk_disp,
+            })
+
+        box_w = 125
+        print(f"\n" + "=" * box_w)
+        print(" " * 35 + "[ ASSET vs. PREDICTION MARKET LEVERAGE & EFFICIENCY ]")
+        print("=" * box_w)
+        print(f"Target Event       : {title}")
+        print(f"Spot Reference     : ${s0:,.2f} -> ${k:,.2f} ({asset_pct_move*100:.2f}% {asset_direction} Move)")
+        print(f"Binary Position    : BUY {contract_side} @ {pm*100:.1f}c -> $1.00 (+{pct_return:.2f}% Payout)")
+        print(f"Conviction         : Your Prob: {pu*100:.1f}% vs Market: {pm*100:.1f}% (Edge: {edge*100:+.2f}%)")
+        print(f"Horizon            : {days:.1f} days ({bin_daily_roi:+.2f}%/day max ROI | EV Ann: {ann_ev_roi:+.1f}%)")
+        print("-" * box_w)
+        print(f"Breakeven Win Rate : {pm*100:.1f}% (Requires {contract_side} to resolve > {pm*100:.1f}% of the time)")
+        print(f"Expected EV ROI    : {ev_binary_roi:+.2f}% per dollar committed (EV Payout: ${1.0 * (pu/pm):.2f} per $1.00)")
+        print("-" * box_w)
+        print("  Strategy                 | Lev   | Req Move   | Target Px ($S*) | Liq Price (Aave v4) | Margin & Liquidation Risk")
+        print("---------------------------+-------+------------+-----------------+----------------------+-----------------------------------")
+        for r in table_rows:
+            print(f"  {r['strategy']:<25}| {r['lev']:>5} | {r['req_move']:>10} | {r['target_px']:>15} | {r['liq_px']:>20} | {r['risk']:<34}")
+        print("-" * box_w)
+        print("  * Aave v4 leverage models buy -> borrow -> recollateralize looping (ETH 82.5% Liquidation Threshold).")
+        print("  * Verdict & allocation decision left to operator based on risk tolerance, liquidation buffer & payout asymmetry.")
+        print("=" * box_w + "\n")
+
+    except ValueError as e:
+        print(f"\n[!] Input error: {e}.\n")

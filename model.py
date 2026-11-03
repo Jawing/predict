@@ -74,11 +74,11 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
         base_k = 0.0
     eff_kelly = eff_scale_live * base_k
 
-    # Exit / Diminishing-Return Regime strictly in our trade's favor
-    if eval_win_m >= LOGISTIC_HALF_HIGH:
-        regime = "HALF-SLOPE"
-    elif eval_win_m >= LOGISTIC_DECEL_HIGH:
-        regime = "DECEL-EXIT"
+    # Pure Unconstrained Bayesian Target (no artificial landmark clamping):
+    target_win_m = win_prob_bal
+
+    if eval_win_m >= target_win_m or live_active_edge <= 0.0:
+        regime = "OVER-TGT"
     elif eval_win_m < win_prob_m - 1e-9:
         regime = "AGAINST"
     else:
@@ -86,7 +86,6 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
 
     dist_to_decel = LOGISTIC_DECEL_HIGH - eval_win_m
     dist_to_half = LOGISTIC_HALF_HIGH - eval_win_m
-    target_win_m = min(win_prob_bal, LOGISTIC_DECEL_HIGH)
     dist_to_target = target_win_m - eval_win_m
     delta_kelly = live_model_kelly - base_k
     if abs(delta_kelly) < 1e-9:
@@ -123,25 +122,57 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
 
 
 def calculate_base_ego(history, verbose=True):
-    """Calculates historical Kelly-weighted Brier score calibration."""
+    """Calculates historical Kelly-weighted Brier score calibration across resolved and exited positions."""
     resolved = history.get("resolved", {})
-    if not resolved:
+    exited = history.get("exited", {})
+    if not resolved and not exited:
         return 0.50
         
     bs_u_total, bs_m_total = 0.0, 0.0
     total_weight = 0.0
     
+    # 1. Terminal Resolutions (y in {0.0, 0.5, 1.0})
     for market_preds in resolved.values():
-        market_preds = ensure_list(market_preds)
-        for data in market_preds:
-            outcome = data.get("outcome", 0)
-            weight = data.get("kelly", 0.0)
-            
-            if weight <= 1e-9: 
-                continue 
-                
-            bs_u_total += weight * ((data.get("pu", 0.5) - outcome) ** 2)
-            bs_m_total += weight * ((data.get("pm", 0.5) - outcome) ** 2)
+        for data in ensure_list(market_preds):
+            outcome = float(data.get("outcome", 0.0) or 0.0)
+            weight = float(data.get("kelly", 0.0) or 0.0)
+            if weight <= 1e-9:
+                cb = float(data.get("cost_basis", 0.0) or 0.0)
+                weight = max(0.01, cb / cfg.BANKROLL) if cfg.BANKROLL > 0 else 0.01
+
+            pu = float(data.get("pu", 0.5))
+            pm = float(data.get("pm", 0.5))
+            bs_u_total += weight * ((pu - outcome) ** 2)
+            bs_m_total += weight * ((pm - outcome) ** 2)
+            total_weight += weight
+
+    # 2. Exited Positions (Synthetic Repricing Resolution against exit price)
+    for market_preds in exited.values():
+        for data in ensure_list(market_preds):
+            exit_price = data.get("exit_price") if data.get("exit_price") is not None else data.get("cur_pm")
+            if exit_price is None:
+                continue
+            exit_outcome = float(exit_price)
+            weight = float(data.get("kelly", 0.0) or 0.0)
+            if weight <= 1e-9:
+                cb = float(data.get("cost_basis", 0.0) or 0.0)
+                weight = max(0.01, cb / cfg.BANKROLL) if cfg.BANKROLL > 0 else 0.01
+
+            pu_raw = data.get("pu")
+            pm = float(data.get("pm", 0.5))
+            r_pnl = float(data.get("realized_pnl", 0.0) or 0.0)
+
+            is_uncalibrated_pre_program = (pu_raw is None or abs(float(pu_raw) - pm) < 1e-6)
+
+            if is_uncalibrated_pre_program and r_pnl < 0:
+                # Accepted loss pre-program: user accepted loss without adding tranches.
+                # Market is correct at the time (exit_outcome), while user lost money.
+                bs_u_total += weight * ((pm - exit_outcome) ** 2)
+                bs_m_total += weight * 0.0
+            else:
+                pu = float(pu_raw if pu_raw is not None else pm)
+                bs_u_total += weight * ((pu - exit_outcome) ** 2)
+                bs_m_total += weight * ((pm - exit_outcome) ** 2)
             total_weight += weight
             
     if total_weight == 0:

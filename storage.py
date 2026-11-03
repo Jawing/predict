@@ -150,7 +150,6 @@ def load_history(profile_id=None):
                 data.setdefault("exited", {})
                 data.setdefault("skipped", {})
                 data.setdefault("resolved", {})
-                data.setdefault("limit_orders", {})
                 data.setdefault("wallet_summary", {"cash": 100.0, "portfolio": 0.0, "bankroll": 100.0})
 
                 if "alias" not in data or not data["alias"]:
@@ -198,7 +197,6 @@ def load_history(profile_id=None):
         "exited": {},
         "skipped": {},
         "resolved": {},
-        "limit_orders": {},
         "wallet_summary": {"cash": 100.0, "portfolio": 0.0, "bankroll": 100.0}
     }
     cfg.BANKROLL = 100.0

@@ -17,7 +17,7 @@ from utils import ensure_list
 from storage import load_history, save_history, stringify_overflow
 from views import print_main_menu_dashboard
 from wallet import import_polymarket_positions, update_resolutions
-from session import run_prediction_session, custom_calculator
+from session import run_prediction_session, custom_calculator, compare_asset_market
 from manage import handle_delete_data, manual_resolve, settings_menu
 
 
@@ -30,11 +30,9 @@ def main():
         n_exit = sum(len(ensure_list(v)) for v in history.get("exited", {}).values())
         n_res = sum(len(ensure_list(v)) for v in history.get("resolved", {}).values())
         n_skip = len(history.get("skipped", {}))
-        n_lim = sum(len(ensure_list(v)) for v in history.get("limit_orders", {}).values())
 
-        lim_str = f" | {n_lim} limits" if n_lim > 0 else ""
         print(" 1: Discover Markets (Scan & Predict)")
-        print(" 2: Review Portfolio & History (Active, Exited, Resolved, Skipped, Limits)")
+        print(" 2: Review Portfolio & History (Active, Exited, Resolved, Skipped)")
         print(" 3: Target Specific URLs or Slugs")
         print(" 4: Wallet Profiles & Resolutions (Sync, Switch, Multi-Wallet)")
         print(" 5: Tools & Settings (Custom Calculator, Data Management, Thresholds & Gamma)")
@@ -103,10 +101,9 @@ def main():
             print(f" 2: Exited Positions ({n_exit})")
             print(f" 3: Resolved Markets ({n_res})")
             print(f" 4: Skipped Markets ({n_skip})")
-            print(f" 5: Limit Orders ({n_lim})")
-            print(f" 6: All Predictions (Active + Exited + Resolved)")
+            print(f" 5: All Predictions (Active + Exited + Resolved)")
             review_mode = input("> ").strip()
-            if review_mode not in ["1", "2", "3", "4", "5", "6"]:
+            if review_mode not in ["1", "2", "3", "4", "5"]:
                 review_mode = "1"
             op_mode = "review"
             sub_mode = {
@@ -114,8 +111,7 @@ def main():
                 "2": "exited",
                 "3": "resolved",
                 "4": "skipped",
-                "5": "limit_orders",
-                "6": "all",
+                "5": "all",
             }[review_mode]
 
         elif choice == "3":
@@ -269,15 +265,18 @@ def main():
         elif choice == "5":
             print("\n--- TOOLS & SETTINGS ---")
             print(" 1: Custom Market Calculator (Hypothetical Odds & Kelly)")
-            print(" 2: Data Management (Delete Specific Markets / Reset History)")
-            print(" 3: Settings & Threshold Filters (Min Edge, Gamma, Bankroll)")
+            print(" 2: Asset vs. Binary Leverage & Efficiency Calculator")
+            print(" 3: Data Management (Delete Specific Markets / Reset History)")
+            print(" 4: Settings & Threshold Filters (Min Edge, Gamma, Bankroll)")
             print(" 0: Back to Main Menu")
             t_choice = input("> ").strip()
             if t_choice == "1":
                 custom_calculator()
             elif t_choice == "2":
-                handle_delete_data()
+                compare_asset_market()
             elif t_choice == "3":
+                handle_delete_data()
+            elif t_choice == "4":
                 settings_menu()
             continue
 

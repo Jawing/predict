@@ -32,7 +32,10 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
 
     items = []
     for p, state in preds_list:
+        pos_side = p.get("position", "Yes")
         pu = float(p.get("pu", 0.5))
+        if pos_side == "No" and pu < 0.5:
+            pu = 1.0 - pu
         pm = float(p.get("pm", 0.5))
         cur_pm = p.get("cur_pm")
         kelly = max(0.0, float(p.get("kelly", 0.0)))
@@ -165,12 +168,10 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
         print(f"Realized PnL     : ${stats['total_pnl']:+,.2f}{wl_str} | Avg Sizing: {avg_k*100:.2f}% Kelly")
 
     print(f"Expected Win Rate: {stats['exp_win_bal']*100:.2f}% Balanced (User: {stats['exp_win_u']*100:.2f}% | Market: {stats['exp_win_m']*100:.2f}%)")
-    print(f"Prob. Variance   : {stats['norm_variance']:.4f} (Std Dev: +/-{stats['norm_std_dev']*100:.2f}%)")
     if sub_mode == "resolved":
-        print(f"Logistic Eff.    : Entry {stats['avg_eff_m']*100:.1f}% | Pooled (p_norm) {stats['avg_eff_norm']*100:.1f}% | Avg Entry Edge: {stats['avg_active_edge']*100:+.2f}%")
+        print(f"Logistic Eff.    : Entry {stats['avg_eff_m']*100:.1f}% | Pooled (p_norm) {stats['avg_eff_norm']*100:.1f}% | Avg Entry Edge: {stats['avg_active_edge']*100:+.2f}%\n")
     else:
-        print(f"Logistic Eff.    : Entry {stats['avg_eff_m']*100:.1f}% | Live {stats['avg_eff_live']*100:.1f}% | Pooled (p_norm) {stats['avg_eff_norm']*100:.1f}% | Avg Edge: {stats['avg_active_edge']*100:+.2f}%")
-    print(f"Exit Landmarks   : Max Decel: {LOGISTIC_DECEL_LOW*100:.1f}% & {LOGISTIC_DECEL_HIGH*100:.1f}% (66.7% Eff) | Half-Slope: {LOGISTIC_HALF_LOW*100:.1f}% & {LOGISTIC_HALF_HIGH*100:.1f}% (50.0% Eff)\n")
+        print(f"Logistic Eff.    : Entry {stats['avg_eff_m']*100:.1f}% | Live {stats['avg_eff_live']*100:.1f}% | Pooled (p_norm) {stats['avg_eff_norm']*100:.1f}% | Avg Edge: {stats['avg_active_edge']*100:+.2f}%\n")
 
 
 def print_review_table(history, sub_mode):
@@ -178,40 +179,34 @@ def print_review_table(history, sub_mode):
     base_ego = calculate_base_ego(history, verbose=False)
     TABLE_CONFIGS = {
         "predicted": {
-            "headers": ["#", "Date", "Src", "Side", "Question", "Kelly", "EffK", "pu", "p_norm", "pm", "Live", "Target", "Action / Signal"],
-            "widths": [3, 10, 8, 6, 36, 7, 7, 6, 6, 6, 6, 6, 25],
-            "aligns": ["right", "left", "left", "left", "left", "right", "right", "right", "right", "right", "right", "right", "left"],
-            "q_idx": 4
-        },
-        "limit_orders": {
-            "headers": ["#", "Date", "Side", "Question", "Shares", "Limit Px", "Live Px", "Dist to Fill", "Status"],
-            "widths": [3, 10, 10, 40, 8, 8, 8, 14, 20],
-            "aligns": ["right", "left", "left", "left", "right", "right", "right", "right", "left"],
-            "q_idx": 3
+            "headers": ["#", "Question", "Action / Signal", "Held Pos", "Kelly", "Edge", "Side", "Live", "p_norm", "Date", "Src"],
+            "widths": [3, 34, 22, 13, 7, 7, 4, 6, 6, 10, 8],
+            "aligns": ["right", "left", "left", "right", "right", "right", "left", "right", "right", "left", "left"],
+            "q_idx": 1
         },
         "exited": {
-            "headers": ["#", "Date", "Side", "Question", "Kelly", "pu", "p_norm", "Entry", "Live", "Realized PnL", "Status"],
-            "widths": [3, 10, 6, 42, 7, 6, 6, 6, 6, 12, 18],
-            "aligns": ["right", "left", "left", "left", "right", "right", "right", "right", "right", "right", "left"],
-            "q_idx": 3
+            "headers": ["#", "Question", "Realized PnL", "Kelly", "Edge", "Side", "Entry", "Exit Px", "pu", "p_norm", "Date", "Src"],
+            "widths": [3, 34, 13, 7, 7, 4, 6, 7, 6, 6, 10, 8],
+            "aligns": ["right", "left", "right", "right", "right", "left", "right", "right", "right", "right", "left", "left"],
+            "q_idx": 1
         },
         "resolved": {
-            "headers": ["#", "Date", "Src", "Side", "Question", "Kelly", "pu", "p_norm", "pm", "Realized PnL", "Result"],
-            "widths": [3, 10, 6, 11, 40, 7, 6, 6, 6, 12, 6],
-            "aligns": ["right", "left", "left", "left", "left", "right", "right", "right", "right", "right", "left"],
-            "q_idx": 4
+            "headers": ["#", "Question", "Result", "Realized PnL", "Kelly", "Edge", "Side", "Entry", "pu", "p_norm", "Date", "Src"],
+            "widths": [3, 34, 6, 13, 7, 7, 4, 6, 6, 6, 10, 8],
+            "aligns": ["right", "left", "left", "right", "right", "right", "left", "right", "right", "right", "left", "left"],
+            "q_idx": 1
         },
         "skipped": {
-            "headers": ["#", "Date", "Question"],
-            "widths": [3, 16, 78],
+            "headers": ["#", "Question", "Date"],
+            "widths": [3, 78, 16],
             "aligns": ["right", "left", "left"],
-            "q_idx": 2
+            "q_idx": 1
         },
         "all": {
-            "headers": ["#", "State", "Side", "Date", "Question", "Kelly", "pu", "p_norm", "pm", "Target", "Status / Result"],
-            "widths": [3, 8, 9, 10, 40, 7, 6, 6, 6, 6, 22],
-            "aligns": ["right", "left", "left", "left", "left", "right", "right", "right", "right", "right", "left"],
-            "q_idx": 4
+            "headers": ["#", "Question", "State", "Status / Signal", "PnL / Pos", "Kelly", "Edge", "Side", "Live/Exit", "p_norm", "Date"],
+            "widths": [3, 34, 8, 22, 13, 7, 7, 4, 9, 6, 10],
+            "aligns": ["right", "left", "left", "left", "right", "right", "right", "left", "right", "right", "left"],
+            "q_idx": 1
         }
     }
 
@@ -220,26 +215,49 @@ def print_review_table(history, sub_mode):
     if sub_mode in ["predicted", "predicted_skipped", "all"]:
         for market_id, value in history.get("predicted", {}).items():
             for pred in ensure_list(value):
+                side_val = pred.get("position", "Yes")
                 pu_v = float(pred.get("pu", 0.5))
+                if side_val == "No" and pu_v < 0.5:
+                    pu_v = 1.0 - pu_v
                 pm_v = float(pred.get("pm", 0.5))
                 cur_pm_v = pred.get("cur_pm")
                 k_v = float(pred.get("kelly", 0.0))
                 ego_v = float(pred.get("dynamic_ego", base_ego))
+
+                # Mark-to-Market holding fraction of live bankroll
+                sh = float(pred.get("shares", 0.0) or 0.0)
+                cur_p = float(cur_pm_v if cur_pm_v is not None else pm_v)
+                is_wallet = (pred.get("source", "local") == "wallet")
+                if is_wallet:
+                    if sh > 0 and cur_p > 0:
+                        live_val = sh * cur_p
+                    elif pred.get("cost_basis"):
+                        cb = float(pred.get("cost_basis", 0.0) or 0.0)
+                        entry_p = float(pred.get("pm", cur_p) or cur_p)
+                        live_val = cb * (cur_p / entry_p if entry_p > 0 else 1.0)
+                    else:
+                        live_val = k_v * cfg.BANKROLL
+                    held_mtm_k = (live_val / cfg.BANKROLL) if cfg.BANKROLL > 0 else k_v
+                else:
+                    live_val = 0.0
+                    held_mtm_k = 0.0
+
                 lm = calculate_logistic_metrics(pu_v, pm_v, ego_v, held_kelly=k_v, cur_pm=cur_pm_v)
                 tgt_v = lm["target_win_m"]
-                if pred.get("source", "local") != "wallet":
-                    regime_str = f"EXEC BUY({lm['live_model_kelly']*100:.1f}%)" if lm["live_active_edge"] > 0 else "SKIP: EDGE GONE"
-                elif lm["regime"] == "HALF-SLOPE":
-                    regime_str = f"SELL: HALF({lm['eval_win_m']*100:.1f}%)"
-                elif lm["regime"] == "DECEL-EXIT":
-                    regime_str = f"SELL: DECEL({lm['eval_win_m']*100:.1f}%)"
-                elif lm["live_active_edge"] <= 0:
+                delta_k = max(0.0, lm["eff_kelly"] - held_mtm_k) if held_mtm_k > 0 else lm["eff_kelly"]
+
+                delta_usd = delta_k * cfg.BANKROLL if cfg.BANKROLL > 0 else 0.0
+                buy_usd = lm["eff_kelly"] * cfg.BANKROLL if cfg.BANKROLL > 0 else 0.0
+
+                if not is_wallet:
+                    regime_str = f"EXEC BUY ${buy_usd:,.0f} ({lm['eff_kelly']*100:.1f}%)" if lm["live_active_edge"] > 0 else "SKIP: EDGE GONE"
+                elif lm["regime"] == "OVER-TGT" or lm["live_active_edge"] <= 0:
                     regime_str = f"SELL: OVER-TGT({lm['live_active_edge']*100:+.1f}%)"
-                elif lm["delta_kelly"] >= 0.01:
-                    tag = "DISCOUNT " if lm["regime"] == "AGAINST" else ""
-                    regime_str = f"ADD +{lm['delta_kelly']*100:.1f}% ({tag}EDGE {lm['live_active_edge']*100:+.1f}%)"
+                elif delta_k >= 0.005:
+                    tag = "DISC " if lm["regime"] == "AGAINST" else ""
+                    regime_str = f"ADD +${delta_usd:,.0f} (+{delta_k*100:.1f}%)"
                 else:
-                    regime_str = f"HOLD(+{lm['dist_to_target']*100:.1f}%->{tgt_v*100:.1f}%)"
+                    regime_str = f"HOLD (+{lm['dist_to_target']*100:.1f}% to exit)"
                 w_tag = pred.get("wallet")
                 alias_tag = history.get("alias")
                 if pred.get("source") == "wallet" and alias_tag:
@@ -248,18 +266,11 @@ def print_review_table(history, sub_mode):
                     src_val = f"0x..{w_tag[-4:]}"
                 else:
                     src_val = pred.get("source", "local").upper()
-                is_pos_yes = lm["is_yes"]
-                side_val = pred.get("position", "Yes" if is_pos_yes else "No")
-                if side_val == "No":
-                    pu_disp = lm["win_prob_u"]
-                    p_norm_disp = lm["win_prob_bal"]
-                    pm_disp = lm["win_prob_m"]
-                    live_disp = lm["eval_win_m"]
-                else:
-                    pu_disp = pu_v
-                    p_norm_disp = lm["pu_norm"]
-                    pm_disp = pm_v
-                    live_disp = float(cur_pm_v) if cur_pm_v is not None else pm_v
+                is_pos_yes = (side_val == "Yes")
+                pu_disp = pu_v
+                p_norm_disp = lm["win_prob_bal"]
+                pm_disp = pm_v
+                live_disp = float(cur_pm_v) if cur_pm_v is not None else pm_v
 
                 rows.append({
                     "Mode": "active",
@@ -271,7 +282,10 @@ def print_review_table(history, sub_mode):
                     "Web Link": f"https://polymarket.com/event/{pred.get('slug', 'unknown')}",
                     "Kelly": k_v,
                     "EffKelly": lm["eff_kelly"],
-                    "Edge": lm["live_active_edge"],
+                    "HeldVal": live_val,
+                    "HeldFrac": held_mtm_k,
+                    "Shares": sh,
+                    "Edge": float(pred.get("edge", lm["live_active_edge"]) or lm["live_active_edge"]),
                     "DistDecel": lm["dist_to_target"],
                     "pu": pu_disp,
                     "p_norm": p_norm_disp,
@@ -305,9 +319,18 @@ def print_review_table(history, sub_mode):
                     pm_disp = pm_v
                     live_disp = float(cur_pm_v) if cur_pm_v is not None else pm_v
 
+                w_tag = pred.get("wallet")
+                alias_tag = history.get("alias")
+                if pred.get("source") == "wallet" and alias_tag:
+                    src_val = alias_tag[:8]
+                elif w_tag and len(w_tag) >= 6:
+                    src_val = f"0x..{w_tag[-4:]}"
+                else:
+                    src_val = pred.get("source", "wallet").upper()
+
                 rows.append({
                     "Mode": "exited",
-                    "Source": pred.get("source", "wallet").upper(),
+                    "Source": src_val,
                     "Side": side_val,
                     "Market ID": market_id,
                     "Date": str(pred.get("date", "unknown"))[:10],
@@ -339,40 +362,6 @@ def print_review_table(history, sub_mode):
                 "Web Link": f"https://polymarket.com/event/{value.get('slug', 'unknown')}"
             })
 
-    if sub_mode in ["limit_orders", "all"]:
-        for market_id, value in history.get("limit_orders", {}).items():
-            for lo in ensure_list(value):
-                limit_p = float(lo.get("limit_price", 0.5))
-                cur_p = float(lo.get("cur_pm", limit_p))
-                side = lo.get("side", "SELL").upper()
-                pos = lo.get("position", "Yes")
-                target_str = f"{limit_p*100:.1f}%"
-                live_str = f"{cur_p*100:.1f}%"
-                dist = cur_p - limit_p if side == "SELL" else limit_p - cur_p
-                dist_str = f"{dist*100:+.1f}% to fill"
-                shares = float(lo.get("shares", 0.0) or 0.0)
-                status_str = f"PENDING ({dist_str})" if abs(dist) > 0.005 else "NEAR FILL"
-                rows.append({
-                    "Mode": "limit",
-                    "Source": "LIMIT",
-                    "Side": f"{side} {pos}",
-                    "Market ID": market_id,
-                    "Date": str(lo.get("date", "unknown"))[:10],
-                    "Question": lo.get("question", "unknown"),
-                    "Web Link": f"https://polymarket.com/event/{lo.get('slug', 'unknown')}",
-                    "Kelly": None,
-                    "EffKelly": None,
-                    "Edge": dist,
-                    "DistDecel": abs(dist),
-                    "pu": float(lo.get("pu", limit_p)),
-                    "p_norm": float(lo.get("p_norm", limit_p)),
-                    "pm": limit_p,
-                    "cur_pm": cur_p,
-                    "Target": limit_p,
-                    "PnL": None,
-                    "Regime": status_str,
-                    "Shares": shares
-                })
 
     if sub_mode in ["resolved", "all"]:
         for market_id, value in history.get("resolved", {}).items():
@@ -473,8 +462,11 @@ def print_review_table(history, sub_mode):
         side_str = r.get("Side", "-")
         src_str = r.get("Source", "-")
 
+        edge_v = r.get("Edge")
+
         kelly_str = f"{kelly_val*100:.2f}%" if kelly_val is not None else "-"
         eff_kelly_str = f"{eff_kelly_val*100:.2f}%" if eff_kelly_val is not None else "-"
+        edge_str = f"{edge_v*100:+.1f}%" if edge_v is not None else "-"
         pu_str = f"{pu_val*100:.1f}%" if pu_val is not None else "-"
         p_norm_str = f"{p_norm_val*100:.1f}%" if p_norm_val is not None else "-"
         pm_str = f"{pm_val*100:.1f}%" if pm_val is not None else "-"
@@ -491,23 +483,20 @@ def print_review_table(history, sub_mode):
 
         row_num = str(row_i)
         if sub_mode == "predicted":
-            vals = [row_num, r["Date"], src_str, side_str, r["Question"], kelly_str, eff_kelly_str, pu_str, p_norm_str, pm_str, live_str, tgt_str, regime_val]
-        elif sub_mode == "limit_orders":
-            shares_str = f"{r.get('Shares', 0.0):,.0f}"
-            lim_px_str = f"{r.get('Target', 0.0)*100:.1f}%"
-            live_px_str = f"{r.get('cur_pm', 0.0)*100:.1f}%"
-            dist_val = r.get("Edge", 0.0)
-            dist_fill_str = f"{dist_val*100:+.1f}%"
-            vals = [row_num, r["Date"], side_str, r["Question"], shares_str, lim_px_str, live_px_str, dist_fill_str, regime_val]
+            held_v = r.get("HeldVal", 0.0)
+            held_f = r.get("HeldFrac", 0.0)
+            held_str = f"${held_v:,.0f} ({held_f*100:.1f}%)" if held_v > 0 else "-"
+            vals = [row_num, r["Question"], regime_val, held_str, kelly_str, edge_str, side_str, live_str, p_norm_str, r["Date"], src_str]
         elif sub_mode == "exited":
-            vals = [row_num, r["Date"], side_str, r["Question"], kelly_str, pu_str, p_norm_str, pm_str, live_str, pnl_str, regime_val]
+            vals = [row_num, r["Question"], pnl_str, kelly_str, edge_str, side_str, pm_str, live_str, pu_str, p_norm_str, r["Date"], src_str]
         elif sub_mode == "resolved":
-            vals = [row_num, r["Date"], src_str, side_str, r["Question"], kelly_str, pu_str, p_norm_str, pm_str, pnl_str, outcome_str]
+            vals = [row_num, r["Question"], outcome_str, pnl_str, kelly_str, edge_str, side_str, pm_str, pu_str, p_norm_str, r["Date"], src_str]
         elif sub_mode == "skipped":
-            vals = [row_num, r["Date"], r["Question"]]
+            vals = [row_num, r["Question"], r["Date"]]
         else:
             st_res = f"{outcome_str} ({pnl_str})" if r["Mode"] == "resolved" else (f"EXITED ({pnl_str})" if r["Mode"] == "exited" else regime_val)
-            vals = [row_num, r["Mode"].upper(), side_str, r["Date"], r["Question"], kelly_str, pu_str, p_norm_str, pm_str, tgt_str, st_res]
+            pos_or_pnl = pnl_str if r["Mode"] in ("resolved", "exited") else (f"${r.get('HeldVal', 0):,.0f}" if r.get('HeldVal', 0) > 0 else "-")
+            vals = [row_num, r["Question"], r["Mode"].upper(), st_res, pos_or_pnl, kelly_str, edge_str, side_str, live_str, p_norm_str, r["Date"]]
 
         row_parts = []
         for i, (v, w, a) in enumerate(zip(vals, widths, aligns)):
@@ -526,120 +515,47 @@ def print_review_table(history, sub_mode):
     # Pure Voluntary Action Bar
     if sub_mode == "predicted":
         sell_signals = [r for r in rows if "SELL" in r.get("Regime", "")]
-        sell_tag = f" ({len(sell_signals)} exit signal{'s' if len(sell_signals) > 1 else ''})" if sell_signals else ""
-        print(f"Actions: [1] Predict / Add Tranche on Market from Table  [2] Place Limit Sell{sell_tag}  [Enter] Main Menu")
-        act = input("> ").strip()
-        if act == "1":
-            _handle_targeted_tranche_predict(rows)
-        elif act == "2":
-            _handle_limit_sell(rows, sell_signals, history)
-
-    elif sub_mode == "limit_orders" and rows:
-        print("Actions: [1] Predict / Add Tranche on Market from Table  [2] Cancel a tracked limit order  [Enter] Main Menu")
-        act = input("> ").strip()
-        if act == "1":
-            _handle_targeted_tranche_predict(rows)
-        elif act == "2":
-            _handle_cancel_limit_order(rows, history)
+        exit_tag = f"  [*] Active Exit: {len(sell_signals)} position{'s' if len(sell_signals) > 1 else ''} reached target (Market Sell on Polymarket recommended)\n" if sell_signals else ""
+        if exit_tag:
+            print(exit_tag, end="")
+        act = input(f"Select row # to predict / add tranche (1-{len(rows)}) [Enter for Main Menu]: ").strip()
+        if act.isdigit():
+            _handle_targeted_tranche_predict(rows, preselected_idx=int(act) - 1)
 
     elif sub_mode in ["exited", "resolved", "skipped", "all"] and rows:
-        print("Actions: [1] Predict / Add Tranche on Market from Table  [Enter] Main Menu")
-        act = input("> ").strip()
-        if act == "1":
-            _handle_targeted_tranche_predict(rows)
+        act = input(f"Select row # to predict / add tranche (1-{len(rows)}) [Enter for Main Menu]: ").strip()
+        if act.isdigit():
+            _handle_targeted_tranche_predict(rows, preselected_idx=int(act) - 1)
 
 
-def _handle_targeted_tranche_predict(rows):
+def _handle_targeted_tranche_predict(rows, preselected_idx=None):
     """Launches targeted prediction / tranche addition on a specific table row."""
-    sel_str = input(f"Select row # to predict / add tranche (1-{len(rows)}) [Enter to cancel]: ").strip()
-    if not sel_str.isdigit():
-        return
-    sel_idx = int(sel_str) - 1
+    if preselected_idx is not None:
+        sel_idx = preselected_idx
+    else:
+        sel_str = input(f"Select row # to predict / add tranche (1-{len(rows)}) [Enter to cancel]: ").strip()
+        if not sel_str.isdigit():
+            return
+        sel_idx = int(sel_str) - 1
+
     if not (0 <= sel_idx < len(rows)):
         print(f"[!] Row number out of range (1-{len(rows)}).")
         return
     sel_row = rows[sel_idx]
     link = sel_row.get("Web Link", "")
     target_slug = link.split("/event/")[-1].split("?")[0] if "/event/" in link else ""
+    target_mid = sel_row.get("Market ID")
     if not target_slug or target_slug == "unknown":
         print(f"[!] Could not extract market slug for: {sel_row.get('Question')}")
         return
-    print(f"\n[+] Selected #{sel_str}: {sel_row['Question'][:70]}")
+    print(f"\n[+] Selected #{sel_idx + 1}: {sel_row['Question'][:70]}")
     from session import run_prediction_session
-    run_prediction_session(mode="target", target_slugs=[target_slug], exclude_mode="none")
-
-
-def _handle_limit_sell(rows, sell_signals, history):
-    """Prompts for limit sell placement either from signals or chosen row."""
-    targets_to_sell = sell_signals
-    if not targets_to_sell:
-        sel_str = input(f"Enter row # to place limit sell on (1-{len(rows)}) [Enter to cancel]: ").strip()
-        if not sel_str.isdigit():
-            return
-        sel_idx = int(sel_str) - 1
-        if 0 <= sel_idx < len(rows):
-            targets_to_sell = [rows[sel_idx]]
-        else:
-            print(f"[!] Invalid row number.")
-            return
-
-    from datetime import datetime, timezone
-    from storage import save_history, stringify_overflow
-    for idx, r in enumerate(targets_to_sell):
-        mid = r["Market ID"]
-        q = r["Question"]
-        tgt_p = r["Target"]
-        print(f"\n[{idx+1}/{len(targets_to_sell)}] {q[:60]}")
-        print(f"  Signal: {r['Regime']} | Target Exit Price: {tgt_p*100:.1f}%")
-        lim_in = input(f"  Confirm Limit Sell Price % [Enter for {tgt_p*100:.1f}%]: ").strip()
-        try:
-            lim_price = float(lim_in) / 100.0 if lim_in else tgt_p
-        except ValueError:
-            lim_price = tgt_p
-
-        shares_in = input(f"  Shares to sell [Enter to skip]: ").strip()
-        if not shares_in:
-            continue
-        try:
-            shares_cnt = float(shares_in)
-        except ValueError:
-            shares_cnt = 0.0
-
-        link = r.get("Web Link", "")
-        slug_val = link.split("/event/")[-1].split("?")[0] if "/event/" in link else "unknown"
-        history.setdefault("limit_orders", {}).setdefault(mid, []).append({
-            "question": q,
-            "slug": slug_val,
-            "side": "SELL",
-            "position": r.get("Side", "Yes"),
-            "shares": shares_cnt,
-            "limit_price": lim_price,
-            "cur_pm": r.get("cur_pm", lim_price),
-            "pu": r.get("pu"),
-            "p_norm": r.get("p_norm"),
-            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        })
-        print(f"  [+] Added to pending limit orders: SELL {shares_cnt:,.0f} shares @ {lim_price*100:.1f}%.")
-    save_history(stringify_overflow(history))
-
-
-def _handle_cancel_limit_order(rows, history):
-    """Cancels a tracked limit order by row number."""
-    from storage import save_history, stringify_overflow
-    del_num = input(f"Enter row # to cancel limit order (1-{len(rows)}) [Enter to cancel]: ").strip()
-    if not del_num.isdigit():
-        return
-    del_idx = int(del_num) - 1
-    if 0 <= del_idx < len(rows):
-        del_mid = rows[del_idx]["Market ID"]
-        if del_mid in history.get("limit_orders", {}):
-            history["limit_orders"].pop(del_mid, None)
-            save_history(stringify_overflow(history))
-            print(f"[+] Cancelled limit order for: {rows[del_idx]['Question'][:60]}")
-        else:
-            print("[!] Limit order not found in history.")
-    else:
-        print("[!] Invalid row number.")
+    run_prediction_session(
+        mode="target",
+        target_slugs=[target_slug],
+        target_market_id=target_mid,
+        exclude_mode="none"
+    )
 
 
 def _strip_ansi(text):
@@ -654,7 +570,6 @@ def print_main_menu_dashboard(history):
     n_exit = sum(len(ensure_list(v)) for v in history.get("exited", {}).values())
     n_res = sum(len(ensure_list(v)) for v in history.get("resolved", {}).values())
     n_skip = len(history.get("skipped", {}))
-    n_lim = sum(len(ensure_list(v)) for v in history.get("limit_orders", {}).values())
     
     from storage import get_active_profile, get_profile_display_name
     active_pid = get_active_profile()
@@ -684,19 +599,44 @@ def print_main_menu_dashboard(history):
     for preds in history.get("predicted", {}).values():
         for p in ensure_list(preds):
             k = max(0.0, float(p.get("kelly", 0.0) or 0.0))
+            is_w = (p.get("source") == "wallet")
+            sh = float(p.get("shares", 0.0) or 0.0)
+            cur_p = float(p.get("cur_pm") if p.get("cur_pm") is not None else p.get("pm", 0.5))
+            if is_w:
+                if sh > 0 and cur_p > 0:
+                    live_val = sh * cur_p
+                elif p.get("cost_basis"):
+                    cb = float(p.get("cost_basis", 0.0) or 0.0)
+                    entry_p = float(p.get("pm", cur_p) or cur_p)
+                    live_val = cb * (cur_p / entry_p if entry_p > 0 else 1.0)
+                else:
+                    live_val = k * cfg.BANKROLL
+                held_mtm_k = live_val / cfg.BANKROLL if cfg.BANKROLL > 0 else k
+            else:
+                live_val = 0.0
+                held_mtm_k = 0.0
+
+            pos_side = p.get("position", "Yes")
+            pu_dash = float(p.get("pu", 0.5))
+            if pos_side == "No" and pu_dash < 0.5:
+                pu_dash = 1.0 - pu_dash
+            ego_dash = float(p.get("dynamic_ego") if p.get("dynamic_ego") is not None else base_ego)
             lm = calculate_logistic_metrics(
-                p.get("pu"), p.get("pm"), float(p.get("dynamic_ego", base_ego)),
+                pu_dash, p.get("pm"), ego_dash,
                 held_kelly=k, cur_pm=p.get("cur_pm")
             )
+
             eff_k = lm["eff_kelly"]
+            delta_k = max(0.0, eff_k - held_mtm_k) if held_mtm_k > 0 else eff_k
+
             active_eff_kelly += eff_k
-            active_edge_w += eff_k * lm["live_active_edge"]
-            is_w = (p.get("source") == "wallet")
+            active_edge_w += eff_k * float(p.get("edge", lm["live_active_edge"]) or lm["live_active_edge"])
+
             if not is_w:
                 sig = "BUY" if lm["live_active_edge"] > 0 else "PASS"
-            elif lm["regime"] in ("HALF-SLOPE", "DECEL-EXIT") or lm["live_active_edge"] <= 0:
+            elif lm["regime"] == "OVER-TGT" or lm["live_active_edge"] <= 0:
                 sig = "SELL"
-            elif lm["delta_kelly"] >= 0.01:
+            elif delta_k >= 0.005:
                 sig = "ADD"
             else:
                 sig = "HOLD"
@@ -720,7 +660,6 @@ def print_main_menu_dashboard(history):
     total_games = wins + losses
     win_pct_str = f" ({wins/total_games*100:.1f}%)" if total_games > 0 else ""
     pnl_str = f"+${pnl_total:,.2f}" if pnl_total >= 0 else f"-${abs(pnl_total):,.2f}"
-    lim_str = f" | {n_lim} limits" if n_lim > 0 else ""
     skip_str = f" | {n_skip} skipped" if n_skip > 0 else ""
 
     box_w = 96
@@ -733,6 +672,6 @@ def print_main_menu_dashboard(history):
     print("-" * box_w)
     print(cap_line)
     print(f"  Live Exposure  : {active_eff_kelly*100:.1f}% Eff-Kelly (${active_eff_kelly*cfg.BANKROLL:,.2f} across {n_pred} active) | Avg Edge: {avg_edge*100:+.2f}% | Signals: {sig_summary}")
-    print(f"  Track Record   : {wins}W - {losses}L{win_pct_str} | Realized PnL: {pnl_str} across {n_res} resolved + {n_exit} exited | Base Ego: {base_ego:.3f}{lim_str}{skip_str}")
+    print(f"  Track Record   : {wins}W - {losses}L{win_pct_str} | Realized PnL: {pnl_str} across {n_res} resolved + {n_exit} exited | Base Ego: {base_ego:.3f}{skip_str}")
     print("=" * box_w)
 

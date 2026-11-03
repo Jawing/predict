@@ -47,21 +47,25 @@ def get_wallet_usdc_balance(wallet_address):
 
 
 def get_wallet_portfolio_value(wallet_address, positions=None):
-    """Retrieves current value of open positions from Polymarket data API."""
+    """Retrieves current value of open positions from Polymarket Data API (v2)."""
     if not wallet_address or not wallet_address.startswith("0x"):
         return 0.0
     try:
-        val_resp = api.get(f"https://data-api.polymarket.com/value?user={wallet_address}", timeout=5).json()
-        if isinstance(val_resp, list) and len(val_resp) > 0 and "value" in val_resp[0]:
-            return float(val_resp[0]["value"] or 0.0)
+        val_resp = api.get(f"https://data-api.polymarket.com/v2/value?user={wallet_address}", timeout=5).json()
+        if isinstance(val_resp, dict):
+            data_val = val_resp.get("data", {})
+            if isinstance(data_val, dict) and "value" in data_val:
+                return float(data_val["value"] or 0.0)
+            elif "value" in val_resp:
+                return float(val_resp["value"] or 0.0)
     except Exception:
         pass
     if positions:
         total = 0.0
         for pos in positions:
-            size = float(pos.get("size", 0.0))
-            avg_price = float(pos.get("avgPrice", 0.0))
-            value = float(pos.get("currentValue", pos.get("initialValue", size * avg_price)))
+            size = float(pos.get("current_size") if pos.get("current_size") is not None else pos.get("size", 0.0) or 0.0)
+            avg_price = float(pos.get("avg_price") if pos.get("avg_price") is not None else pos.get("avgPrice", 0.0) or 0.0)
+            value = float(pos.get("current_value") if pos.get("current_value") is not None else pos.get("currentValue", pos.get("initialValue", size * avg_price)) or (size * avg_price))
             total += value
         return total
     return 0.0
@@ -367,7 +371,7 @@ def validate_market(m, history, mode, exclude_mode="none"):
     return True, "Valid"
 
 
-def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0, exclude_mode="none", discovery_order="volume"):
+def generate_market_stream(mode, sub_mode, target_slugs, history, category="All", max_offset=0, exclude_mode="none", discovery_order="volume", target_market_id=None):
     """Yields validated market objects from discovery vectors or targeted slugs."""
     if mode == "discover":
         seen_categories = set()
@@ -451,6 +455,8 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 for event in events:
                     if not isinstance(event, dict): continue
                     for m in event.get('markets', []):
+                        if target_market_id and str(m.get('id')) != str(target_market_id):
+                            continue
                         m['parent_slug'] = event.get('slug', 'unknown')
                         m['parent_name'] = event.get('title', 'unknown')
                         is_valid, reason = validate_market(m, history, mode, exclude_mode)
