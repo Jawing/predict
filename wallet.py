@@ -435,6 +435,12 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     wp["source"] = "wallet"
                     wp["wallet"] = wallet_address
                     wp["exited"] = is_exited_open_pos
+                    if end_date or (m and m.get("endDate")):
+                        wp["endDate"] = end_date or m.get("endDate")
+                    if m and m.get("volume") is not None:
+                        wp["volume"] = float(m.get("volume") or 0.0)
+                    if m and m.get("volume24hr") is not None:
+                        wp["volume24hr"] = float(m.get("volume24hr") or 0.0)
                     if latest_trade_ts > 0:
                         wp["last_synced_ts"] = latest_trade_ts
                     updated_existing += 1
@@ -690,7 +696,10 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             "outcomeIndex": outcome_idx,
             "source": "wallet",
             "wallet": wallet_address,
-            "exited": is_exited_flag
+            "exited": is_exited_flag,
+            "endDate": end_date or (m.get("endDate") if m else None),
+            "volume": float(m.get("volume") or 0.0) if m else 0.0,
+            "volume24hr": float(m.get("volume24hr") or 0.0) if m else 0.0
         }
         if latest_trade_ts > 0:
             pred_entry["last_synced_ts"] = latest_trade_ts

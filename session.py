@@ -5,7 +5,8 @@ and custom hypothetical market calculations.
 """
 
 import json
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 
 from config import BANKROLL, MIN_EDGE, api
@@ -25,12 +26,13 @@ from market import (
     extract_prices,
     refresh_prices_from_clob,
     stream_clob_book,
+    get_event_sub_markets,
 )
 from views import print_review_table, print_prediction_stats
 
 
 def format_velocity_display(edge, price, days):
-    """Formats velocity with dynamic precision to avoid +0.00% on small daily edges, including APY."""
+    """Formats daily capital velocity and daily ROI with dynamic precision."""
     if days <= 0 or price <= 0 or abs(edge) < 1e-9:
         return "Immediate / N/A"
     daily_edge = edge / max(0.05, days)
@@ -39,10 +41,155 @@ def format_velocity_display(edge, price, days):
     d_roi_pct = daily_roi * 100.0
     edge_str = f"{d_edge_pct:+.4f}%" if abs(d_edge_pct) < 0.01 else f"{d_edge_pct:+.2f}%"
     roi_str = f"{d_roi_pct:+.4f}%" if abs(d_roi_pct) < 0.01 else f"{d_roi_pct:+.2f}%"
-    ann_edge = (edge / max(0.05, days)) * 365.0 * 100.0
-    _, apy = calculate_annualized_yield(edge, price, days)
-    apy_str = f"{apy*100:+.1f}% APY" if -1.0 <= apy <= 100.0 else f"{ann_edge:+.1f}% Ann Edge"
-    return f"{edge_str} edge/day ({roi_str} ROI/day | {apy_str} | {days:.1f}d horizon)"
+    return f"{edge_str} edge/day ({roi_str} ROI/day)"
+
+
+def get_available_sub_markets(current_m, sub_markets, history, session_candidates=None):
+    """Filters sibling sub-markets to only unpredicted, active, open markets (excluding current)."""
+    if not sub_markets or len(sub_markets) <= 1:
+        return []
+    cur_id = str(current_m.get("id"))
+    staged_ids = {str(c.get("market_id")) for c in (session_candidates or [])}
+    pred_ids = set(str(k) for k in history.get("predicted", {}).keys())
+    skip_ids = set(str(k) for k in history.get("skipped", {}).keys())
+
+    available = []
+    for sm in sub_markets:
+        sm_id = str(sm.get("id"))
+        if sm_id == cur_id:
+            continue
+        if sm.get("closed") or sm.get("umaResolutionStatus") == "resolved" or sm.get("active") is False:
+            continue
+        if sm_id in pred_ids or sm_id in staged_ids or sm_id in skip_ids:
+            continue
+        available.append(sm)
+    return available
+
+
+def select_sub_market(current_m, sub_markets, history, session_candidates=None, page_size=10):
+    """Displays unanchored list of available sibling sub-markets with page scrolling and instant search."""
+    available = get_available_sub_markets(current_m, sub_markets, history, session_candidates)
+    if not available:
+        print("[!] No other available sub-markets found for this event.\n")
+        return None
+
+    total_items = len(available)
+    total_pages = math.ceil(total_items / page_size)
+    parent_title = current_m.get("parent_name") or "Event Sub-Markets"
+    current_page = 0
+
+    while True:
+        start_idx = current_page * page_size
+        end_idx = min(start_idx + page_size, total_items)
+
+        print(f"\n" + "=" * 76)
+        if total_pages > 1:
+            print(f" [AVAILABLE SUB-MARKETS: {parent_title} (Page {current_page + 1}/{total_pages} - {total_items} total)]")
+        else:
+            print(f" [AVAILABLE SUB-MARKETS: {parent_title} ({total_items} available)]")
+        print("-" * 76)
+        print(f"  # | Market / Sub-Question")
+        print(f"----+-------------------------------------------------------------------")
+
+        for idx in range(start_idx, end_idx):
+            sm = available[idx]
+            title = sm.get("groupItemTitle") or sm.get("question") or "unknown"
+            title_disp = (title[:62] + "...") if len(title) > 65 else title
+            print(f" {idx + 1:2d} | {title_disp}")
+
+        print("=" * 76)
+
+        if total_pages > 1:
+            prompt_str = f"Select # (1-{total_items}), [n]ext, [p]rev, [a]ll, or search [Enter to cancel]: "
+        else:
+            prompt_str = f"Select # (1-{total_items}), or search [Enter to cancel]: "
+
+        choice = input(prompt_str).strip()
+
+        if not choice:
+            return None
+
+        choice_lower = choice.lower()
+
+        if total_pages > 1 and choice_lower in ("n", "next", ">"):
+            if current_page < total_pages - 1:
+                current_page += 1
+            else:
+                print("[*] Wrapped to first page.")
+                current_page = 0
+            continue
+
+        if total_pages > 1 and choice_lower in ("p", "prev", "<"):
+            if current_page > 0:
+                current_page -= 1
+            else:
+                print("[*] Wrapped to last page.")
+                current_page = total_pages - 1
+            continue
+
+        if total_pages > 1 and choice_lower in ("a", "all"):
+            print(f"\n" + "=" * 76)
+            print(f" [ALL SUB-MARKETS: {parent_title} ({total_items} available)]")
+            print("-" * 76)
+            print(f"  # | Market / Sub-Question")
+            print(f"----+-------------------------------------------------------------------")
+            for i, sm in enumerate(available, 1):
+                title = sm.get("groupItemTitle") or sm.get("question") or "unknown"
+                title_disp = (title[:62] + "...") if len(title) > 65 else title
+                print(f" {i:2d} | {title_disp}")
+            print("=" * 76)
+            sel = input(f"Select # to predict (1-{total_items}) [Enter to cancel]: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= total_items:
+                chosen = available[int(sel) - 1].copy()
+                chosen["parent_slug"] = current_m.get("parent_slug")
+                chosen["parent_name"] = current_m.get("parent_name")
+                chosen["event_markets"] = sub_markets
+                return chosen
+            return None
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < total_items:
+                chosen = available[idx].copy()
+                chosen["parent_slug"] = current_m.get("parent_slug")
+                chosen["parent_name"] = current_m.get("parent_name")
+                chosen["event_markets"] = sub_markets
+                return chosen
+            else:
+                print(f"[!] Invalid selection. Please enter a number between 1 and {total_items}.\n")
+                continue
+
+        # Instant text search / filter
+        matches = [
+            (i, sm) for i, sm in enumerate(available)
+            if choice_lower in (sm.get("groupItemTitle") or sm.get("question") or "").lower()
+        ]
+        if len(matches) == 1:
+            idx, chosen = matches[0]
+            m_title = chosen.get("groupItemTitle") or chosen.get("question")
+            print(f"[+] Matched #{idx + 1}: {m_title}")
+            chosen_ret = chosen.copy()
+            chosen_ret["parent_slug"] = current_m.get("parent_slug")
+            chosen_ret["parent_name"] = current_m.get("parent_name")
+            chosen_ret["event_markets"] = sub_markets
+            return chosen_ret
+        elif len(matches) > 1:
+            print(f"\n[+] Found {len(matches)} matches for '{choice}':")
+            for idx, sm in matches:
+                t = sm.get("groupItemTitle") or sm.get("question") or "unknown"
+                t_disp = (t[:62] + "...") if len(t) > 65 else t
+                print(f" {idx + 1:2d} | {t_disp}")
+            sel = input(f"\nSelect # to predict [Enter to cancel]: ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= total_items:
+                chosen = available[int(sel) - 1].copy()
+                chosen["parent_slug"] = current_m.get("parent_slug")
+                chosen["parent_name"] = current_m.get("parent_name")
+                chosen["event_markets"] = sub_markets
+                return chosen
+            continue
+        else:
+            print(f"[!] No matches for '{choice}'. Please enter a number (1-{total_items}), 'n', 'p', or Enter to cancel.\n")
+            continue
 
 
 def run_prediction_session(
@@ -138,6 +285,11 @@ def run_prediction_session(
         pm_bid, pm_ask, pm_mid = extract_prices(m)
         m["cached_bid"], m["cached_ask"], m["cached_mid"] = pm_bid, pm_ask, pm_mid
 
+        sub_markets = get_event_sub_markets(m)
+        avail_subs = get_available_sub_markets(m, sub_markets, history, session_candidates)
+        num_avail = len(avail_subs)
+        sub_tag = f" ({num_avail} other available)" if num_avail > 0 else ""
+
         market_id = m.get("id")
         question = m.get("question", "unknown")
         event_slug = m.get("parent_slug", "unknown")
@@ -156,14 +308,15 @@ def run_prediction_session(
         pm_bid, pm_ask, pm_mid = m["cached_bid"], m["cached_ask"], m["cached_mid"]
 
         print(f"==================================================")
-        print(f"Event    : {m.get('parent_name')}")
+        print(f"Event    : {m.get('parent_name')}{sub_tag}")
         print(f"URL      : {event_url}")
         print(f"Market   : {question}")
         print(f"Resolves : {exact_date_str} ({days_str})\n")
 
+        prompt_sub = f", 'sub' (list {num_avail} mkts)" if num_avail > 0 else ""
         while True:
             user_input = input(
-                "Enter % bounds ('36-48' or '42'), 'l' (live), 's' (skip), 'r' (redo), 'q' (quit): "
+                f"Enter % bounds ('36-48' or '42'){prompt_sub}, 'l' (live), 's' (skip), 'r' (redo), 'q' (quit): "
             ).strip()
             cmd_parts = user_input.split()
             if cmd_parts and cmd_parts[0].lower() in ("l", "live"):
@@ -174,6 +327,43 @@ def run_prediction_session(
                     user_input = follow_up
                     break
                 continue
+            if user_input.lower() in ("sub", "m", "markets", "list") and num_avail > 0:
+                chosen = select_sub_market(m, sub_markets, history, session_candidates)
+                if chosen:
+                    chosen = refresh_prices_from_clob(chosen)
+                    b_p, a_p, m_p = extract_prices(chosen)
+                    chosen["cached_bid"], chosen["cached_ask"], chosen["cached_mid"] = b_p, a_p, m_p
+                    chosen["original_state"] = {
+                        "in_pred": chosen.get("id") in history["predicted"],
+                        "pred_data": history["predicted"].get(chosen.get("id")),
+                        "in_skip": chosen.get("id") in history["skipped"],
+                        "skip_data": history["skipped"].get(chosen.get("id")),
+                        "portfolio_len": len(portfolio_data),
+                    }
+                    session_markets[current_index] = chosen
+                    m = chosen
+                    market_id = m.get("id")
+                    question = m.get("question", "unknown")
+                    try:
+                        res_dt = datetime.fromisoformat(m.get("endDate").replace("Z", "+00:00"))
+                        exact_date_str = res_dt.strftime("%B %d, %Y")
+                        seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+                        days_str = format_time_remaining(seconds_left)
+                    except:
+                        exact_date_str, days_str = "unknown", "unknown"
+                    pm_bid, pm_ask, pm_mid = m["cached_bid"], m["cached_ask"], m["cached_mid"]
+                    avail_subs = get_available_sub_markets(m, sub_markets, history, session_candidates)
+                    num_avail = len(avail_subs)
+                    sub_tag = f" ({num_avail} other available)" if num_avail > 0 else ""
+                    prompt_sub = f", 'sub' (list {num_avail} mkts)" if num_avail > 0 else ""
+                    print(f"==================================================")
+                    print(f"Event    : {m.get('parent_name')}{sub_tag}")
+                    print(f"URL      : {event_url}")
+                    print(f"Market   : {question}")
+                    print(f"Resolves : {exact_date_str} ({days_str})\n")
+                    continue
+                else:
+                    continue
             break
 
         if user_input.lower() == "q":
@@ -218,6 +408,20 @@ def run_prediction_session(
                     "slug": event_slug,
                     "date": today_str,
                 }
+            avail_after = get_available_sub_markets(m, sub_markets, history, session_candidates)
+            if len(avail_after) > 0:
+                another = input(f"Predict another sub-market for '{m.get('parent_name')}'? [y/N]: ").strip().lower()
+                if another in ("y", "yes"):
+                    chosen = select_sub_market(m, sub_markets, history, session_candidates)
+                    if chosen:
+                        chosen["original_state"] = {
+                            "in_pred": chosen.get("id") in history["predicted"],
+                            "pred_data": history["predicted"].get(chosen.get("id")),
+                            "in_skip": chosen.get("id") in history["skipped"],
+                            "skip_data": history["skipped"].get(chosen.get("id")),
+                            "portfolio_len": len(portfolio_data),
+                        }
+                        session_markets.insert(current_index + 1, chosen)
             current_index += 1
             continue
 
@@ -361,6 +565,12 @@ def run_prediction_session(
                     primary_p["shares"] = round(tot_sh, 4)
                     primary_p["pm"] = round(tot_cb / tot_sh, 6) if tot_sh > 0 else stored_pm
                     primary_p["tranche_added"] = final_alloc
+                    if m.get("endDate"):
+                        primary_p["endDate"] = m.get("endDate")
+                    if m.get("volume") is not None:
+                        primary_p["volume"] = float(m.get("volume") or 0.0)
+                    if m.get("volume24hr") is not None:
+                        primary_p["volume24hr"] = float(m.get("volume24hr") or 0.0)
                 elif primary_p.get("kelly") is None or float(primary_p.get("kelly", 0.0)) <= 0:
                     primary_p["kelly"] = raw_kelly
                 candidate_to_commit = primary_p
@@ -379,6 +589,9 @@ def run_prediction_session(
                     "conditionId": m.get("conditionId"),
                     "position": pos_side,
                     "source": "local",
+                    "endDate": m.get("endDate"),
+                    "volume": float(m.get("volume") or 0.0),
+                    "volume24hr": float(m.get("volume24hr") or 0.0),
                 }
 
             norm_target = lm["target_win_m"]
@@ -387,15 +600,21 @@ def run_prediction_session(
             print(
                 f"Spread       : Bid {pm_bid*100:.1f}% | Ask {pm_ask*100:.1f}% (Spread: {(pm_ask - pm_bid)*100:.1f}%)"
             )
+            if lower == upper:
+                conv_str = f"User {lower*100:.1f}%"
+            else:
+                conv_str = f"User [{lower*100:.1f}%-{upper*100:.1f}%]"
             print(
-                f"Conviction   : User [{lower*100:.1f}%-{upper*100:.1f}%] -> Active Target: {norm_target*100:.1f}%{side_tag} (Ego: {dynamic_ego:.2f})"
+                f"Conviction   : {conv_str} -> Active Target: {norm_target*100:.1f}%{side_tag} (Ego: {dynamic_ego:.2f})"
             )
             ref_px = stored_pm if not is_existing else stored_cur_pm
             dist_tgt = norm_target - ref_px
-            runway_str = f"{dist_tgt*100:+.1f}% to Target ({norm_target*100:.1f}%)"
-            print(f"Runway       : {runway_str} | Efficiency: {lm['eff_live']*100:.1f}% ({lm['regime']})")
+            print(f"Runway       : {dist_tgt*100:+.1f}% | Efficiency: {lm['eff_live']*100:.1f}% ({lm['regime']})")
 
-            vel_str = format_velocity_display(adjusted_edge, vwap_true, days_until)
+            if action in ["YES", "NO"] and final_alloc > 0 and adjusted_edge > 0:
+                vel_str = format_velocity_display(adjusted_edge, vwap_true, days_until)
+            else:
+                vel_str = "N/A (No trade / 0 allocation)"
             print(f"Velocity     : {vel_str}")
 
             if action in ["YES", "NO"]:
@@ -409,13 +628,11 @@ def run_prediction_session(
                         action_label = f"HOLD (Held {held_mtm_k*100:.1f}% >= Target {eff_kelly*100:.1f}%{excess_str})"
                     print(f"Action       : {action_label} | Net Edge: {adjusted_edge*100:+.2f}%")
                     sh_tag = f" | {held_shares:,.1f} shares" if held_shares > 0 else ""
-                    print(f"Existing Pos : {held_mtm_k*100:.2f}% MTM (${live_held_val:,.2f}{sh_tag})")
-                    print(f"Target Kelly : {eff_kelly*100:.2f}% Eff-Kelly (${target_alloc:,.2f}) | Tranche Delta: +{delta_k*100:.2f}% (${final_alloc:,.2f})")
+                    print(f"Position     : Held {held_mtm_k*100:.2f}% (${live_held_val:,.2f}{sh_tag}) -> Target {eff_kelly*100:.2f}% (${target_alloc:,.2f})")
                 else:
                     slip_note = f" (Slippage: +{slippage*100:.2f}%)" if slippage > 0.0001 else ""
                     print(f"Action       : BUY {action} @ {vwap_true*100:.1f}% VWAP{slip_note} | Net Edge: {adjusted_edge*100:+.2f}%")
-                    print(f"Kelly Target : {raw_kelly*100:.2f}% Raw-Kelly | Eff-Kelly: {eff_kelly*100:.2f}% (${final_alloc:,.2f})")
-                    print(f"Allocation   : ${final_alloc:,.2f} ({eff_kelly*100:.2f}% Eff-Kelly)")
+                    print(f"Allocation   : ${final_alloc:,.2f} ({eff_kelly*100:.2f}% Eff-Kelly | {raw_kelly*100:.2f}% Raw)")
 
                     ws = history.get("wallet_summary", {})
                     wallet_cash = float(ws.get("cash", current_bankroll) or current_bankroll) if isinstance(ws, dict) else current_bankroll
@@ -441,7 +658,12 @@ def run_prediction_session(
                 if lm["live_active_edge"] <= 0:
                     reason = f"Price {pm_mid*100:.1f}% at/above target {lm['pu_norm']*100:.1f}% (Exit Signal: SELL)"
                 elif action == "THIN_EDGE":
-                    reason = f"Edge below {MIN_EDGE*100}% threshold"
+                    if edge > 0 and adjusted_edge <= 0:
+                        reason = f"Orderbook slippage on ${final_alloc:,.2f} order (Ask {true_price*100:.1f}% -> VWAP {vwap_true*100:.1f}%) wiped raw edge"
+                    elif edge > 0 and adjusted_edge < MIN_EDGE:
+                        reason = f"Net edge {adjusted_edge*100:.2f}% below {MIN_EDGE*100:.1f}% threshold after slippage"
+                    else:
+                        reason = f"Edge below {MIN_EDGE*100:.1f}% threshold"
                 elif action == "NONE":
                     reason = "Trapped inside bid-ask spread"
                 else:
@@ -495,6 +717,21 @@ def run_prediction_session(
                     print("=" * 80 + "\n")
             else:
                 print(f"Status       : [-] Pass (Edge: {adjusted_edge*100:+.2f}%)\n")
+
+            avail_after = get_available_sub_markets(m, sub_markets, history, session_candidates)
+            if len(avail_after) > 0:
+                another = input(f"Predict another sub-market for '{m.get('parent_name')}'? [y/N]: ").strip().lower()
+                if another in ("y", "yes"):
+                    chosen = select_sub_market(m, sub_markets, history, session_candidates)
+                    if chosen:
+                        chosen["original_state"] = {
+                            "in_pred": chosen.get("id") in history["predicted"],
+                            "pred_data": history["predicted"].get(chosen.get("id")),
+                            "in_skip": chosen.get("id") in history["skipped"],
+                            "skip_data": history["skipped"].get(chosen.get("id")),
+                            "portfolio_len": len(portfolio_data),
+                        }
+                        session_markets.insert(current_index + 1, chosen)
 
             current_index += 1
 
@@ -683,6 +920,9 @@ def custom_calculator():
                 "conditionId": "custom",
                 "position": pos_side_c,
                 "source": "local",
+                "endDate": (datetime.now(timezone.utc) + timedelta(days=days_until)).strftime("%Y-%m-%dT%H:%M:%SZ") if days_until > 0 else None,
+                "volume": 0.0,
+                "volume24hr": 0.0,
             })
             save_history(stringify_overflow(history))
             print("[+] Saved to active predictions.")

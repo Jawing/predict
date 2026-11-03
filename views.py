@@ -1,15 +1,55 @@
 """Portfolio and history display tables, aggregate variance metrics, and top-of-menu dashboard."""
 import math
+from datetime import datetime, timezone
+import requests
 import config as cfg
 from utils import ensure_list
 from model import (
     LOGISTIC_DECEL_LOW, LOGISTIC_DECEL_HIGH, LOGISTIC_HALF_LOW, LOGISTIC_HALF_HIGH,
-    calculate_logistic_metrics, calculate_base_ego
+    calculate_logistic_metrics, calculate_base_ego, calculate_annualized_yield
 )
+
+
+def ensure_predicted_market_metadata(history):
+    """Enriches predicted markets with endDate, volume, and volume24hr from Gamma API if missing."""
+    changed = False
+    for market_id, value in history.get("predicted", {}).items():
+        if str(market_id).startswith("custom_"):
+            continue
+        preds = ensure_list(value)
+        missing = [p for p in preds if not p.get("endDate") or p.get("volume24hr") is None]
+        if missing:
+            try:
+                resp = requests.get(f"{cfg.GAMMA_API}/markets/{market_id}", timeout=4).json()
+                if isinstance(resp, dict) and resp.get("id"):
+                    end_d = resp.get("endDate")
+                    vol = float(resp.get("volume") or 0.0)
+                    vol24 = float(resp.get("volume24hr") or 0.0)
+                    for p in preds:
+                        if end_d and not p.get("endDate"):
+                            p["endDate"] = end_d
+                            changed = True
+                        if p.get("volume") is None:
+                            p["volume"] = vol
+                            changed = True
+                        if p.get("volume24hr") is None:
+                            p["volume24hr"] = vol24
+                            changed = True
+            except Exception:
+                pass
+    if changed:
+        try:
+            from storage import save_history
+            from utils import stringify_overflow
+            save_history(stringify_overflow(history))
+        except Exception:
+            pass
 
 
 def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
     """Calculates weighted portfolio stats: balance percentage, effective N, expected win rate, variance."""
+    if sub_mode in ["predicted", "all"]:
+        ensure_predicted_market_metadata(history)
     if base_ego is None:
         base_ego = calculate_base_ego(history, verbose=False)
 
@@ -30,6 +70,11 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
     if not preds_list:
         return None
 
+    ws_b = history.get("wallet_summary", {})
+    active_bankroll = cfg.BANKROLL
+    if isinstance(ws_b, dict) and ws_b.get("bankroll") and float(ws_b.get("bankroll")) > 0:
+        active_bankroll = float(ws_b.get("bankroll"))
+
     items = []
     for p, state in preds_list:
         pos_side = p.get("position", "Yes")
@@ -47,10 +92,23 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
         is_res = (state == "resolved")
 
         lm = calculate_logistic_metrics(pu, pm, ego, held_kelly=kelly, cur_pm=cur_pm)
+        end_d = p.get("endDate") or p.get("end_date")
+        d_until = None
+        if end_d:
+            try:
+                res_dt = datetime.fromisoformat(str(end_d).replace('Z', '+00:00'))
+                if res_dt.tzinfo is None:
+                    res_dt = res_dt.replace(tzinfo=timezone.utc)
+                sec_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+                d_until = max(0.05, sec_left / 86400.0) if sec_left > 0 else 0.05
+            except Exception:
+                pass
+        p_edge = float(p.get("edge", lm["live_active_edge"]) or lm["live_active_edge"])
+        d_edge = (p_edge / d_until) if (d_until and d_until > 0) else None
         win_prob_bal = lm["win_prob_bal"]
         var_i = win_prob_bal * (1.0 - win_prob_bal)
-        alloc_i = (kelly * cfg.BANKROLL) if state == "active" else 0.0
-        eff_alloc_i = (lm["eff_kelly"] * cfg.BANKROLL) if state == "active" else 0.0
+        alloc_i = (kelly * active_bankroll) if state == "active" else 0.0
+        eff_alloc_i = (lm["eff_kelly"] * active_bankroll) if state == "active" else 0.0
         items.append({
             "state": state,
             "question": p.get("question", "Unknown"),
@@ -81,7 +139,10 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
             "var_i": var_i,
             "source": p.get("source", "local"),
             "is_resolved": is_res,
-            "outcome": float(outcome) if (is_res and outcome is not None) else None
+            "outcome": float(outcome) if (is_res and outcome is not None) else None,
+            "daily_edge": d_edge,
+            "days_until": d_until,
+            "apy": p.get("apy")
         })
 
     sized_items = [x for x in items if x["kelly"] > 0]
@@ -114,6 +175,19 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
     sum_w_sq = sum(w ** 2 for w in weights)
     effective_n = (1.0 / sum_w_sq) if sum_w_sq > 0 else 0.0
 
+    valid_d_edges = [x["daily_edge"] for x in items if x.get("daily_edge") is not None]
+    valid_days = [x["days_until"] for x in items if x.get("days_until") is not None]
+    valid_apys = []
+    for x in items:
+        try:
+            if x.get("apy") is not None and -1.0 <= float(x["apy"]) <= 100.0:
+                valid_apys.append(float(x["apy"]))
+        except Exception:
+            pass
+    avg_daily_edge = sum(w * x["daily_edge"] for w, x in zip(weights, used_items) if x.get("daily_edge") is not None) if used_items else None
+    avg_days = sum(valid_days) / len(valid_days) if valid_days else None
+    avg_apy = sum(valid_apys) / len(valid_apys) if valid_apys else None
+
     return {
         "total_count": len(items),
         "active_count": len(sized_items),
@@ -124,7 +198,7 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
         "total_alloc": total_alloc,
         "total_eff_alloc": total_eff_alloc,
         "total_pnl": total_pnl,
-        "bankroll": cfg.BANKROLL,
+        "bankroll": active_bankroll,
         "exp_win_bal": exp_win_bal,
         "exp_win_u": exp_win_u,
         "exp_win_m": exp_win_m,
@@ -135,6 +209,9 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None):
         "norm_variance": norm_variance,
         "norm_std_dev": norm_std_dev,
         "effective_n": effective_n,
+        "avg_daily_edge": avg_daily_edge,
+        "avg_days": avg_days,
+        "avg_apy": avg_apy,
         "items": items
     }
 
@@ -160,6 +237,10 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
 
     if sub_mode == "predicted":
         print(f"Model Exposure   : ${stats['total_eff_alloc']:,.2f} / ${stats['bankroll']:,.2f} ({stats['total_eff_kelly']*100:.1f}% Eff-Kelly)")
+        if stats.get("avg_daily_edge") is not None:
+            vel_s = f"{stats['avg_daily_edge']*100:+.2f}%/d"
+            h_s = f" | Avg Horizon: {stats['avg_days']:.1f}d" if stats.get("avg_days") else ""
+            print(f"Portfolio Velocity: {vel_s}{h_s}")
     else:
         avg_k = stats['total_kelly'] / max(1, stats['active_count'])
         wins = sum(1 for x in stats["items"] if x["outcome"] == 1.0)
@@ -176,12 +257,14 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
 
 def print_review_table(history, sub_mode):
     """Renders formatted history table with ANSI hyperlinks and sorting."""
+    if sub_mode in ["predicted", "all"]:
+        ensure_predicted_market_metadata(history)
     base_ego = calculate_base_ego(history, verbose=False)
     TABLE_CONFIGS = {
         "predicted": {
-            "headers": ["#", "Question", "Action / Signal", "Held Pos", "Kelly", "Edge", "Side", "Live", "p_norm", "Date", "Src"],
-            "widths": [3, 34, 22, 13, 7, 7, 4, 6, 6, 10, 8],
-            "aligns": ["right", "left", "left", "right", "right", "right", "left", "right", "right", "left", "left"],
+            "headers": ["#", "Question", "Action / Signal", "Held Pos", "Kelly", "Edge", "Vel/d", "Side", "Live", "p_norm", "Date", "Src"],
+            "widths": [3, 34, 22, 13, 7, 7, 8, 4, 6, 6, 10, 6],
+            "aligns": ["right", "left", "left", "right", "right", "right", "right", "left", "right", "right", "left", "left"],
             "q_idx": 1
         },
         "exited": {
@@ -210,6 +293,11 @@ def print_review_table(history, sub_mode):
         }
     }
 
+    ws_b = history.get("wallet_summary", {})
+    live_bankroll = cfg.BANKROLL
+    if isinstance(ws_b, dict) and ws_b.get("bankroll") and float(ws_b.get("bankroll")) > 0:
+        live_bankroll = float(ws_b.get("bankroll"))
+
     rows = []
 
     if sub_mode in ["predicted", "predicted_skipped", "all"]:
@@ -236,8 +324,8 @@ def print_review_table(history, sub_mode):
                         entry_p = float(pred.get("pm", cur_p) or cur_p)
                         live_val = cb * (cur_p / entry_p if entry_p > 0 else 1.0)
                     else:
-                        live_val = k_v * cfg.BANKROLL
-                    held_mtm_k = (live_val / cfg.BANKROLL) if cfg.BANKROLL > 0 else k_v
+                        live_val = k_v * live_bankroll
+                    held_mtm_k = (live_val / live_bankroll) if live_bankroll > 0 else k_v
                 else:
                     live_val = 0.0
                     held_mtm_k = 0.0
@@ -246,8 +334,8 @@ def print_review_table(history, sub_mode):
                 tgt_v = lm["target_win_m"]
                 delta_k = max(0.0, lm["eff_kelly"] - held_mtm_k) if held_mtm_k > 0 else lm["eff_kelly"]
 
-                delta_usd = delta_k * cfg.BANKROLL if cfg.BANKROLL > 0 else 0.0
-                buy_usd = lm["eff_kelly"] * cfg.BANKROLL if cfg.BANKROLL > 0 else 0.0
+                delta_usd = delta_k * live_bankroll if live_bankroll > 0 else 0.0
+                buy_usd = lm["eff_kelly"] * live_bankroll if live_bankroll > 0 else 0.0
 
                 if not is_wallet:
                     regime_str = f"EXEC BUY ${buy_usd:,.0f} ({lm['eff_kelly']*100:.1f}%)" if lm["live_active_edge"] > 0 else "SKIP: EDGE GONE"
@@ -272,6 +360,77 @@ def print_review_table(history, sub_mode):
                 pm_disp = pm_v
                 live_disp = float(cur_pm_v) if cur_pm_v is not None else pm_v
 
+                # Velocity & Horizon resolution
+                end_date_str = pred.get("endDate") or pred.get("end_date")
+                days_until = None
+                seconds_left = None
+                if end_date_str:
+                    try:
+                        res_dt = datetime.fromisoformat(str(end_date_str).replace('Z', '+00:00'))
+                        if res_dt.tzinfo is None:
+                            res_dt = res_dt.replace(tzinfo=timezone.utc)
+                        seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
+                        days_until = max(0.05, seconds_left / 86400.0) if seconds_left > 0 else 0.05
+                    except Exception:
+                        pass
+
+                active_edge = float(pred.get("edge", lm["live_active_edge"]) or lm["live_active_edge"])
+                price_ref = lm["win_prob_m"] if lm["win_prob_m"] > 0 else (cur_p if cur_p > 0 else 0.5)
+                if days_until is not None and days_until > 0 and price_ref > 0:
+                    daily_edge = active_edge / days_until
+                    daily_roi = (active_edge / price_ref) / days_until
+                    ann_edge = daily_edge * 365.0 * 100.0
+                    _, apy_val = calculate_annualized_yield(active_edge, price_ref, days_until)
+                else:
+                    daily_edge = None
+                    daily_roi = None
+                    ann_edge = None
+                    apy_val = pred.get("apy")
+
+                # Format Ends In
+                if seconds_left is not None:
+                    if seconds_left <= 0:
+                        ends_in_disp = "Ended"
+                    elif days_until >= 1.0:
+                        ends_in_disp = f"{days_until:.1f}d"
+                    else:
+                        hrs = max(0.1, seconds_left / 3600.0)
+                        ends_in_disp = f"{hrs:.1f}h"
+                else:
+                    ends_in_disp = "-"
+
+                # Format Daily Edge (Capital Velocity)
+                if daily_edge is not None:
+                    d_pct = daily_edge * 100.0
+                    vel_d_disp = f"{d_pct:+.3f}%/d" if abs(d_pct) < 0.01 else f"{d_pct:+.2f}%/d"
+                else:
+                    vel_d_disp = "-"
+
+                # Format APY
+                if apy_val is not None:
+                    try:
+                        apy_f = float(apy_val)
+                        if -1.0 <= apy_f <= 99.99:
+                            apy_disp = f"{apy_f*100:+.1f}%"
+                        elif ann_edge is not None and abs(ann_edge) < 99999:
+                            apy_disp = f"{ann_edge:+.0f}%a"
+                        else:
+                            apy_disp = ">9999%"
+                    except Exception:
+                        apy_disp = "-"
+                else:
+                    apy_disp = "-"
+
+                # Format Market Velocity (24h Vol / Total Vol)
+                vol_v = float(pred.get("volume") or 0.0)
+                vol24_v = float(pred.get("volume24hr") or 0.0)
+                if vol_v > 0 and vol24_v >= 0:
+                    mkt_vel_v = vol24_v / vol_v
+                    mkt_vel_disp = f"{mkt_vel_v*100:.1f}%"
+                else:
+                    mkt_vel_v = None
+                    mkt_vel_disp = "-"
+
                 rows.append({
                     "Mode": "active",
                     "Source": src_val,
@@ -285,7 +444,15 @@ def print_review_table(history, sub_mode):
                     "HeldVal": live_val,
                     "HeldFrac": held_mtm_k,
                     "Shares": sh,
-                    "Edge": float(pred.get("edge", lm["live_active_edge"]) or lm["live_active_edge"]),
+                    "Edge": active_edge,
+                    "DailyEdge": daily_edge,
+                    "APY": apy_val,
+                    "DaysUntil": days_until,
+                    "MktVel": mkt_vel_v,
+                    "VelDStr": vel_d_disp,
+                    "APYStr": apy_disp,
+                    "EndsInStr": ends_in_disp,
+                    "MktVelStr": mkt_vel_disp,
                     "DistDecel": lm["dist_to_target"],
                     "pu": pu_disp,
                     "p_norm": p_norm_disp,
@@ -418,9 +585,33 @@ def print_review_table(history, sub_mode):
 
     sort_by = "date"
     if sub_mode in ["predicted", "exited", "resolved", "all"]:
-        print(f"\nSort '{sub_mode}' by: [1] Date (default)  [2] Kelly  [3] Edge  [4] Exit Proximity")
-        sort_choice = input("> ").strip()
-        sort_by = {"2": "kelly", "3": "edge", "4": "exit_prox"}.get(sort_choice, "date")
+        if sub_mode == "predicted":
+            print(f"\nSort '{sub_mode}' by: [1] Date (default)  [2] Kelly  [3] Edge  [4] Exit Proximity  [5] Velocity (Edge/d)")
+        elif sub_mode == "all":
+            print(f"\nSort '{sub_mode}' by: [1] Date (default)  [2] Kelly  [3] Edge  [4] Exit Proximity  [5] Velocity")
+        else:
+            print(f"\nSort '{sub_mode}' by: [1] Date (default)  [2] Kelly  [3] Edge  [4] Exit Proximity")
+
+        sort_choice = input("> ").strip().lower()
+        sort_map = {
+            "1": "date",
+            "date": "date",
+            "2": "kelly",
+            "kelly": "kelly",
+            "k": "kelly",
+            "3": "edge",
+            "edge": "edge",
+            "e": "edge",
+            "4": "exit_prox",
+            "exit": "exit_prox",
+            "prox": "exit_prox",
+            "5": "velocity",
+            "vel": "velocity",
+            "velocity": "velocity",
+            "v": "velocity",
+            "daily": "velocity",
+        }
+        sort_by = sort_map.get(sort_choice, "date")
 
     if sort_by == "date":
         rows.sort(key=lambda x: x.get("Date", "") if x.get("Date", "") != "unknown" else "", reverse=True)
@@ -430,6 +621,8 @@ def print_review_table(history, sub_mode):
         rows.sort(key=lambda x: (0 if x.get("Edge") is None else 1, x.get("Edge") or 0.0), reverse=True)
     elif sort_by == "exit_prox":
         rows.sort(key=lambda x: (1 if x.get("DistDecel") is None else 0, x.get("DistDecel") if x.get("DistDecel") is not None else float("inf")))
+    elif sort_by == "velocity":
+        rows.sort(key=lambda x: (0 if x.get("DailyEdge") is None else 1, x.get("DailyEdge") or 0.0), reverse=True)
 
     config = TABLE_CONFIGS.get(sub_mode, TABLE_CONFIGS["all"])
     headers = config["headers"]
@@ -486,7 +679,8 @@ def print_review_table(history, sub_mode):
             held_v = r.get("HeldVal", 0.0)
             held_f = r.get("HeldFrac", 0.0)
             held_str = f"${held_v:,.0f} ({held_f*100:.1f}%)" if held_v > 0 else "-"
-            vals = [row_num, r["Question"], regime_val, held_str, kelly_str, edge_str, side_str, live_str, p_norm_str, r["Date"], src_str]
+            vel_d_str = r.get("VelDStr", "-")
+            vals = [row_num, r["Question"], regime_val, held_str, kelly_str, edge_str, vel_d_str, side_str, live_str, p_norm_str, r["Date"], src_str]
         elif sub_mode == "exited":
             vals = [row_num, r["Question"], pnl_str, kelly_str, edge_str, side_str, pm_str, live_str, pu_str, p_norm_str, r["Date"], src_str]
         elif sub_mode == "resolved":

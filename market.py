@@ -267,6 +267,26 @@ def resolve_position_market_metadata(pos, event_cache=None):
     return m, market_id, question, slug, end_date
 
 
+def get_event_sub_markets(m):
+    """Returns list of sibling sub-markets for the parent event of market m."""
+    sub_markets = m.get("event_markets")
+    if sub_markets and len(sub_markets) > 1:
+        return sub_markets
+
+    slug = m.get("parent_slug") or m.get("slug")
+    if slug and slug != "unknown":
+        try:
+            ev_list = api.get(f"{cfg.GAMMA_API}/events?slug={slug}", timeout=5).json()
+            if isinstance(ev_list, list) and ev_list:
+                ev_markets = ev_list[0].get("markets", [])
+                if ev_markets:
+                    m["event_markets"] = ev_markets
+                    return ev_markets
+        except Exception:
+            pass
+    return sub_markets or [m]
+
+
 def determine_redeemable_outcome(pos, m=None):
     """Returns 1.0 if the held position won, 0.0 if it lost, 0.5 if split."""
     try:
@@ -423,13 +443,15 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                             print(f"[+] Category Matched: '{full_name}'")
                             seen_categories.add(full_name)
 
+                raw_markets = event.get('markets', [])
                 valid_markets = []
-                for m in event.get('markets', []):
+                for m in raw_markets:
                     m_id = m.get('id')
                     if m_id in seen_market_ids:
                         continue
                     m['parent_slug'] = event.get('slug', 'unknown')
                     m['parent_name'] = event.get('title', 'unknown')
+                    m['event_markets'] = raw_markets
                     
                     is_valid, reason = validate_market(m, history, mode, exclude_mode)
                     if is_valid: 
@@ -454,11 +476,13 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     
                 for event in events:
                     if not isinstance(event, dict): continue
-                    for m in event.get('markets', []):
+                    raw_markets = event.get('markets', [])
+                    for m in raw_markets:
                         if target_market_id and str(m.get('id')) != str(target_market_id):
                             continue
                         m['parent_slug'] = event.get('slug', 'unknown')
                         m['parent_name'] = event.get('title', 'unknown')
+                        m['event_markets'] = raw_markets
                         is_valid, reason = validate_market(m, history, mode, exclude_mode)
                         if is_valid: yield m
                         else: print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")
