@@ -239,11 +239,16 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
     print(f"--- PORTFOLIO & PREDICTION STATS [{status_lbl.upper()}] ---")
     print(f"Predictions      : {stats['total_count']} {status_lbl}{sized_note} ({stats['local_count']} LOCAL, {stats['wallet_count']} WALLET)")
     print(f"Effective N      : {stats['effective_n']:.2f} / {n_denom} equal-sized bets ({bal_pct:.1f}% size-balanced)")
+    active_pid = history.get("profile_id") or get_active_profile()
+    is_wallet = bool(active_pid and active_pid.startswith("0x"))
     w_sum = history.get("wallet_summary")
-    w_addr = history.get("wallet_address") or cfg.POLYGON_WALLET
-    if isinstance(w_sum, dict) and "cash" in w_sum and "portfolio" in w_sum:
+    if is_wallet:
+        w_addr = history.get("wallet_address") or active_pid
         w_label = ansi_link(f"https://polymarket.com/profile/{w_addr}", "Wallet Bankroll") if w_addr else "Wallet Bankroll"
-        print(f"{w_label}  : ${stats['bankroll']:,.2f} (Cash: ${w_sum['cash']:,.2f} | Open Positions: ${w_sum['portfolio']:,.2f})")
+        if isinstance(w_sum, dict) and "cash" in w_sum and "portfolio" in w_sum:
+            print(f"{w_label}  : ${stats['bankroll']:,.2f} (Cash: ${w_sum['cash']:,.2f} | Open Positions: ${w_sum['portfolio']:,.2f})")
+    else:
+        print(f"Paper Bankroll   : ${stats['bankroll']:,.2f} (Sandbox Capital)")
 
     if sub_mode == "predicted":
         print(f"Model Exposure   : ${stats['total_eff_alloc']:,.2f} / ${stats['bankroll']:,.2f} ({stats['total_eff_kelly']*100:.1f}% Eff-Kelly)")
@@ -253,9 +258,9 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
             print(f"Portfolio Velocity: {vel_s}{h_s}")
     else:
         avg_k = stats['total_kelly'] / max(1, stats['active_count'])
-        wins = sum(1 for x in stats["items"] if x["outcome"] == 1.0)
-        losses = sum(1 for x in stats["items"] if x["outcome"] == 0.0)
-        wl_str = f" | Record: {wins}W - {losses}L" if sub_mode == "resolved" else ""
+        wins = sum(1 for x in stats["items"] if x["outcome"] == 1.0 or (x.get("pnl") is not None and float(x.get("pnl") or 0.0) > 0.0001))
+        losses = sum(1 for x in stats["items"] if x["outcome"] == 0.0 or (x.get("pnl") is not None and float(x.get("pnl") or 0.0) < -0.0001))
+        wl_str = f" | Record: {wins}W - {losses}L" if sub_mode in ("resolved", "exited", "all") else ""
         print(f"Realized PnL     : ${stats['total_pnl']:+,.2f}{wl_str} | Avg Sizing: {avg_k*100:.2f}% Kelly")
 
     print(f"Expected Win Rate: {stats['exp_win_bal']*100:.2f}% Balanced (User: {stats['exp_win_u']*100:.2f}% | Market: {stats['exp_win_m']*100:.2f}%)")
@@ -435,6 +440,29 @@ def print_review_table(history, sub_mode):
 
                 src_val = _format_source_tag(pred, alias_tag)
 
+                out_val = exit_disp
+                ego_w_mode = getattr(cfg, "EGO_WEIGHTING", "capital")
+                if ego_w_mode == "equal":
+                    w = 1.0
+                elif ego_w_mode == "kelly":
+                    w = k_v if k_v > 1e-9 else (max(0.01, float(pred.get("cost_basis", 0.0) or 0.0) / live_bankroll) if live_bankroll > 0 else 0.01)
+                else:
+                    cb = float(pred.get("cost_basis", 0.0) or 0.0)
+                    tot_s = float(pred.get("total_size", 0.0) or 0.0)
+                    avg_p = float(pred.get("avg_price", 0.0) or 0.0)
+                    pnl = float(pred.get("realized_pnl", 0.0) or 0.0)
+                    act_dlrs = cb if cb > 0 else (tot_s * avg_p if tot_s > 0 else abs(pnl))
+                    w = max(0.005, min(1.0, act_dlrs / live_bankroll))
+
+                is_uncal = (pred.get("pu") is None or abs(float(pred.get("pu")) - pm_v) < 1e-6)
+                if is_uncal and float(pred.get("realized_pnl", 0.0) or 0.0) < 0:
+                    bs_u = (pm_v - out_val) ** 2
+                    bs_m = 0.0
+                else:
+                    bs_u = (pu_disp - out_val) ** 2
+                    bs_m = (pm_disp - out_val) ** 2
+                ego_drag = w * (bs_u - bs_m)
+
                 rows.append({
                     "Mode": "exited",
                     "Source": src_val,
@@ -454,7 +482,8 @@ def print_review_table(history, sub_mode):
                     "Target": lm["target_win_m"],
                     "PnL": float(pred.get("realized_pnl", 0.0) or 0.0),
                     "Regime": "EXITED (Await Res)",
-                    "Outcome": ""
+                    "Outcome": "",
+                    "EgoDrag": ego_drag
                 })
 
     # 3. Skipped Rows
@@ -486,6 +515,24 @@ def print_review_table(history, sub_mode):
                 else:
                     pu_disp, p_norm_disp, pm_disp = pu_v, lm["pu_norm"], pm_v
 
+                out_val = float(res.get("outcome", 0.5) or 0.5)
+                ego_w_mode = getattr(cfg, "EGO_WEIGHTING", "capital")
+                if ego_w_mode == "equal":
+                    w = 1.0
+                elif ego_w_mode == "kelly":
+                    w = k_v if k_v > 1e-9 else (max(0.01, float(res.get("cost_basis", 0.0) or 0.0) / live_bankroll) if live_bankroll > 0 else 0.01)
+                else:
+                    cb = float(res.get("cost_basis", 0.0) or 0.0)
+                    tot_s = float(res.get("total_size", 0.0) or 0.0)
+                    avg_p = float(res.get("avg_price", 0.0) or 0.0)
+                    pnl = float(res.get("realized_pnl", 0.0) or 0.0)
+                    act_dlrs = cb if cb > 0 else (tot_s * avg_p if tot_s > 0 else abs(pnl))
+                    w = max(0.005, min(1.0, act_dlrs / live_bankroll))
+
+                bs_u = (pu_disp - out_val) ** 2
+                bs_m = (pm_disp - out_val) ** 2
+                ego_drag = w * (bs_u - bs_m)
+
                 src_val = _format_source_tag(res, alias_tag)
 
                 rows.append({
@@ -507,7 +554,8 @@ def print_review_table(history, sub_mode):
                     "Target": lm["target_win_m"],
                     "PnL": res.get("realized_pnl"),
                     "Regime": lm["regime"],
-                    "Outcome": str(res.get("outcome", 0.5))
+                    "Outcome": str(res.get("outcome", 0.5)),
+                    "EgoDrag": ego_drag
                 })
 
     if not rows:
@@ -518,7 +566,8 @@ def print_review_table(history, sub_mode):
     sort_by = "date"
     if sub_mode in ["predicted", "exited", "resolved", "all"]:
         vel_hint = "  [5] Velocity (Edge/d)" if sub_mode in ("predicted", "all") else ""
-        print(f"\nSort '{sub_mode}' by: [1] Date (default)  [2] Kelly  [3] Edge  [4] Exit Proximity{vel_hint}")
+        ego_hint = "  [6] Ego Impact (Brier)" if sub_mode in ("resolved", "exited", "all") else ""
+        print(f"\nSort '{sub_mode}' by: [1] Date (default)  [2] Kelly  [3] Edge  [4] Exit Proximity{vel_hint}{ego_hint}")
         sort_choice = input("> ").strip().lower()
         sort_map = {
             "1": "date", "date": "date",
@@ -526,6 +575,7 @@ def print_review_table(history, sub_mode):
             "3": "edge", "edge": "edge", "e": "edge",
             "4": "exit_prox", "exit": "exit_prox", "prox": "exit_prox",
             "5": "velocity", "vel": "velocity", "velocity": "velocity", "v": "velocity", "daily": "velocity",
+            "6": "ego_impact", "ego": "ego_impact", "brier": "ego_impact", "b": "ego_impact",
         }
         sort_by = sort_map.get(sort_choice, "date")
 
@@ -539,6 +589,8 @@ def print_review_table(history, sub_mode):
         rows.sort(key=lambda x: (1 if x.get("DistDecel") is None else 0, x.get("DistDecel") if x.get("DistDecel") is not None else float("inf")))
     elif sort_by == "velocity":
         rows.sort(key=lambda x: (0 if x.get("DailyEdge") is None else 1, x.get("DailyEdge") or 0.0), reverse=True)
+    elif sort_by == "ego_impact":
+        rows.sort(key=lambda x: (0 if x.get("EgoDrag") is None else 1, x.get("EgoDrag") or 0.0), reverse=True)
 
     config = TABLE_CONFIGS.get(sub_mode, TABLE_CONFIGS["all"])
     headers = config["headers"]
@@ -670,7 +722,7 @@ def print_main_menu_dashboard(history):
     n_res = counts["resolved"]
     n_skip = counts["skipped"]
 
-    active_pid = get_active_profile()
+    active_pid = history.get("profile_id") or get_active_profile()
     is_wallet = active_pid.startswith("0x")
     ws = history.get("wallet_summary", {})
     cash_val = float(ws.get("cash", 0.0) or 0.0)
@@ -687,7 +739,9 @@ def print_main_menu_dashboard(history):
         short_addr = f"{active_pid[:6]}...{active_pid[-4:]}"
         prof_link = ansi_link(f"https://polymarket.com/profile/{active_pid}", short_addr)
         alias_str = f"{alias} [{prof_link}]" if alias else prof_link
-        cap_line = f"  Capital State  : ${cfg.BANKROLL:,.2f} Total (Cash ${cash_val:,.2f} | Open Positions ${pos_val:,.2f})"
+        bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
+        add_str = f" | Off-Platform +${bankroll_add:,.2f}" if bankroll_add > 0 else ""
+        cap_line = f"  Capital State  : ${cfg.BANKROLL:,.2f} Total (Cash ${cash_val:,.2f} | Open Positions ${pos_val:,.2f}{add_str})"
         hdr_tag = f"PROFILE: {alias_str} | Polymarket Live Portfolio"
     else:
         alias_str = f"{alias} ({active_pid})" if alias else active_pid
@@ -753,12 +807,16 @@ def print_main_menu_dashboard(history):
             pnl_total += float(p.get("realized_pnl", 0.0) or 0.0)
     for preds in history.get("exited", {}).values():
         for p in ensure_list(preds):
-            pnl_total += float(p.get("realized_pnl", 0.0) or 0.0)
+            pnl = float(p.get("realized_pnl", 0.0) or 0.0)
+            if pnl > 0.0001:
+                wins += 1
+            elif pnl < -0.0001:
+                losses += 1
+            pnl_total += pnl
 
     total_games = wins + losses
     win_pct_str = f" ({wins/total_games*100:.1f}%)" if total_games > 0 else ""
     pnl_str = f"+${pnl_total:,.2f}" if pnl_total >= 0 else f"-${abs(pnl_total):,.2f}"
-    skip_str = f" | {n_skip} skipped" if n_skip > 0 else ""
 
     box_w = 96
     hdr_visible_len = len(strip_ansi(hdr_tag))
@@ -769,6 +827,6 @@ def print_main_menu_dashboard(history):
     print(hdr_line)
     print("-" * box_w)
     print(cap_line)
-    print(f"  Live Exposure  : {active_eff_kelly*100:.1f}% Eff-Kelly (${active_eff_kelly*cfg.BANKROLL:,.2f} across {n_pred} active) | Avg Edge: {avg_edge*100:+.2f}% | Signals: {sig_summary}")
-    print(f"  Track Record   : {wins}W - {losses}L{win_pct_str} | Realized PnL: {pnl_str} across {n_res} resolved + {n_exit} exited | Base Ego: {base_ego:.3f}{skip_str}")
+    print(f"  Live Exposure  : {active_eff_kelly*100:.1f}% Eff-Kelly (${active_eff_kelly*cfg.BANKROLL:,.2f}) | Avg Edge: {avg_edge*100:+.2f}% | Signals: {sig_summary}")
+    print(f"  Track Record   : {wins}W - {losses}L{win_pct_str} | Realized PnL: {pnl_str} | Base Ego: {base_ego:.3f}")
     print("=" * box_w)

@@ -159,14 +159,19 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         cash_balance = history.get("wallet_summary", {}).get("cash", 0.0)
     portfolio_value = get_wallet_portfolio_value(wallet_address, open_positions)
 
-    cfg.BANKROLL = round(cash_balance + portfolio_value, 4)
+    bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
+    total_bankroll = round(cash_balance + portfolio_value + bankroll_add, 4)
+    cfg.BANKROLL = total_bankroll
+    history["bankroll_add"] = bankroll_add
     history["wallet_summary"] = {
         "cash": round(cash_balance, 4),
         "portfolio": round(portfolio_value, 4),
-        "bankroll": cfg.BANKROLL,
+        "bankroll_add": bankroll_add,
+        "bankroll": total_bankroll,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     }
-    print(f"[*] Wallet Profile Updated: ${cfg.BANKROLL:,.2f} (Cash: ${cash_balance:,.2f} | Positions: ${portfolio_value:,.2f})")
+    add_tag = f" + ${bankroll_add:,.2f} off-platform" if bankroll_add > 0 else ""
+    print(f"[*] Wallet Profile Updated: ${cfg.BANKROLL:,.2f} (Cash: ${cash_balance:,.2f} | Positions: ${portfolio_value:,.2f}{add_tag})")
 
     if not positions:
         print("[*] No positions returned from Polymarket endpoints.")
@@ -838,6 +843,20 @@ def update_resolutions(history):
                             else: outcome = 0.5
                         resolved_entry = dict(pred_data)
                         resolved_entry["outcome"] = outcome
+                        if resolved_entry.get("realized_pnl") is None or float(resolved_entry.get("realized_pnl", 0.0) or 0.0) == 0.0:
+                            cb = float(resolved_entry.get("cost_basis", 0.0) or 0.0)
+                            sh = float(resolved_entry.get("shares", 0.0) or 0.0)
+                            if cb == 0.0 and resolved_entry.get("kelly"):
+                                cb = float(resolved_entry.get("kelly", 0.0)) * cfg.BANKROLL
+                                if sh == 0.0 and resolved_entry.get("pm", 0.0):
+                                    sh = cb / float(resolved_entry["pm"])
+                            if sh > 0 or cb > 0:
+                                if outcome == 1.0:
+                                    resolved_entry["realized_pnl"] = round(sh * 1.0 - cb, 2)
+                                elif outcome == 0.0:
+                                    resolved_entry["realized_pnl"] = round(-cb, 2)
+                                elif outcome == 0.5:
+                                    resolved_entry["realized_pnl"] = round(sh * 0.5 - cb, 2)
                         history["resolved"][market_id].append(resolved_entry)
 
                     del history[bucket_name][market_id]

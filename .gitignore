@@ -18,8 +18,11 @@ __pycache__/
 # Ignore logs
 logs/
 
-# Ignore data files
+# Ignore data files & active profile state
 data/
+active_profile.txt
+prediction_history.json
+scratch/
 
 # Ignore model files
 models/
@@ -30,4 +33,3 @@ Thumbs.db
 
 # Ignore any other files you don't want to track
 temp/
-prediction_history.json

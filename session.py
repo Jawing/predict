@@ -8,7 +8,7 @@ import math
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
-from config import BANKROLL, MIN_EDGE, api
+from config import api
 import config as cfg
 from utils import (
     ensure_list,
@@ -460,7 +460,7 @@ def run_prediction_session(
                         win_prob = true_price + edge
                         adjusted_edge = win_prob - vwap_true
                         _, adjusted_apy = calculate_annualized_yield(adjusted_edge, vwap_true, days_until)
-                        if adjusted_edge < MIN_EDGE:
+                        if adjusted_edge < cfg.MIN_EDGE:
                             action = "THIN_EDGE"
 
             pu_mid_val = (lower + upper) / 2.0
@@ -525,6 +525,8 @@ def run_prediction_session(
                     "conditionId": m.get("conditionId"),
                     "position": pos_side,
                     "source": "local",
+                    "cost_basis": round(final_alloc, 4),
+                    "shares": round(final_alloc / true_price, 4) if true_price > 0 else 0.0,
                     "endDate": m.get("endDate"),
                     "volume": float(m.get("volume") or 0.0),
                     "volume24hr": float(m.get("volume24hr") or 0.0),
@@ -591,10 +593,10 @@ def run_prediction_session(
                 elif action == "THIN_EDGE":
                     if edge > 0 and adjusted_edge <= 0:
                         reason = f"Orderbook slippage on ${final_alloc:,.2f} order (Ask {true_price*100:.1f}% -> VWAP {vwap_true*100:.1f}%) wiped raw edge"
-                    elif edge > 0 and adjusted_edge < MIN_EDGE:
-                        reason = f"Net edge {adjusted_edge*100:.2f}% below {MIN_EDGE*100:.1f}% threshold after slippage"
+                    elif edge > 0 and adjusted_edge < cfg.MIN_EDGE:
+                        reason = f"Net edge {adjusted_edge*100:.2f}% below {cfg.MIN_EDGE*100:.1f}% threshold after slippage"
                     else:
-                        reason = f"Edge below {MIN_EDGE*100:.1f}% threshold"
+                        reason = f"Edge below {cfg.MIN_EDGE*100:.1f}% threshold"
                 elif action == "NONE":
                     reason = "Trapped inside bid-ask spread"
                 else:
@@ -785,8 +787,8 @@ def custom_calculator():
         fee_rate = float(fee_input) / 100.0 if fee_input else 0.0
         days_input = input("Days until resolution [Enter for 0]: ").strip()
         days_until = float(days_input) if days_input else 0.0
-        bankroll_input = input(f"Bankroll [Enter for ${BANKROLL:,.2f}]: ").strip()
-        calc_bankroll = float(bankroll_input) if bankroll_input else BANKROLL
+        bankroll_input = input(f"Bankroll [Enter for ${cfg.BANKROLL:,.2f}]: ").strip()
+        calc_bankroll = float(bankroll_input) if bankroll_input else cfg.BANKROLL
 
         action, true_price, raw_kelly, eff_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
             lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego
@@ -828,6 +830,8 @@ def custom_calculator():
                 "conditionId": "custom",
                 "position": pos_side_c,
                 "source": "local",
+                "cost_basis": round(final_alloc, 4),
+                "shares": round(final_alloc / true_price, 4) if true_price > 0 else 0.0,
                 "endDate": (datetime.now(timezone.utc) + timedelta(days=days_until)).strftime("%Y-%m-%dT%H:%M:%SZ") if days_until > 0 else None,
                 "volume": 0.0,
                 "volume24hr": 0.0,

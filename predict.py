@@ -27,6 +27,18 @@ from manage import handle_delete_data, manual_resolve, settings_menu
 
 
 def main():
+    # Startup auto-sync if on an active online wallet profile
+    active_pid = get_active_profile()
+    if active_pid.startswith("0x"):
+        try:
+            print(f"[*] Auto-syncing live wallet '{get_profile_display_name(active_pid)}'...")
+            history = load_history(active_pid)
+            history = import_polymarket_positions(active_pid, history, auto_sync=True)
+            history = update_resolutions(history)
+            save_history(history, profile_id=active_pid)
+        except Exception as e:
+            print(f"[!] Startup auto-sync warning: {e}")
+
     while True:
         history = load_history()
         print_main_menu_dashboard(history)
@@ -40,8 +52,8 @@ def main():
         print(" 1: Discover Markets (Scan & Predict)")
         print(" 2: Review Portfolio & History (Active, Exited, Resolved, Skipped)")
         print(" 3: Target Specific URLs or Slugs")
-        print(" 4: Wallet Profiles & Resolutions (Sync, Switch, Multi-Wallet)")
-        print(" 5: Tools & Settings (Custom Calculator, Data Management, Thresholds & Gamma)")
+        print(" 4: Wallet Profiles & Sync (Switch, Add, Sync)")
+        print(" 5: Tools & Settings (Calculators, Data Management, Parameters)")
         print(" 0: Exit")
 
         choice = input("> ").strip()
@@ -158,7 +170,7 @@ def main():
             prof_type = "Polymarket Wallet" if is_wallet else "Paper Trading"
             active_disp = get_profile_display_name(active_pid)
 
-            print(f"\n--- WALLET PROFILES & RESOLUTIONS ---")
+            print(f"\n--- WALLET & PROFILES ---")
             print(f"Active Profile : {active_disp} ({prof_type})")
             print(f"Address / ID   : {active_pid}")
             print(f"Bankroll       : ${config.BANKROLL:,.2f}")
@@ -170,11 +182,9 @@ def main():
             print("\nActions:")
             print(" 1: Sync Active Wallet (Positions, Cash, Bankroll & Resolutions) [Enter]")
             print(" 2: Switch Active Profile")
-            print(" 3: Add & Switch to New Wallet Profile (0x...)")
-            print(" 4: Create Local Paper Trading Profile")
-            print(" 5: Set / Rename Profile Alias")
-            print(" 6: Manually Resolve a Specific Market")
-            print(" 7: Delete a Profile")
+            print(" 3: Add New Profile (Wallet 0x... or Paper Sandbox)")
+            print(" 4: Rename Profile Alias")
+            print(" 5: Delete a Profile")
             print(" 0: Back to Main Menu")
 
             s_choice = input("> ").strip()
@@ -197,32 +207,38 @@ def main():
                 except ValueError:
                     print("[!] Cancelled.")
             elif s_choice == "3":
-                new_w = input("Enter Polymarket wallet address (0x...): ").strip()
-                if new_w.startswith("0x") and len(new_w) >= 10:
-                    new_alias = input("Enter friendly alias for this wallet (e.g. 'Fund B', 'Alpha') [Enter to skip]: ").strip()
-                    set_active_profile(new_w)
-                    history = load_history(new_w)
+                p_in = input("Enter Polymarket wallet (0x...) or Paper Profile ID [default: 'sandbox']: ").strip()
+                if not p_in:
+                    p_in = "sandbox"
+                is_w = p_in.startswith("0x") and len(p_in) >= 10
+                if is_w:
+                    new_alias = input("Enter friendly alias (e.g. 'Main', 'Fund B') [Enter to skip]: ").strip()
+                    set_active_profile(p_in)
+                    history = load_history(p_in)
                     if new_alias:
                         history["alias"] = new_alias
-                    history = import_polymarket_positions(new_w, history, auto_sync=True)
+                    history = import_polymarket_positions(p_in, history, auto_sync=True)
                     history = update_resolutions(history)
                     save_history(history)
-                    print(f"[+] Created and activated wallet profile: {get_profile_display_name(new_w)}")
+                    print(f"[+] Created and activated wallet profile: {get_profile_display_name(p_in)}")
                 else:
-                    print("[!] Invalid Ethereum/Polygon address format.")
+                    new_alias = input(f"Enter friendly alias [default: '{p_in.capitalize()}']: ").strip()
+                    if not new_alias:
+                        new_alias = p_in.capitalize()
+                    br_in = input("Enter paper sandbox bankroll ($) [default: $100.00]: ").strip()
+                    try:
+                        paper_br = max(1.0, float(br_in)) if br_in else 100.00
+                    except ValueError:
+                        paper_br = 100.00
+                    set_active_profile(p_in)
+                    history = load_history(p_in)
+                    history["alias"] = new_alias
+                    history.setdefault("wallet_summary", {})["bankroll"] = paper_br
+                    history["wallet_summary"]["cash"] = paper_br
+                    config.BANKROLL = paper_br
+                    save_history(history, profile_id=p_in)
+                    print(f"[+] Switched to paper trading profile: {new_alias} ({p_in}) with ${paper_br:,.2f} bankroll.")
             elif s_choice == "4":
-                p_name = input("Enter Paper Profile ID [default: 'sandbox']: ").strip()
-                if not p_name:
-                    p_name = "sandbox"
-                p_alias = input(f"Enter friendly alias [default: '{p_name.capitalize()}']: ").strip()
-                if not p_alias:
-                    p_alias = p_name.capitalize()
-                set_active_profile(p_name)
-                history = load_history(p_name)
-                history["alias"] = p_alias
-                save_history(history, profile_id=p_name)
-                print(f"[+] Switched to paper trading profile: {p_alias} ({p_name})")
-            elif s_choice == "5":
                 rn = input("Select Profile Number to Rename: ").strip()
                 try:
                     rn_idx = int(rn) - 1
@@ -241,9 +257,7 @@ def main():
                         print("[!] Invalid profile number.")
                 except ValueError:
                     print("[!] Cancelled.")
-            elif s_choice == "6":
-                manual_resolve(history)
-            elif s_choice == "7":
+            elif s_choice == "5":
                 if len(profiles) <= 1:
                     print("[!] Cannot delete the only remaining profile.")
                 else:
@@ -255,6 +269,7 @@ def main():
                             conf = input(f"WARNING: Type 'CONFIRM' to delete profile '{target_p}': ").strip()
                             if conf == "CONFIRM":
                                 delete_profile(target_p)
+                                history = load_history()
                                 print(f"[+] Deleted profile '{target_p}'.")
                             else:
                                 print("[!] Deletion cancelled.")
@@ -268,7 +283,7 @@ def main():
             print("\n--- TOOLS & SETTINGS ---")
             print(" 1: Custom Market Calculator (Hypothetical Odds & Kelly)")
             print(" 2: Asset vs. Binary Leverage & Efficiency Calculator")
-            print(" 3: Data Management (Delete Specific Markets / Reset History)")
+            print(" 3: Data Management (Delete Data, Reset, Manual Resolve)")
             print(" 4: Settings & Threshold Filters (Min Edge, Gamma, Bankroll)")
             print(" 0: Back to Main Menu")
             t_choice = input("> ").strip()

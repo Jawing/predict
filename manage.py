@@ -162,16 +162,18 @@ def clear_specific_category(history):
 
 
 def handle_delete_data():
-    """Menu interface for full reset, selective deletion, or clearing a category."""
+    """Menu interface for full reset, selective deletion, clearing category, or manual resolution."""
     history = load_history()
     counts = get_history_counts(history)
     total_markets = counts["total_markets"]
 
-    print("\n--- DELETE DATA ---")
-    print(" 1: Delete all data (Full reset)")
+    print("\n--- DATA MANAGEMENT ---")
+    print(" 1: Delete all data (Full profile reset)")
     print(f" 2: Selectively delete specific markets ({total_markets} in history)")
     print(" 3: Clear specific category (Active, Exited, Resolved, or Skipped)")
-    print(" 4: Cancel")
+    print(" 4: Manually Resolve / Override a Specific Market")
+    print(" 5: Select / Toggle Markets Included in Ego Calibration")
+    print(" 0: Back to Tools Menu")
 
     sub_choice = input("> ").strip()
 
@@ -201,10 +203,83 @@ def handle_delete_data():
             return
         clear_specific_category(history)
 
-    elif sub_choice in ["4", ""]:
-        print("[!] Deletion cancelled.")
+    elif sub_choice == "4":
+        manual_resolve(history)
+
+    elif sub_choice == "5":
+        toggle_ego_market_inclusion(history)
+
+    elif sub_choice in ["0", ""]:
+        print("[!] Cancelled.")
     else:
         print("[!] Invalid selection.")
+
+
+def toggle_ego_market_inclusion(history):
+    """Allows selecting specific markets to include or exclude from Base Ego Brier score calibration."""
+    all_settled = []
+    for cat in ["resolved", "exited"]:
+        for m_id, preds in history.get(cat, {}).items():
+            for idx, p in enumerate(ensure_list(preds)):
+                q = p.get("question", m_id)
+                side = p.get("position", "-")
+                pnl = float(p.get("realized_pnl", 0.0) or 0.0)
+                is_excl = bool(p.get("exclude_from_ego", False))
+                all_settled.append({
+                    "cat": cat,
+                    "m_id": m_id,
+                    "idx": idx,
+                    "question": q,
+                    "side": side,
+                    "pnl": pnl,
+                    "excluded": is_excl,
+                    "ref": p
+                })
+
+    if not all_settled:
+        print("[!] No resolved or exited markets available to calibrate.")
+        return
+
+    print("\n--- EGO CALIBRATION MARKET SELECTOR ---")
+    print("Toggle markets to INCLUDE/EXCLUDE, or custom-adjust recorded Kelly %.")
+    print(f"{'#':<3} | {'Status':<10} | {'Kelly':<7} | {'Type':<8} | {'Side':<4} | {'PnL':<10} | {'Question'}")
+    print("-" * 90)
+    for i, it in enumerate(all_settled, 1):
+        st = "[EXCLUDED]" if it["excluded"] else "[ACTIVE]"
+        k_val = float(it["ref"].get("kelly", 0.0) or 0.0)
+        print(f"{i:<3} | {st:<10} | {k_val*100:>5.1f}% | {it['cat']:<8} | {it['side']:<4} | ${it['pnl']:>+8.2f} | {it['question'][:40]}")
+
+    sel = input("\nEnter row # to toggle [ACTIVE/EXCLUDED], 'adj <#>' to edit Kelly %, 'reset' all, or Enter to finish: ").strip()
+    if sel.lower() == "reset":
+        for it in all_settled:
+            it["ref"]["exclude_from_ego"] = False
+        save_history(history)
+        print("[+] All markets restored to Active in Base Ego.")
+    elif sel.lower().startswith("adj "):
+        adj_num = sel.split()[1]
+        if adj_num.isdigit():
+            idx = int(adj_num) - 1
+            if 0 <= idx < len(all_settled):
+                target_item = all_settled[idx]
+                curr_k = float(target_item["ref"].get("kelly", 0.0) or 0.0)
+                new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.1f}%, e.g. 1.0 for 1%): ").strip()
+                try:
+                    new_k_val = float(new_k_raw) / 100.0 if float(new_k_raw) > 1.0 else float(new_k_raw)
+                    target_item["ref"]["kelly"] = new_k_val
+                    save_history(history)
+                    print(f"[+] Market #{adj_num} Kelly updated to {new_k_val*100:.2f}%.")
+                except ValueError:
+                    print("[!] Invalid percentage entered.")
+    elif sel.isdigit():
+        idx = int(sel) - 1
+        if 0 <= idx < len(all_settled):
+            curr = all_settled[idx]["ref"].get("exclude_from_ego", False)
+            all_settled[idx]["ref"]["exclude_from_ego"] = not curr
+            save_history(history)
+            new_st = "EXCLUDED from" if not curr else "INCLUDED in"
+            print(f"[+] Market #{sel} is now {new_st} Base Ego calculation.")
+        else:
+            print("[!] Invalid row number.")
 
 
 def manual_resolve(history):
@@ -251,6 +326,20 @@ def manual_resolve(history):
     history.setdefault("resolved", {}).setdefault(sel, [])
     for p in ensure_list(preds):
         p["outcome"] = outcome
+        if p.get("realized_pnl") is None or float(p.get("realized_pnl", 0.0) or 0.0) == 0.0:
+            cb = float(p.get("cost_basis", 0.0) or 0.0)
+            sh = float(p.get("shares", 0.0) or 0.0)
+            if cb == 0.0 and p.get("kelly"):
+                cb = float(p.get("kelly", 0.0)) * cfg.BANKROLL
+                if sh == 0.0 and p.get("pm", 0.0):
+                    sh = cb / float(p["pm"])
+            if sh > 0 or cb > 0:
+                if outcome == 1.0:
+                    p["realized_pnl"] = round(sh * 1.0 - cb, 2)
+                elif outcome == 0.0:
+                    p["realized_pnl"] = round(-cb, 2)
+                elif outcome == 0.5:
+                    p["realized_pnl"] = round(sh * 0.5 - cb, 2)
         history["resolved"][sel].append(p)
 
     history[bucket_name].pop(sel, None)
@@ -261,35 +350,27 @@ def manual_resolve(history):
 
 def settings_menu():
     """Interactive settings and thresholds configurator."""
+    active_pid = get_active_profile()
+    is_wallet = active_pid.startswith("0x")
+    history = load_history(active_pid)
+
     print("\n--- SETTINGS / FILTERS ---")
     print(f" 1: Min Edge       = {config.MIN_EDGE*100:.2f}%  (skip bets below this edge)")
     print(f" 2: Max Days       = {config.MAX_DAYS}  (ignore markets beyond this horizon)")
     print(f" 3: Min Days       = {config.MIN_DAYS}  (ignore markets resolving sooner than this)")
     print(f" 4: Extreme Odds   = {config.EXTREME_ODDS*100:.2f}%  (tail-risk filter - skip near 0% or 100%)")
-    print(f" 5: Bankroll       = ${config.BANKROLL:,.2f}  (manual override; overwritten by wallet sync)")
 
-    gamma_val = getattr(config, "KELLY_GAMMA", 0.5)
-    mode_label = "Balanced (sqrt, gamma=0.5)" if gamma_val == 0.5 else ("Full Eff (gamma=1.0)" if gamma_val == 1.0 else ("Normal (gamma=0.0)" if gamma_val == 0.0 else f"Custom ({gamma_val})"))
-    print(f" 6: Kelly Mode     = {mode_label}")
+    if is_wallet:
+        bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
+        print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}  (off-platform funds added to live wallet total, default $0)")
+    else:
+        print(f" 5: Paper Bankroll = ${config.BANKROLL:,.2f}  (sandbox capital)")
 
     print("\nEnter setting number to edit [Enter to cancel]:")
     s_choice = input("> ").strip()
-    setting_map = {"1": "MIN_EDGE", "2": "MAX_DAYS", "3": "MIN_DAYS", "4": "EXTREME_ODDS", "5": "BANKROLL", "6": "KELLY_GAMMA"}
-    if s_choice == "6":
-        print("Select Mode: [1] Balanced (sqrt, gamma=0.5, default)  [2] Full Eff (gamma=1.0)  [3] Normal Kelly (gamma=0.0)  [4] Custom")
-        k_sel = input("> ").strip()
-        k_map = {"1": 0.5, "2": 1.0, "3": 0.0}
-        if k_sel in k_map:
-            setattr(config, "KELLY_GAMMA", k_map[k_sel])
-            print(f"[+] KELLY_GAMMA updated to {k_map[k_sel]}.")
-        elif k_sel == "4":
-            c_val = input("Enter custom gamma (0.0 to 1.0): ").strip()
-            try:
-                setattr(config, "KELLY_GAMMA", float(c_val))
-                print(f"[+] KELLY_GAMMA updated to {float(c_val)}.")
-            except ValueError:
-                print("[!] Invalid input.")
-    elif s_choice in setting_map:
+    setting_map = {"1": "MIN_EDGE", "2": "MAX_DAYS", "3": "MIN_DAYS", "4": "EXTREME_ODDS"}
+
+    if s_choice in setting_map:
         param = setting_map[s_choice]
         current_val = getattr(config, param)
         new_raw = input(f"New value for {param} (currently {current_val}): ").strip()
@@ -297,10 +378,35 @@ def settings_menu():
             try:
                 new_val = float(new_raw)
                 setattr(config, param, new_val)
-                if param == "BANKROLL":
-                    history = load_history()
-                    history.setdefault("wallet_summary", {})["bankroll"] = new_val
-                    save_history(history)
                 print(f"[+] {param} updated to {new_val}.")
             except ValueError:
                 print("[!] Invalid value - setting unchanged.")
+    elif s_choice == "5":
+        if is_wallet:
+            curr_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
+            new_raw = input(f"Enter additional off-platform bankroll in $ (currently +${curr_add:,.2f}, default 0): ").strip()
+            if new_raw:
+                try:
+                    new_add = max(0.0, float(new_raw))
+                    history["bankroll_add"] = new_add
+                    cash_val = float(history.get("wallet_summary", {}).get("cash", 0.0) or 0.0)
+                    pos_val = float(history.get("wallet_summary", {}).get("portfolio", 0.0) or 0.0)
+                    config.BANKROLL = round(cash_val + pos_val + new_add, 4)
+                    history.setdefault("wallet_summary", {})["bankroll_add"] = new_add
+                    history["wallet_summary"]["bankroll"] = config.BANKROLL
+                    save_history(history, profile_id=active_pid)
+                    print(f"[+] Off-platform bankroll add set to +${new_add:,.2f}. Total Bankroll is now ${config.BANKROLL:,.2f}.")
+                except ValueError:
+                    print("[!] Invalid dollar amount.")
+        else:
+            new_raw = input(f"New paper sandbox bankroll (currently ${config.BANKROLL:,.2f}): ").strip()
+            if new_raw:
+                try:
+                    new_val = max(1.0, float(new_raw))
+                    config.BANKROLL = new_val
+                    history.setdefault("wallet_summary", {})["bankroll"] = new_val
+                    history["wallet_summary"]["cash"] = new_val
+                    save_history(history, profile_id=active_pid)
+                    print(f"[+] Paper bankroll updated to ${new_val:,.2f}.")
+                except ValueError:
+                    print("[!] Invalid value.")

@@ -217,25 +217,57 @@ def calculate_dynamic_kelly_action(win_prob_bal, cur_p, held_frac, bankroll, fee
     }
 
 
-def calculate_base_ego(history, verbose=True):
-    """Calculates historical Kelly-weighted Brier score calibration across resolved and exited positions."""
+def calculate_base_ego(history, verbose=True, weighting_mode=None):
+    """
+    Calculates historical Brier score calibration across resolved and exited positions.
+    Weighting mode:
+      - 'capital' (default): Weights by actual risked capital % (cost basis / bankroll).
+        Reflects your true Kelly capital allocation rather than uninvested hypothetical model Kelly.
+      - 'kelly': Weights by theoretical model Kelly fraction.
+      - 'equal': Equal weighting (1 vote per position).
+    Supports skipping markets tagged with data.get("exclude_from_ego") == True.
+    """
+    if weighting_mode is None:
+        weighting_mode = getattr(cfg, "EGO_WEIGHTING", "capital")
+
     resolved = history.get("resolved", {})
     exited = history.get("exited", {})
     if not resolved and not exited:
         return 0.50
-        
+
     bs_u_total, bs_m_total = 0.0, 0.0
     total_weight = 0.0
-    
+
+    bankroll = cfg.BANKROLL if cfg.BANKROLL > 0 else 100.0
+
+    def compute_weight(data):
+        if data.get("exclude_from_ego"):
+            return 0.0
+        if weighting_mode == "equal":
+            return 1.0
+        elif weighting_mode == "kelly":
+            wk = float(data.get("kelly", 0.0) or 0.0)
+            if wk > 1e-9:
+                return wk
+            cb = float(data.get("cost_basis", 0.0) or 0.0)
+            return max(0.01, cb / bankroll)
+        else:  # "capital" (Actual Risked Capital % - True Kelly Allocation)
+            if data.get("actual_kelly") is not None and float(data.get("actual_kelly")) > 0:
+                return float(data.get("actual_kelly"))
+            cb = float(data.get("cost_basis", 0.0) or 0.0)
+            tot_s = float(data.get("total_size", 0.0) or 0.0)
+            avg_p = float(data.get("avg_price", 0.0) or 0.0)
+            pnl = float(data.get("realized_pnl", 0.0) or 0.0)
+            act_dlrs = cb if cb > 0 else (tot_s * avg_p if tot_s > 0 else abs(pnl))
+            return max(0.005, min(1.0, act_dlrs / bankroll))
+
     # 1. Terminal Resolutions (y in {0.0, 0.5, 1.0})
     for market_preds in resolved.values():
         for data in ensure_list(market_preds):
+            weight = compute_weight(data)
+            if weight <= 0.0:
+                continue
             outcome = float(data.get("outcome", 0.0) or 0.0)
-            weight = float(data.get("kelly", 0.0) or 0.0)
-            if weight <= 1e-9:
-                cb = float(data.get("cost_basis", 0.0) or 0.0)
-                weight = max(0.01, cb / cfg.BANKROLL) if cfg.BANKROLL > 0 else 0.01
-
             pu = float(data.get("pu", 0.5))
             pm = float(data.get("pm", 0.5))
             bs_u_total += weight * ((pu - outcome) ** 2)
@@ -245,15 +277,13 @@ def calculate_base_ego(history, verbose=True):
     # 2. Exited Positions (Synthetic Repricing Resolution against exit price)
     for market_preds in exited.values():
         for data in ensure_list(market_preds):
+            weight = compute_weight(data)
+            if weight <= 0.0:
+                continue
             exit_price = data.get("exit_price") if data.get("exit_price") is not None else data.get("cur_pm")
             if exit_price is None:
                 continue
             exit_outcome = float(exit_price)
-            weight = float(data.get("kelly", 0.0) or 0.0)
-            if weight <= 1e-9:
-                cb = float(data.get("cost_basis", 0.0) or 0.0)
-                weight = max(0.01, cb / cfg.BANKROLL) if cfg.BANKROLL > 0 else 0.01
-
             pu_raw = data.get("pu")
             pm = float(data.get("pm", 0.5))
             r_pnl = float(data.get("realized_pnl", 0.0) or 0.0)
@@ -268,16 +298,17 @@ def calculate_base_ego(history, verbose=True):
                 bs_u_total += weight * ((pu - exit_outcome) ** 2)
                 bs_m_total += weight * ((pm - exit_outcome) ** 2)
             total_weight += weight
-            
+
     if total_weight == 0:
         return 0.50
 
     bs_u_total /= total_weight
     bs_m_total /= total_weight
-        
+
     if verbose:
-        print(f"[*] Current Brier Score - User: {bs_u_total:.4f} | Market: {bs_m_total:.4f}")
-    
+        mode_tag = f"[{weighting_mode.upper()}]"
+        print(f"[*] Base Ego {mode_tag} - User Brier: {bs_u_total:.4f} | Market Brier: {bs_m_total:.4f}")
+
     if bs_u_total == 0 and bs_m_total == 0:
         return 0.50
     return bs_m_total / (bs_u_total + bs_m_total)

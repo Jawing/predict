@@ -47,6 +47,18 @@ def set_active_profile(profile_id):
         cfg.POLYGON_WALLET = profile_id
     else:
         cfg.POLYGON_WALLET = ""
+
+    # Synchronize runtime bankroll immediately to match active profile
+    fpath = get_profile_path(profile_id)
+    if os.path.exists(fpath):
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+            saved_br = pdata.get("wallet_summary", {}).get("bankroll")
+            if saved_br and float(saved_br) > 0:
+                cfg.BANKROLL = float(saved_br)
+        except Exception:
+            pass
     return profile_id
 
 
@@ -146,6 +158,7 @@ def load_history(profile_id=None):
                 data = json.load(f)
                 if not isinstance(data, dict):
                     data = {}
+                data["profile_id"] = profile_id
                 data.setdefault("predicted", {})
                 data.setdefault("exited", {})
                 data.setdefault("skipped", {})
