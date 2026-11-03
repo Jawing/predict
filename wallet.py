@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 import config as cfg
 from config import api
-from utils import ensure_list, parse_outcome_prices
+from utils import ensure_list, parse_outcome_prices, parse_market_date, ansi_link
 from model import (
     compute_dynamic_ego, calculate_logistic_metrics, calculate_base_ego,
     calculate_annualized_yield, parse_user_input
@@ -34,10 +34,11 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
     history.setdefault("resolved", {})
     history.setdefault("skipped", {})
     profile_url = f"https://polymarket.com/profile/{wallet_address}"
-    linked_wallet = f"\033]8;;{profile_url}\033\\{wallet_address}\033]8;;\033\\"
+    linked_wallet = ansi_link(profile_url, wallet_address)
     base_ego = calculate_base_ego(history)
 
     print(f"[*] Syncing Polymarket wallet {linked_wallet}...")
+
     def _fetch_v2_positions(status_filter):
         pos_list = []
         cursor = None
@@ -80,6 +81,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                         "eventId": p.get("event_id"),
                         "eventSlug": p.get("event_slug"),
                         "timestamp": p.get("timestamp") or 0,
+                        "last_event_at": p.get("last_event_at") or p.get("timestamp") or 0,
+                        "first_entry_at": p.get("first_entry_at") or 0,
                         "_from_closed": (status_filter == "CLOSED")
                     })
                 pagination = resp.get("pagination", {}) if isinstance(resp, dict) else {}
@@ -214,6 +217,11 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             continue
 
         if is_from_closed:
+            tot_bought = float(pos.get("totalBought") or size or 0.0)
+            calc_exit_price = max(0.0001, min(0.9999, round(avg_price + (realized_pnl / tot_bought), 4))) if tot_bought > 0 else cur_price
+            last_evt_ts = int(pos.get("last_event_at") or pos.get("timestamp") or 0)
+            exit_date_str = datetime.fromtimestamp(last_evt_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if last_evt_ts > 0 else None
+
             already_in_exited = False
             for m_id, ex_val in list(history.get("exited", {}).items()):
                 ex_list = ensure_list(ex_val)
@@ -242,6 +250,10 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     for e in matching_ex:
                         e["cur_pm"] = cur_price
                         e["realized_pnl"] = realized_pnl
+                        if calc_exit_price is not None:
+                            e["exit_price"] = calc_exit_price
+                        if exit_date_str:
+                            e["date"] = exit_date_str
                         updated_existing += 1
                 break
             if already_in_exited:
@@ -257,14 +269,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         pos["redeemable"] = is_resolved_pos
         pos["_exited"] = is_exited_open_pos
 
-        try:
-            res_dt = datetime.fromisoformat(str(end_date).replace('Z', '+00:00'))
-            if res_dt.tzinfo is None:
-                res_dt = res_dt.replace(tzinfo=timezone.utc)
-            seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
-            days_until = seconds_left / 86400.0
-        except Exception:
-            days_until = 0.0
+        _, _, days_until = parse_market_date(end_date)
+        days_until = days_until or 0.0
 
         already_stored = False
         for m_id in list(history.get("predicted", {}).keys()):
@@ -349,7 +355,7 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     key=lambda idx_i: abs(float(local_preds[idx_i - 1].get("kelly", 0.0)) * cfg.BANKROLL - delta_usdc)
                 )
                 web_link = f"https://polymarket.com/event/{slug}"
-                linked_q = f"\033]8;;{web_link}\033\\{question}\033]8;;\033\\"
+                linked_q = ansi_link(web_link, question)
                 print(f"\n[SYNC TRANCHE] On-chain execution detected (+${delta_usdc:,.2f} @ {delta_pm*100:.2f}%) for: {linked_q}")
                 for i_lp, lp_item in enumerate(local_preds, 1):
                     rec_tag = " (Recommended match)" if i_lp == default_idx else ""
@@ -510,10 +516,18 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     history["predicted"][target_key] = remaining_pred
                 else:
                     history["predicted"].pop(target_key, None)
+                tot_bought = float(pos.get("totalBought") or size or 0.0)
+                calc_exit_price = max(0.0001, min(0.9999, round(avg_price + (realized_pnl / tot_bought), 4))) if tot_bought > 0 else cur_price
+                last_evt_ts = int(pos.get("last_event_at") or pos.get("timestamp") or latest_trade_ts or 0)
+                exit_date_str = datetime.fromtimestamp(last_evt_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if last_evt_ts > 0 else None
                 for p in to_exit:
                     p["exited"] = True
                     p["cost_basis"] = 0.0
                     p["realized_pnl"] = realized_pnl
+                    if calc_exit_price is not None:
+                        p["exit_price"] = calc_exit_price
+                    if exit_date_str:
+                        p["date"] = exit_date_str
                     c_id_l = (p.get("conditionId") or cond_id or "").lower()
                     sells = [t for t in trades_by_cond.get(c_id_l, []) if t["side"] == "SELL"]
                     if sells:
@@ -543,6 +557,10 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             "latest_trade_ts": latest_trade_ts
         })
 
+    closed_lookup = {
+        ((cp.get("conditionId") or "").lower(), cp.get("outcome", "Yes")): cp
+        for cp in closed_positions if isinstance(cp, dict)
+    }
     for m_id in list(history.get("predicted", {}).keys()):
         preds_list = ensure_list(history["predicted"][m_id])
         kept_preds = []
@@ -552,6 +570,16 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             if p.get("source") == "wallet" and c_id and (c_id or "").lower() not in wallet_cond_ids:
                 p["cost_basis"] = 0.0
                 p["exited"] = True
+                cp_match = closed_lookup.get(((c_id or "").lower(), p.get("position", "Yes")))
+                if cp_match:
+                    p["realized_pnl"] = round(float(cp_match.get("realizedPnl", 0.0) or 0.0), 4)
+                    cp_tb = float(cp_match.get("totalBought") or cp_match.get("size") or 0.0)
+                    cp_avg = float(cp_match.get("avgPrice") or p.get("pm", 0.5))
+                    if cp_tb > 0:
+                        p["exit_price"] = max(0.0001, min(0.9999, round(cp_avg + (p["realized_pnl"] / cp_tb), 4)))
+                    cp_ts = int(cp_match.get("last_event_at") or cp_match.get("timestamp") or 0)
+                    if cp_ts > 0:
+                        p["date"] = datetime.fromtimestamp(cp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
                 sells = [t for t in trades_by_cond.get((c_id or "").lower(), []) if t["side"] == "SELL"]
                 if sells:
                     p["cur_pm"] = round(sells[-1]["price"], 6)
@@ -600,7 +628,7 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         except Exception:
             outcome_idx = 0
         web_link = f"https://polymarket.com/event/{slug}"
-        linked_question = f"\033]8;;{web_link}\033\\{question}\033]8;;\033\\"
+        linked_question = ansi_link(web_link, question)
 
         if not skip_all_remaining:
             progress_str = f" {idx + 1}/{len(to_import)}" if len(to_import) > 1 else ""
@@ -676,10 +704,32 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         _, apy = calculate_annualized_yield(edge, lm["win_prob_m"], days_until)
 
         is_exited_flag = bool(pos.get("_exited"))
+        exit_ts = pos.get("last_event_at") or latest_trade_ts
+        if is_exited_flag and exit_ts and int(exit_ts) > 0:
+            rec_date = datetime.fromtimestamp(int(exit_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        elif pos.get("redeemable") and exit_ts and int(exit_ts) > 0:
+            rec_date = datetime.fromtimestamp(int(exit_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+        elif not is_exited_flag and not pos.get("redeemable"):
+            entry_ts = pos.get("first_entry_at") or pos.get("timestamp") or latest_trade_ts
+            if entry_ts and int(entry_ts) > 0:
+                rec_date = datetime.fromtimestamp(int(entry_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            else:
+                rec_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        else:
+            rec_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+        tot_sz_import = float(pos.get("totalBought") or size or 0.0)
+        calc_import_exit_px = None
+        if is_exited_flag:
+            if tot_sz_import > 0:
+                calc_import_exit_px = max(0.0001, min(0.9999, round(avg_price + (realized_pnl / tot_sz_import), 4)))
+            else:
+                calc_import_exit_px = cur_price
+
         pred_entry = {
             "question": question,
             "slug": slug,
-            "date": pos.get("endDate", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")),
+            "date": rec_date,
             "pu": pu_val,
             "pm": avg_price,
             "cur_pm": cur_price,
@@ -689,6 +739,7 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             "shares": round(size, 4) if not is_exited_flag else 0.0,
             "current_value": round(float(pos.get("currentValue", size * cur_price)), 4) if not is_exited_flag else 0.0,
             "realized_pnl": realized_pnl,
+            "exit_price": calc_import_exit_px if is_exited_flag else None,
             "edge": edge,
             "apy": apy,
             "conditionId": cond_id,
@@ -736,7 +787,7 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             if len(q_short) > 65:
                 q_short = q_short[:62] + "..."
             lp_link = f"https://polymarket.com/event/{lp.get('slug', 'unknown')}"
-            q_linked = f"\033]8;;{lp_link}\033\\{q_short}\033]8;;\033\\"
+            q_linked = ansi_link(lp_link, q_short)
             k_pct = float(lp.get("kelly", 0.0)) * 100.0
             pu_pct = float(lp.get("pu", 0.5)) * 100.0
             pm_pct = float(lp.get("pm", 0.5)) * 100.0
@@ -797,4 +848,3 @@ def update_resolutions(history):
     if resolved_count > 0:
         print(f"[+] Auto-resolved and scored {resolved_count} closed market(s).")
     return history
-

@@ -3,7 +3,7 @@ import json
 import os
 import re
 import config as cfg
-from utils import ensure_list, stringify_overflow
+from utils import ensure_list, stringify_overflow, get_history_counts
 
 
 def sanitize_profile_id(name):
@@ -207,7 +207,7 @@ def load_history(profile_id=None):
 
 
 def save_history(history, profile_id=None):
-    """Saves prediction history to profile file."""
+    """Saves prediction history to profile file, automatically sanitizing overflow floats."""
     if not profile_id:
         profile_id = get_active_profile()
 
@@ -236,38 +236,20 @@ def list_profiles():
             except Exception:
                 data = {}
 
-            n_pred = sum(len(ensure_list(v)) for v in data.get("predicted", {}).values())
-            n_exit = sum(len(ensure_list(v)) for v in data.get("exited", {}).values())
-            n_res = sum(len(ensure_list(v)) for v in data.get("resolved", {}).values())
+            counts = get_history_counts(data)
             br = float(data.get("wallet_summary", {}).get("bankroll", 100.0) or 100.0)
-
-            alias = data.get("alias", "")
-            if not alias:
-                if pid.startswith("0xbC73"):
-                    alias = "Main"
-                elif pid == "local":
-                    alias = "Paper"
-
+            alias = get_profile_alias(pid)
             is_wallet = pid.startswith("0x")
-            short_w = f"0x..{pid[-4:]}" if (is_wallet and len(pid) >= 6) else pid
-            if alias and is_wallet:
-                display_name = f"{alias} ({short_w})"
-            elif alias:
-                display_name = f"{alias} ({pid})"
-            elif is_wallet:
-                display_name = short_w
-            else:
-                display_name = pid.upper()
 
             profiles.append({
                 "profile_id": pid,
                 "alias": alias,
-                "display_name": display_name,
+                "display_name": get_profile_display_name(pid),
                 "is_active": (pid == active_pid),
                 "is_wallet": is_wallet,
-                "active_count": n_pred,
-                "exited_count": n_exit,
-                "resolved_count": n_res,
+                "active_count": counts["active"],
+                "exited_count": counts["exited"],
+                "resolved_count": counts["resolved"],
                 "bankroll": br,
                 "path": fpath
             })

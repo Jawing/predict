@@ -1,29 +1,23 @@
-"""
-manage.py - History data management and manual resolution utilities.
+"""manage.py - History data management and manual resolution utilities.
+
 Allows selective deletion of markets, category clears, manual resolution overrides,
 and interactive settings/filters configuration.
 """
 
 import os
-from config import (
-    HISTORY_FILE,
-    MIN_EDGE,
-    MAX_DAYS,
-    MIN_DAYS,
-    EXTREME_ODDS,
-    BANKROLL,
-)
 import config
-from utils import ensure_list
-from storage import load_history, save_history, stringify_overflow, get_active_profile, get_profile_path
+from utils import ensure_list, get_history_counts
+from storage import load_history, save_history, get_active_profile, get_profile_path
 from wallet import update_resolutions
 
 
 def delete_specific_markets(history):
-    pred_count = len(history.get("predicted", {}))
-    ex_count = len(history.get("exited", {}))
-    res_count = len(history.get("resolved", {}))
-    skip_count = len(history.get("skipped", {}))
+    """Interactively lists markets across categories and deletes selected rows or tranches."""
+    counts = get_history_counts(history)
+    pred_count = counts["active_markets"]
+    ex_count = counts["exited_markets"]
+    res_count = counts["resolved_markets"]
+    skip_count = counts["skipped"]
 
     print(
         f"\nFilter view: [1] All ({pred_count+ex_count+res_count+skip_count})  [2] Active ({pred_count})  [3] Exited ({ex_count})  [4] Resolved ({res_count})  [5] Skipped ({skip_count})"
@@ -78,7 +72,7 @@ def delete_specific_markets(history):
     try:
         parts = del_input.replace(",", " ").split()
         for p in parts:
-            if "-" in p and not "." in p:
+            if "-" in p and "." not in p:
                 start, end = map(int, p.split("-"))
                 for i in range(start, end + 1):
                     if 1 <= i <= len(indexed_markets):
@@ -130,21 +124,18 @@ def delete_specific_markets(history):
                 else:
                     cat_dict.pop(m_id, None)
 
-    save_history(stringify_overflow(history))
+    save_history(history)
     print(f"[+] Successfully deleted {len(to_delete)} item(s) from prediction history.\n")
 
 
 def clear_specific_category(history):
-    pred_count = len(history.get("predicted", {}))
-    ex_count = len(history.get("exited", {}))
-    res_count = len(history.get("resolved", {}))
-    skip_count = len(history.get("skipped", {}))
-
+    """Empties all entries from a selected history category."""
+    counts = get_history_counts(history)
     print("\nSelect Category to Clear:")
-    print(f" 1: Active Predictions ({pred_count})")
-    print(f" 2: Exited Positions ({ex_count})")
-    print(f" 3: Resolved Markets ({res_count})")
-    print(f" 4: Skipped Markets ({skip_count})")
+    print(f" 1: Active Predictions ({counts['active_markets']} mkts, {counts['active']} tranches)")
+    print(f" 2: Exited Positions ({counts['exited_markets']} mkts, {counts['exited']} tranches)")
+    print(f" 3: Resolved Markets ({counts['resolved_markets']} mkts, {counts['resolved']} tranches)")
+    print(f" 4: Skipped Markets ({counts['skipped']})")
     print(" 5: Cancel")
 
     cat_sel = input("> ").strip()
@@ -164,19 +155,17 @@ def clear_specific_category(history):
     ).strip()
     if confirm == "CONFIRM":
         history[target_cat] = {}
-        save_history(stringify_overflow(history))
+        save_history(history)
         print(f"[+] All '{target_cat}' markets cleared from history.\n")
     else:
         print("[!] Category clear cancelled.")
 
 
 def handle_delete_data():
+    """Menu interface for full reset, selective deletion, or clearing a category."""
     history = load_history()
-    pred_count = len(history.get("predicted", {}))
-    ex_count = len(history.get("exited", {}))
-    res_count = len(history.get("resolved", {}))
-    skip_count = len(history.get("skipped", {}))
-    total_markets = pred_count + ex_count + res_count + skip_count
+    counts = get_history_counts(history)
+    total_markets = counts["total_markets"]
 
     print("\n--- DELETE DATA ---")
     print(" 1: Delete all data (Full reset)")
@@ -193,8 +182,8 @@ def handle_delete_data():
             p_path = get_profile_path(active_pid)
             if os.path.exists(p_path):
                 os.remove(p_path)
-            if os.path.exists(HISTORY_FILE):
-                os.remove(HISTORY_FILE)
+            if os.path.exists(config.HISTORY_FILE):
+                os.remove(config.HISTORY_FILE)
             load_history(active_pid)
             print(f"[+] All data for profile '{active_pid}' reset.")
         else:
@@ -227,7 +216,7 @@ def manual_resolve(history):
     r_mode = input("> ").strip()
     if r_mode == "1":
         history = update_resolutions(history)
-        save_history(stringify_overflow(history))
+        save_history(history)
         return history
     elif r_mode != "2":
         return history
@@ -265,7 +254,7 @@ def manual_resolve(history):
         history["resolved"][sel].append(p)
 
     history[bucket_name].pop(sel, None)
-    save_history(stringify_overflow(history))
+    save_history(history)
     print("[+] Market manually resolved and saved.")
     return history
 
@@ -311,8 +300,7 @@ def settings_menu():
                 if param == "BANKROLL":
                     history = load_history()
                     history.setdefault("wallet_summary", {})["bankroll"] = new_val
-                    save_history(stringify_overflow(history))
+                    save_history(history)
                 print(f"[+] {param} updated to {new_val}.")
             except ValueError:
                 print("[!] Invalid value - setting unchanged.")
-

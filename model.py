@@ -22,6 +22,19 @@ def compute_dynamic_ego(base_ego, u_spread, m_spread=0.0):
     return base_ego
 
 
+def calculate_efficiency_scale(eff, gamma=None):
+    """Calculates logistic efficiency scaling factor [4p(1-p)]^gamma."""
+    if gamma is None:
+        gamma = float(getattr(cfg, "KELLY_GAMMA", 0.5))
+    if gamma == 0.0:
+        return 1.0
+    if eff <= 0.0:
+        return 0.0
+    if gamma == 1.0:
+        return eff
+    return eff ** gamma
+
+
 def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fee_rate=0.0):
     """Computes Bayesian pooled probability p_norm, active edge, true cost, live Kelly, and logistic landmarks."""
     eps = 0.01
@@ -52,8 +65,8 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
     eff_norm = 4.0 * pu_norm * (1.0 - pu_norm)
 
     gamma = float(getattr(cfg, "KELLY_GAMMA", 0.5))
-    eff_scale_m = (eff_m ** gamma) if (eff_m > 0 and gamma != 1.0) else (eff_m if gamma == 1.0 else 1.0)
-    eff_scale_live = (eff_live ** gamma) if (eff_live > 0 and gamma != 1.0) else (eff_live if gamma == 1.0 else 1.0)
+    eff_scale_m = calculate_efficiency_scale(eff_m, gamma)
+    eff_scale_live = calculate_efficiency_scale(eff_live, gamma)
 
     true_cost = win_prob_m + (fee_rate * win_prob_m * (1.0 - win_prob_m))
     active_edge = win_prob_bal - true_cost
@@ -74,7 +87,7 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
         base_k = 0.0
     eff_kelly = eff_scale_live * base_k
 
-    # Pure Unconstrained Bayesian Target (no artificial landmark clamping):
+    # Pure Unconstrained Bayesian Target (no artificial landmark clamping)
     target_win_m = win_prob_bal
 
     if eval_win_m >= target_win_m or live_active_edge <= 0.0:
@@ -118,6 +131,89 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
         "regime": regime,
         "dist_to_decel": dist_to_decel,
         "dist_to_half": dist_to_half
+    }
+
+
+def calculate_dynamic_kelly_action(win_prob_bal, cur_p, held_frac, bankroll, fee_rate=0.0, half_spread=0.005, gamma=None):
+    """
+    Evaluates position holding against dynamic Kelly optimization,
+    accounting for downside risk, crossing the bid-ask spread, and
+    discrete conviction-based holding without premature continuous trimming.
+    """
+    if gamma is None:
+        gamma = float(getattr(cfg, "KELLY_GAMMA", 0.5))
+
+    p_norm = float(win_prob_bal)
+    cur_p = max(0.001, min(0.999, float(cur_p)))
+    held_frac = max(0.0, float(held_frac))
+    dist_to_tgt = p_norm - cur_p
+
+    half_sp = max(0.001, float(half_spread))
+
+    # 1. Optimal Live Hold Target f*_hold (at current live price with true fees)
+    hold_true_cost = cur_p + (fee_rate * cur_p * (1.0 - cur_p))
+    edge_hold = p_norm - hold_true_cost
+    if edge_hold > 0.0 and hold_true_cost < 1.0:
+        raw_k_hold = edge_hold / (1.0 - hold_true_cost)
+        eff_scale_hold = calculate_efficiency_scale(4.0 * cur_p * (1.0 - cur_p), gamma)
+        f_star_hold = eff_scale_hold * raw_k_hold
+    else:
+        f_star_hold = 0.0
+
+    # 2. Optimal Add Target f*_add (evaluated after crossing ask spread and paying fees)
+    p_ask = min(0.999, cur_p + half_sp)
+    buy_true_cost = p_ask + (fee_rate * p_ask * (1.0 - p_ask))
+    edge_add = p_norm - buy_true_cost
+    if edge_add > 0.0 and buy_true_cost < 1.0:
+        raw_k_add = edge_add / (1.0 - buy_true_cost)
+        eff_scale_add = calculate_efficiency_scale(4.0 * p_ask * (1.0 - p_ask), gamma)
+        f_star_add = eff_scale_add * raw_k_add
+    else:
+        f_star_add = 0.0
+
+    double_f_hold = 2.0 * f_star_hold
+
+    # 3. Action Decision
+    if dist_to_tgt <= 0.0 or edge_hold <= 0.0:
+        # Target reached or negative edge at current price
+        action_type = "SELL"
+        signal_code = "SELL"
+        action_label = f"SELL: OVER-TGT ({dist_to_tgt*100:+.1f}%)"
+        delta_usd = held_frac * bankroll
+    elif dist_to_tgt <= half_sp or f_star_hold < 0.005:
+        # Exit Runway / Finish Line: Within orderbook half-spread of target, or remaining optimal holding < 0.5% bankroll
+        # Remaining edge cannot cover spread friction; risk/reward is exhausted
+        action_type = "TAKE_PROFIT"
+        signal_code = "EXIT"
+        action_label = f"TAKE PROFIT (+{dist_to_tgt*100:.1f}%)"
+        delta_usd = held_frac * bankroll
+    elif f_star_add > held_frac and (f_star_add - held_frac) >= 0.005:
+        # Genuinely under-allocated: even at the Ask price (after paying spread), Kelly dictates adding >= 0.5% bankroll
+        action_type = "ADD"
+        signal_code = "ADD"
+        add_frac = f_star_add - held_frac
+        add_usd = add_frac * bankroll
+        action_label = f"ADD +${add_usd:,.0f} (+{add_frac*100:.1f}%)"
+        delta_usd = add_usd
+    else:
+        # Conviction Holding: let winning positions run to target without premature spread-dragging micro-trims
+        action_type = "HOLD"
+        signal_code = "HOLD"
+        action_label = f"HOLD (+{dist_to_tgt*100:.1f}% to exit)"
+        delta_usd = 0.0
+
+    return {
+        "action_type": action_type,
+        "signal_code": signal_code,
+        "action_label": action_label,
+        "f_star_hold": f_star_hold,
+        "f_star_add": f_star_add,
+        "double_f_hold": double_f_hold,
+        "held_frac": held_frac,
+        "delta_usd": delta_usd,
+        "edge_hold": edge_hold,
+        "edge_add": edge_add,
+        "dist_to_tgt": dist_to_tgt
     }
 
 
@@ -165,8 +261,6 @@ def calculate_base_ego(history, verbose=True):
             is_uncalibrated_pre_program = (pu_raw is None or abs(float(pu_raw) - pm) < 1e-6)
 
             if is_uncalibrated_pre_program and r_pnl < 0:
-                # Accepted loss pre-program: user accepted loss without adding tranches.
-                # Market is correct at the time (exit_outcome), while user lost money.
                 bs_u_total += weight * ((pm - exit_outcome) ** 2)
                 bs_m_total += weight * 0.0
             else:
@@ -197,7 +291,8 @@ def calculate_annualized_yield(edge, true_price, days_until):
     roi = edge / true_price
     try:
         apy = -1.0 if roi <= -1.0 else ((1 + roi) ** (365.0 / days_until)) - 1
-        if isinstance(apy, complex): apy = -1.0
+        if isinstance(apy, complex):
+            apy = -1.0
     except Exception:
         apy = 0.0
         
@@ -258,8 +353,7 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     
     # Balanced / Efficiency Kelly: Scale raw Kelly by logistic marginal efficiency [4p(1-p)]^gamma
     # Defaults to gamma=0.5 (Square-Root Fisher information geodesic) for optimal growth-variance balance
-    gamma = float(getattr(cfg, "KELLY_GAMMA", 0.5))
-    eff_scale = (lm["eff_m"] ** gamma) if (lm["eff_m"] > 0 and gamma != 1.0) else (lm["eff_m"] if gamma == 1.0 else 1.0)
+    eff_scale = calculate_efficiency_scale(lm["eff_m"])
     eff_kelly = eff_scale * raw_kelly
     final_allocation = eff_kelly * bankroll
     
@@ -305,4 +399,3 @@ def calculate_vwap(asks, target_usdc):
         vwap = total_spent / total_shares
         return vwap, total_spent
     return 0.0, 0.0
-

@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import config as cfg
 from config import api
-from utils import parse_outcome_prices, format_time_remaining
+from utils import parse_outcome_prices, format_time_remaining, parse_market_date
 
 
 def get_wallet_usdc_balance(wallet_address):
@@ -71,21 +71,36 @@ def get_wallet_portfolio_value(wallet_address, positions=None):
     return 0.0
 
 
+def get_market_clob_tokens(m):
+    """Returns YES and NO CLOB token IDs for a given market dict."""
+    if not isinstance(m, dict):
+        return None, None
+    clob_ids = m.get('clobTokenIds')
+    if not clob_ids:
+        return None, None
+    if isinstance(clob_ids, str):
+        try:
+            clob_ids = json.loads(clob_ids)
+        except Exception:
+            return None, None
+    if not isinstance(clob_ids, list) or not clob_ids:
+        return None, None
+    yes_token = clob_ids[0] if len(clob_ids) > 0 else None
+    no_token = clob_ids[1] if len(clob_ids) > 1 else None
+    return yes_token, no_token
+
+
 def refresh_prices_from_clob(m):
     """Pulls best bid/ask and midpoint directly from the CLOB order book."""
-    clob_ids_str = m.get('clobTokenIds')
-    if not clob_ids_str:
+    yes_token, _ = get_market_clob_tokens(m)
+    if not yes_token:
         return m
     try:
-        clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-        if not clob_ids or len(clob_ids) == 0:
-            return m
-        yes_token = clob_ids[0]
         r = api.get(f"https://clob.polymarket.com/book?token_id={yes_token}", timeout=5)
         if r.status_code == 200:
             book = r.json()
-            bids = [float(b['price']) for b in book.get('bids', [])]
-            asks = [float(a['price']) for a in book.get('asks', [])]
+            bids = [float(b['price']) for b in book.get('bids', []) if float(b.get('price', 0)) > 0]
+            asks = [float(a['price']) for a in book.get('asks', []) if float(a.get('price', 0)) > 0]
             if bids and asks:
                 best_bid = max(bids)
                 best_ask = min(asks)
@@ -96,22 +111,6 @@ def refresh_prices_from_clob(m):
     except Exception:
         pass
     return m
-
-
-def get_market_clob_tokens(m):
-    """Returns YES and NO CLOB token IDs for a given market dict."""
-    clob_ids_str = m.get('clobTokenIds')
-    if not clob_ids_str:
-        return None, None
-    try:
-        clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-        if not clob_ids:
-            return None, None
-        yes_token = clob_ids[0] if len(clob_ids) > 0 else None
-        no_token = clob_ids[1] if len(clob_ids) > 1 else None
-        return yes_token, no_token
-    except Exception:
-        return None, None
 
 
 def stream_clob_book(m, custom_token_id=None):
@@ -377,16 +376,13 @@ def validate_market(m, history, mode, exclude_mode="none"):
     if pm_mid < cfg.EXTREME_ODDS or pm_mid > (1.0 - cfg.EXTREME_ODDS):
         return False, f"Odds ({pm_mid*100:.1f}%) hit extreme tail-risk filter"
         
-    try:
-        res_dt = datetime.fromisoformat(m.get('endDate').replace('Z', '+00:00'))
-        seconds_left = (res_dt - datetime.now(timezone.utc)).total_seconds()
-        if seconds_left <= 0:
-            return False, "Market has expired"
-        days_until = seconds_left / 86400.0
-        if days_until < cfg.MIN_DAYS or days_until > cfg.MAX_DAYS:
-            return False, f"Time horizon ({days_until:.1f} days) outside bounds"
-    except Exception:
+    res_dt, seconds_left, days_until = parse_market_date(m.get('endDate'))
+    if res_dt is None or seconds_left is None:
         return False, "Invalid end date format"
+    if seconds_left <= 0:
+        return False, "Market has expired"
+    if days_until < cfg.MIN_DAYS or days_until > cfg.MAX_DAYS:
+        return False, f"Time horizon ({days_until:.1f} days) outside bounds"
             
     return True, "Valid"
 
@@ -427,11 +423,13 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
             except Exception:
                 continue
             
-            if not events or not isinstance(events, list): continue
+            if not events or not isinstance(events, list):
+                continue
             random.shuffle(events)
             
             for event in events:
-                if not isinstance(event, dict): continue
+                if not isinstance(event, dict):
+                    continue
                 if category and category.lower() != "all":
                     tags = [t.get('label', '').lower() for t in event.get('tags', []) if isinstance(t, dict)]
                     matches = [t for t in tags if category.lower() in t]
@@ -475,7 +473,8 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                     continue
                     
                 for event in events:
-                    if not isinstance(event, dict): continue
+                    if not isinstance(event, dict):
+                        continue
                     raw_markets = event.get('markets', [])
                     for m in raw_markets:
                         if target_market_id and str(m.get('id')) != str(target_market_id):
@@ -484,8 +483,9 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                         m['parent_name'] = event.get('title', 'unknown')
                         m['event_markets'] = raw_markets
                         is_valid, reason = validate_market(m, history, mode, exclude_mode)
-                        if is_valid: yield m
-                        else: print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")
+                        if is_valid:
+                            yield m
+                        else:
+                            print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")
             except Exception as e:
                 print(f"[!] Error fetching slug {slug}: {e}")
-

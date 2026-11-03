@@ -1,5 +1,5 @@
-"""
-predict.py - Antigravity Prediction Engine CLI Orchestrator.
+"""predict.py - Antigravity Prediction Engine CLI Orchestrator.
+
 Interactive terminal interface for discovering Polymarket opportunities,
 tracking predictions, logging Kelly sizing, monitoring logistic diminishing returns,
 and auditing portfolio performance.
@@ -8,14 +8,19 @@ and auditing portfolio performance.
 import sys
 import pandas as pd
 
-from config import (
-    BANKROLL,
-    POLYGON_WALLET,
-)
 import config
-from utils import ensure_list
-from storage import load_history, save_history, stringify_overflow
-from views import print_main_menu_dashboard
+from utils import get_history_counts
+from storage import (
+    load_history,
+    save_history,
+    get_active_profile,
+    set_active_profile,
+    list_profiles,
+    delete_profile,
+    set_profile_alias,
+    get_profile_display_name,
+)
+from views import print_main_menu_dashboard, print_review_table
 from wallet import import_polymarket_positions, update_resolutions
 from session import run_prediction_session, custom_calculator, compare_asset_market
 from manage import handle_delete_data, manual_resolve, settings_menu
@@ -26,10 +31,11 @@ def main():
         history = load_history()
         print_main_menu_dashboard(history)
 
-        n_pred = sum(len(ensure_list(v)) for v in history.get("predicted", {}).values())
-        n_exit = sum(len(ensure_list(v)) for v in history.get("exited", {}).values())
-        n_res = sum(len(ensure_list(v)) for v in history.get("resolved", {}).values())
-        n_skip = len(history.get("skipped", {}))
+        counts = get_history_counts(history)
+        n_pred = counts["active"]
+        n_exit = counts["exited"]
+        n_res = counts["resolved"]
+        n_skip = counts["skipped"]
 
         print(" 1: Discover Markets (Scan & Predict)")
         print(" 2: Review Portfolio & History (Active, Exited, Resolved, Skipped)")
@@ -105,7 +111,6 @@ def main():
             review_mode = input("> ").strip()
             if review_mode not in ["1", "2", "3", "4", "5"]:
                 review_mode = "1"
-            op_mode = "review"
             sub_mode = {
                 "1": "predicted",
                 "2": "exited",
@@ -113,6 +118,8 @@ def main():
                 "4": "skipped",
                 "5": "all",
             }[review_mode]
+            print_review_table(history, sub_mode)
+            continue
 
         elif choice == "3":
             urls_input = (
@@ -143,10 +150,6 @@ def main():
             op_mode, sub_mode = "target", "all"
 
         elif choice == "4":
-            from storage import (
-                get_active_profile, set_active_profile, list_profiles,
-                delete_profile, set_profile_alias, get_profile_display_name
-            )
             history = load_history()
             active_pid = get_active_profile()
             profiles = list_profiles()
@@ -162,7 +165,6 @@ def main():
             print("\nAvailable Profiles:")
             for idx, p in enumerate(profiles, start=1):
                 marker = "*" if p["is_active"] else " "
-                kind = "Wallet" if p["is_wallet"] else "Paper"
                 print(f"  [{idx}] {marker} {p['display_name']:<24} | {p['active_count']} active | {p['resolved_count']} res | ${p['bankroll']:,.2f}")
 
             print("\nActions:")
@@ -180,7 +182,7 @@ def main():
                 if is_wallet:
                     history = import_polymarket_positions(active_pid, history, auto_sync=True)
                 history = update_resolutions(history)
-                save_history(stringify_overflow(history))
+                save_history(history)
             elif s_choice == "2":
                 sw = input("Select Profile Number to Activate: ").strip()
                 try:
@@ -204,7 +206,7 @@ def main():
                         history["alias"] = new_alias
                     history = import_polymarket_positions(new_w, history, auto_sync=True)
                     history = update_resolutions(history)
-                    save_history(stringify_overflow(history))
+                    save_history(history)
                     print(f"[+] Created and activated wallet profile: {get_profile_display_name(new_w)}")
                 else:
                     print("[!] Invalid Ethereum/Polygon address format.")
