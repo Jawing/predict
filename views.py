@@ -258,8 +258,19 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
             print(f"Portfolio Velocity: {vel_s}{h_s}")
     else:
         avg_k = stats['total_kelly'] / max(1, stats['active_count'])
-        wins = sum(1 for x in stats["items"] if x["outcome"] == 1.0 or (x.get("pnl") is not None and float(x.get("pnl") or 0.0) > 0.0001))
-        losses = sum(1 for x in stats["items"] if x["outcome"] == 0.0 or (x.get("pnl") is not None and float(x.get("pnl") or 0.0) < -0.0001))
+        wins, losses = 0, 0
+        for x in stats["items"]:
+            out = x.get("outcome")
+            pnl = float(x.get("realized_pnl", 0.0) or 0.0)
+            if out == 1.0:
+                wins += 1
+            elif out == 0.0:
+                losses += 1
+            elif out is None:
+                if pnl > 0.0001:
+                    wins += 1
+                elif pnl < -0.0001:
+                    losses += 1
         wl_str = f" | Record: {wins}W - {losses}L" if sub_mode in ("resolved", "exited", "all") else ""
         print(f"Realized PnL     : ${stats['total_pnl']:+,.2f}{wl_str} | Avg Sizing: {avg_k*100:.2f}% Kelly")
 
@@ -271,6 +282,12 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None):
 
 
 TABLE_CONFIGS = {
+    "ego_impact": {
+        "headers": ["#", "Question", "Side", "Outcome", "Kelly", "BS (User)", "BS (Mkt)", "Net Adv", "PnL", "Date"],
+        "widths": [3, 34, 4, 7, 7, 9, 9, 9, 10, 10],
+        "aligns": ["right", "left", "left", "left", "right", "right", "right", "right", "right", "left"],
+        "q_idx": 1
+    },
     "predicted": {
         "headers": ["#", "Question", "Action / Signal", "Held Pos", "Kelly", "Edge", "Vel/d", "Side", "Live", "p_norm", "Date", "Src"],
         "widths": [3, 34, 22, 13, 7, 7, 8, 4, 6, 6, 10, 6],
@@ -348,11 +365,11 @@ def print_review_table(history, sub_mode):
                     half_spread=half_sp
                 )
 
-                if not is_wallet:
+                if held_mtm_k > 0 or live_val > 0:
+                    regime_str = dyn_action["action_label"]
+                else:
                     buy_usd = lm["eff_kelly"] * live_bankroll if live_bankroll > 0 else 0.0
                     regime_str = f"EXEC BUY ${buy_usd:,.0f} ({lm['eff_kelly']*100:.1f}%)" if lm["live_active_edge"] > 0 else "SKIP: EDGE GONE"
-                else:
-                    regime_str = dyn_action["action_label"]
 
                 src_val = _format_source_tag(pred, alias_tag)
                 live_disp = float(cur_pm_v) if cur_pm_v is not None else pm_v
@@ -404,7 +421,7 @@ def print_review_table(history, sub_mode):
                     "VelDStr": vel_d_disp,
                     "APYStr": apy_disp,
                     "EndsInStr": ends_in_disp,
-                    "DistDecel": lm["dist_to_target"],
+                    "DistTarget": lm["dist_to_target"],
                     "pu": pu_v,
                     "p_norm": lm["win_prob_bal"],
                     "pm": pm_v,
@@ -474,7 +491,7 @@ def print_review_table(history, sub_mode):
                     "Kelly": k_v,
                     "EffKelly": lm["eff_kelly"],
                     "Edge": lm["active_edge"],
-                    "DistDecel": lm["dist_to_target"],
+                    "DistTarget": lm["dist_to_target"],
                     "pu": pu_disp,
                     "p_norm": p_norm_disp,
                     "pm": pm_disp,
@@ -483,7 +500,11 @@ def print_review_table(history, sub_mode):
                     "PnL": float(pred.get("realized_pnl", 0.0) or 0.0),
                     "Regime": "EXITED (Await Res)",
                     "Outcome": "",
-                    "EgoDrag": ego_drag
+                    "EgoDrag": ego_drag,
+                    "bs_u": bs_u,
+                    "bs_m": bs_m,
+                    "adv": -ego_drag,
+                    "weight": w
                 })
 
     # 3. Skipped Rows
@@ -546,7 +567,7 @@ def print_review_table(history, sub_mode):
                     "Kelly": k_v,
                     "EffKelly": lm["eff_kelly"],
                     "Edge": lm["active_edge"],
-                    "DistDecel": lm["dist_to_target"],
+                    "DistTarget": lm["dist_to_target"],
                     "pu": pu_disp,
                     "p_norm": p_norm_disp,
                     "pm": pm_disp,
@@ -555,7 +576,11 @@ def print_review_table(history, sub_mode):
                     "PnL": res.get("realized_pnl"),
                     "Regime": lm["regime"],
                     "Outcome": str(res.get("outcome", 0.5)),
-                    "EgoDrag": ego_drag
+                    "EgoDrag": ego_drag,
+                    "bs_u": bs_u,
+                    "bs_m": bs_m,
+                    "adv": -ego_drag,
+                    "weight": w
                 })
 
     if not rows:
@@ -586,13 +611,16 @@ def print_review_table(history, sub_mode):
     elif sort_by == "edge":
         rows.sort(key=lambda x: (0 if x.get("Edge") is None else 1, x.get("Edge") or 0.0), reverse=True)
     elif sort_by == "exit_prox":
-        rows.sort(key=lambda x: (1 if x.get("DistDecel") is None else 0, x.get("DistDecel") if x.get("DistDecel") is not None else float("inf")))
+        rows.sort(key=lambda x: (1 if x.get("DistTarget") is None else 0, x.get("DistTarget") if x.get("DistTarget") is not None else float("inf")))
     elif sort_by == "velocity":
         rows.sort(key=lambda x: (0 if x.get("DailyEdge") is None else 1, x.get("DailyEdge") or 0.0), reverse=True)
     elif sort_by == "ego_impact":
         rows.sort(key=lambda x: (0 if x.get("EgoDrag") is None else 1, x.get("EgoDrag") or 0.0), reverse=True)
 
-    config = TABLE_CONFIGS.get(sub_mode, TABLE_CONFIGS["all"])
+    if sort_by == "ego_impact":
+        config = TABLE_CONFIGS["ego_impact"]
+    else:
+        config = TABLE_CONFIGS.get(sub_mode, TABLE_CONFIGS["all"])
     headers = config["headers"]
     widths = config["widths"]
     aligns = config["aligns"]
@@ -638,7 +666,13 @@ def print_review_table(history, sub_mode):
         else: outcome_str = "-"
 
         row_num = str(row_i)
-        if sub_mode == "predicted":
+        if sort_by == "ego_impact":
+            bs_u_s = f"{r['bs_u']:.4f}" if r.get("bs_u") is not None else "-"
+            bs_m_s = f"{r['bs_m']:.4f}" if r.get("bs_m") is not None else "-"
+            adv_s = f"{r['adv']:+.4f}" if r.get("adv") is not None else "-"
+            st_out = outcome_str if r["Mode"] == "resolved" else ("SOLD" if r["Mode"] == "exited" else "-")
+            vals = [row_num, r["Question"], side_str, st_out, kelly_str, bs_u_s, bs_m_s, adv_s, pnl_str, r["Date"]]
+        elif sub_mode == "predicted":
             held_v = r.get("HeldVal", 0.0)
             held_f = r.get("HeldFrac", 0.0)
             held_str = f"${held_v:,.0f} ({held_f*100:.1f}%)" if held_v > 0 else "-"
@@ -674,8 +708,14 @@ def print_review_table(history, sub_mode):
         if exit_signals:
             print(f"  [*] Take-Profit / Exit Alert: {len(exit_signals)} position{'s' if len(exit_signals) > 1 else ''} near or reached target (Limit Sell or Market Sell on Polymarket recommended)")
 
-    act = input(f"Select row # to predict / add tranche (1-{len(rows)}) [Enter for Main Menu]: ").strip()
-    if act.isdigit():
+    prompt_action = "predict / add tranche" if sub_mode == "predicted" else "view market"
+    cal_hint = ", 'cal' (calibrate ego)" if sub_mode in ("resolved", "exited", "all") else ""
+    act = input(f"Select row # to {prompt_action} (1-{len(rows)}){cal_hint} [Enter for Main Menu]: ").strip()
+    if act.lower() in ("cal", "ego", "e"):
+        from manage import toggle_ego_market_inclusion
+        toggle_ego_market_inclusion(history)
+        return
+    elif act.isdigit():
         row_num = int(act)
         if 1 <= row_num <= len(rows):
             _handle_targeted_tranche_predict(rows, preselected_idx=row_num - 1)
@@ -786,10 +826,10 @@ def print_main_menu_dashboard(history):
                 half_spread=half_sp
             )
 
-            if not is_w:
-                sig = "BUY" if lm["live_active_edge"] > 0 else "PASS"
-            else:
+            if held_mtm_k > 0 or live_val > 0:
                 sig = dyn_action["signal_code"]
+            else:
+                sig = "BUY" if lm["live_active_edge"] > 0 else "PASS"
             active_signals[sig] = active_signals.get(sig, 0) + 1
 
     avg_edge = (active_edge_w / active_eff_kelly) if active_eff_kelly > 0 else 0.0

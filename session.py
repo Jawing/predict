@@ -418,8 +418,9 @@ def run_prediction_session(
 
             held_mtm_k = (live_held_val / current_bankroll) if (current_bankroll > 0 and live_held_val > 0) else sum(float(p.get("kelly", 0.0) or 0.0) for p in existing_preds)
 
-            action, true_price, raw_kelly, eff_kelly, full_alloc, dynamic_ego, edge = calculate_allocation(
-                lower, upper, pm_bid, pm_ask, fee_rate, current_bankroll, base_ego
+            action, true_price, raw_kelly, eff_kelly, full_alloc, dynamic_ego, edge, lm = calculate_allocation(
+                lower, upper, pm_bid, pm_ask, fee_rate, current_bankroll, base_ego,
+                held_kelly=held_mtm_k if is_existing else None
             )
 
             # Incremental tranche allocation if position already held
@@ -464,9 +465,6 @@ def run_prediction_session(
                             action = "THIN_EDGE"
 
             pu_mid_val = (lower + upper) / 2.0
-            lm = calculate_logistic_metrics(
-                pu_mid_val, pm_mid, dynamic_ego, held_kelly=eff_kelly if is_existing else raw_kelly, fee_rate=fee_rate
-            )
 
             pos_side = action.capitalize() if action in ("YES", "NO") else ("Yes" if lm["is_yes"] else "No")
             is_pos_no = (pos_side == "No")
@@ -790,15 +788,12 @@ def custom_calculator():
         bankroll_input = input(f"Bankroll [Enter for ${cfg.BANKROLL:,.2f}]: ").strip()
         calc_bankroll = float(bankroll_input) if bankroll_input else cfg.BANKROLL
 
-        action, true_price, raw_kelly, eff_kelly, final_alloc, dynamic_ego, edge = calculate_allocation(
-            lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego
-        )
-        _, apy = calculate_annualized_yield(edge, true_price, days_until)
         pu_mid_c = round((lower + upper) / 2.0, 6)
         pm_mid_c = round((m_lower + m_upper) / 2.0, 6)
-        lm_c = calculate_logistic_metrics(
-            pu_mid_c, pm_mid_c, dynamic_ego, held_kelly=raw_kelly, fee_rate=fee_rate
+        action, true_price, raw_kelly, eff_kelly, final_alloc, dynamic_ego, edge, lm_c = calculate_allocation(
+            lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego, held_kelly=raw_kelly
         )
+        _, apy = calculate_annualized_yield(edge, true_price, days_until)
 
         c_vel_str = format_velocity_display(edge, true_price, days_until)
 

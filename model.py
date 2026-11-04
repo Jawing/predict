@@ -221,9 +221,8 @@ def calculate_base_ego(history, verbose=True, weighting_mode=None):
     """
     Calculates historical Brier score calibration across resolved and exited positions.
     Weighting mode:
-      - 'capital' (default): Weights by actual risked capital % (cost basis / bankroll).
-        Reflects your true Kelly capital allocation rather than uninvested hypothetical model Kelly.
-      - 'kelly': Weights by theoretical model Kelly fraction.
+      - 'kelly' (default): Weights by theoretical model Kelly fraction.
+      - 'capital': Weights by actual risked capital % (cost basis / bankroll).
       - 'equal': Equal weighting (1 vote per position).
     Supports skipping markets tagged with data.get("exclude_from_ego") == True.
     """
@@ -314,6 +313,68 @@ def calculate_base_ego(history, verbose=True, weighting_mode=None):
     return bs_m_total / (bs_u_total + bs_m_total)
 
 
+def calculate_trade_ego_metrics(data, cat="resolved", bankroll=100.0, weighting_mode=None):
+    """Calculates individual trade Brier contributions: weight, bs_u, bs_m, ego_drag, and net_adv."""
+    if weighting_mode is None:
+        weighting_mode = getattr(cfg, "EGO_WEIGHTING", "kelly")
+    
+    bankroll = bankroll if bankroll > 0 else 100.0
+    
+    # Weight calculation
+    if data.get("exclude_from_ego"):
+        weight = 0.0
+    elif weighting_mode == "equal":
+        weight = 1.0
+    elif weighting_mode == "kelly":
+        wk = float(data.get("kelly", 0.0) or 0.0)
+        if wk > 1e-9:
+            weight = wk
+        else:
+            cb = float(data.get("cost_basis", 0.0) or 0.0)
+            weight = max(0.01, cb / bankroll)
+    else:  # capital
+        if data.get("actual_kelly") is not None and float(data.get("actual_kelly")) > 0:
+            weight = float(data.get("actual_kelly"))
+        else:
+            cb = float(data.get("cost_basis", 0.0) or 0.0)
+            tot_s = float(data.get("total_size", 0.0) or 0.0)
+            avg_p = float(data.get("avg_price", 0.0) or 0.0)
+            pnl = float(data.get("realized_pnl") if data.get("realized_pnl") is not None else data.get("pnl", 0.0) or 0.0)
+            act_dlrs = cb if cb > 0 else (tot_s * avg_p if tot_s > 0 else abs(pnl))
+            weight = max(0.005, min(1.0, act_dlrs / bankroll))
+            
+    pm = float(data.get("pm", 0.5) or 0.5)
+    pu_raw = data.get("pu")
+    
+    if cat == "resolved":
+        outcome = float(data.get("outcome", 0.0) or 0.0)
+        pu = float(pu_raw if pu_raw is not None else 0.5)
+        bs_u = (pu - outcome) ** 2
+        bs_m = (pm - outcome) ** 2
+    else:  # exited
+        exit_price = data.get("exit_price") if data.get("exit_price") is not None else data.get("cur_pm")
+        exit_outcome = float(exit_price if exit_price is not None else pm)
+        is_uncal = (pu_raw is None or abs(float(pu_raw) - pm) < 1e-6)
+        r_pnl = float(data.get("realized_pnl") if data.get("realized_pnl") is not None else data.get("pnl", 0.0) or 0.0)
+        if is_uncal and r_pnl < 0:
+            bs_u = (pm - exit_outcome) ** 2
+            bs_m = 0.0
+        else:
+            pu = float(pu_raw if pu_raw is not None else pm)
+            bs_u = (pu - exit_outcome) ** 2
+            bs_m = (pm - exit_outcome) ** 2
+
+    ego_drag = weight * (bs_u - bs_m)
+    net_adv = -ego_drag
+    return {
+        "weight": weight,
+        "bs_u": bs_u,
+        "bs_m": bs_m,
+        "ego_drag": ego_drag,
+        "net_adv": net_adv,
+    }
+
+
 def calculate_annualized_yield(edge, true_price, days_until):
     """Calculates raw expected ROI and geometric compounding APY."""
     if days_until <= 0.0 or true_price <= 0 or abs(edge) < 1e-9:
@@ -355,8 +416,8 @@ def parse_user_input(user_input):
         return round(min(numbers[0], numbers[1]) / 100.0, 6), round(max(numbers[0], numbers[1]) / 100.0, 6)
 
 
-def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, bankroll, base_ego, custom_min_edge=None):
-    """Translates belief bounds into trade direction (YES/NO), true price, Kelly sizing, and edge."""
+def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, bankroll, base_ego, custom_min_edge=None, held_kelly=None):
+    """Translates belief bounds into trade direction (YES/NO), true price, Kelly sizing, edge, and logistic metrics."""
     if custom_min_edge is None:
         custom_min_edge = cfg.MIN_EDGE
     
@@ -366,7 +427,7 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     pm_mid = (pm_bid + pm_ask) / 2.0
     
     dynamic_ego = compute_dynamic_ego(base_ego, u_spread, m_spread)
-    lm = calculate_logistic_metrics(pu_mid, pm_mid, dynamic_ego, fee_rate=fee_rate)
+    lm = calculate_logistic_metrics(pu_mid, pm_mid, dynamic_ego, held_kelly=held_kelly, fee_rate=fee_rate)
     pu_norm = lm["pu_norm"]
     
     cost_yes, cost_no = pm_ask, 1.0 - pm_bid 
@@ -375,23 +436,21 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     elif (1.0 - pu_norm) > cost_no:
         action, base_price, win_prob = "NO", cost_no, 1.0 - pu_norm
     else:
-        return "NONE", 0.0, 0.0, 0.0, 0.0, dynamic_ego, 0.0
+        return "NONE", 0.0, 0.0, 0.0, 0.0, dynamic_ego, 0.0, lm
     
     true_price = base_price + (fee_rate * base_price * (1 - base_price))
     edge = win_prob - true_price
 
     raw_kelly = max(0.0, edge / (1 - true_price)) if true_price < 1.0 else 0.0
     
-    # Balanced / Efficiency Kelly: Scale raw Kelly by logistic marginal efficiency [4p(1-p)]^gamma
-    # Defaults to gamma=0.5 (Square-Root Fisher information geodesic) for optimal growth-variance balance
     eff_scale = calculate_efficiency_scale(lm["eff_m"])
     eff_kelly = eff_scale * raw_kelly
     final_allocation = eff_kelly * bankroll
     
     if edge < custom_min_edge:
-        return "THIN_EDGE", true_price, raw_kelly, eff_kelly, 0.0, dynamic_ego, edge
+        return "THIN_EDGE", true_price, raw_kelly, eff_kelly, 0.0, dynamic_ego, edge, lm
     
-    return action, true_price, raw_kelly, eff_kelly, final_allocation, dynamic_ego, edge
+    return action, true_price, raw_kelly, eff_kelly, final_allocation, dynamic_ego, edge, lm
 
 
 def calculate_vwap(asks, target_usdc):

@@ -8,7 +8,7 @@ and auditing portfolio performance.
 import sys
 import pandas as pd
 
-import config
+import config as cfg
 from utils import get_history_counts
 from storage import (
     load_history,
@@ -120,7 +120,12 @@ def main():
             print(f" 3: Resolved Markets ({n_res})")
             print(f" 4: Skipped Markets ({n_skip})")
             print(f" 5: All Predictions (Active + Exited + Resolved)")
+            print(f" 6: Calibrate Base Ego (Include/Exclude & Custom Kelly)")
             review_mode = input("> ").strip()
+            if review_mode == "6":
+                from manage import toggle_ego_market_inclusion
+                toggle_ego_market_inclusion(history)
+                continue
             if review_mode not in ["1", "2", "3", "4", "5"]:
                 review_mode = "1"
             sub_mode = {
@@ -173,7 +178,7 @@ def main():
             print(f"\n--- WALLET & PROFILES ---")
             print(f"Active Profile : {active_disp} ({prof_type})")
             print(f"Address / ID   : {active_pid}")
-            print(f"Bankroll       : ${config.BANKROLL:,.2f}")
+            print(f"Bankroll       : ${cfg.BANKROLL:,.2f}")
             print("\nAvailable Profiles:")
             for idx, p in enumerate(profiles, start=1):
                 marker = "*" if p["is_active"] else " "
@@ -235,7 +240,7 @@ def main():
                     history["alias"] = new_alias
                     history.setdefault("wallet_summary", {})["bankroll"] = paper_br
                     history["wallet_summary"]["cash"] = paper_br
-                    config.BANKROLL = paper_br
+                    cfg.BANKROLL = paper_br
                     save_history(history, profile_id=p_in)
                     print(f"[+] Switched to paper trading profile: {new_alias} ({p_in}) with ${paper_br:,.2f} bankroll.")
             elif s_choice == "4":

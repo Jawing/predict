@@ -5,10 +5,12 @@ and interactive settings/filters configuration.
 """
 
 import os
-import config
+from datetime import datetime, timezone
+import config as cfg
 from utils import ensure_list, get_history_counts
 from storage import load_history, save_history, get_active_profile, get_profile_path
 from wallet import update_resolutions
+from model import calculate_base_ego, calculate_trade_ego_metrics
 
 
 def delete_specific_markets(history):
@@ -184,8 +186,8 @@ def handle_delete_data():
             p_path = get_profile_path(active_pid)
             if os.path.exists(p_path):
                 os.remove(p_path)
-            if os.path.exists(config.HISTORY_FILE):
-                os.remove(config.HISTORY_FILE)
+            if os.path.exists(cfg.HISTORY_FILE):
+                os.remove(cfg.HISTORY_FILE)
             load_history(active_pid)
             print(f"[+] All data for profile '{active_pid}' reset.")
         else:
@@ -216,71 +218,187 @@ def handle_delete_data():
 
 
 def toggle_ego_market_inclusion(history):
-    """Allows selecting specific markets to include or exclude from Base Ego Brier score calibration."""
-    all_settled = []
-    for cat in ["resolved", "exited"]:
-        for m_id, preds in history.get(cat, {}).items():
-            for idx, p in enumerate(ensure_list(preds)):
-                q = p.get("question", m_id)
-                side = p.get("position", "-")
-                pnl = float(p.get("realized_pnl", 0.0) or 0.0)
-                is_excl = bool(p.get("exclude_from_ego", False))
-                all_settled.append({
-                    "cat": cat,
-                    "m_id": m_id,
-                    "idx": idx,
-                    "question": q,
-                    "side": side,
-                    "pnl": pnl,
-                    "excluded": is_excl,
-                    "ref": p
-                })
+    """Allows selecting specific markets to include/exclude or custom-adjust Kelly % for Base Ego calibration."""
+    sort_mode = "ego_impact"  # Default: Ego impact (detractors first)
 
-    if not all_settled:
-        print("[!] No resolved or exited markets available to calibrate.")
-        return
+    while True:
+        live_bankroll = cfg.BANKROLL if cfg.BANKROLL > 0 else 100.0
+        all_settled = []
+        for cat in ["resolved", "exited"]:
+            for m_id, preds in history.get(cat, {}).items():
+                for idx, p in enumerate(ensure_list(preds)):
+                    q = p.get("question", m_id)
+                    side = p.get("position", "-")
+                    pnl = float(p.get("realized_pnl") if p.get("realized_pnl") is not None else p.get("pnl", 0.0) or 0.0)
+                    is_excl = bool(p.get("exclude_from_ego", False))
+                    
+                    # Unmask exclude_from_ego temporarily to get intrinsic metrics & weight
+                    p["exclude_from_ego"] = False
+                    m_ego = calculate_trade_ego_metrics(p, cat=cat, bankroll=live_bankroll)
+                    p["exclude_from_ego"] = is_excl
 
-    print("\n--- EGO CALIBRATION MARKET SELECTOR ---")
-    print("Toggle markets to INCLUDE/EXCLUDE, or custom-adjust recorded Kelly %.")
-    print(f"{'#':<3} | {'Status':<10} | {'Kelly':<7} | {'Type':<8} | {'Side':<4} | {'PnL':<10} | {'Question'}")
-    print("-" * 90)
-    for i, it in enumerate(all_settled, 1):
-        st = "[EXCLUDED]" if it["excluded"] else "[ACTIVE]"
-        k_val = float(it["ref"].get("kelly", 0.0) or 0.0)
-        print(f"{i:<3} | {st:<10} | {k_val*100:>5.1f}% | {it['cat']:<8} | {it['side']:<4} | ${it['pnl']:>+8.2f} | {it['question'][:40]}")
+                    # Concluded / settled date resolution (never in future)
+                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                    d_res = p.get("resolved_date") or p.get("exit_date")
+                    if d_res and str(d_res) <= now_str:
+                        settled_date = str(d_res)[:16]
+                    else:
+                        d_raw = p.get("date")
+                        if d_raw and str(d_raw)[:16] <= now_str:
+                            settled_date = str(d_raw)[:16]
+                        else:
+                            # Fallback if date is in future (contract endDate horizon)
+                            ts = p.get("last_synced_ts")
+                            if ts and int(ts) > 0:
+                                settled_date = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                            else:
+                                settled_date = str(d_raw)[:16] if d_raw else "unknown" 
 
-    sel = input("\nEnter row # to toggle [ACTIVE/EXCLUDED], 'adj <#>' to edit Kelly %, 'reset' all, or Enter to finish: ").strip()
-    if sel.lower() == "reset":
+                    all_settled.append({
+                        "cat": cat,
+                        "m_id": m_id,
+                        "idx": idx,
+                        "question": q,
+                        "side": side,
+                        "pnl": pnl,
+                        "excluded": is_excl,
+                        "ref": p,
+                        "date": str(settled_date),
+                        "weight": m_ego["weight"],
+                        "bs_u": m_ego["bs_u"],
+                        "bs_m": m_ego["bs_m"],
+                        "ego_drag": m_ego["ego_drag"],
+                        "net_adv": m_ego["net_adv"],
+                    })
+
+        if not all_settled:
+            print("[!] No resolved or exited markets available to calibrate.")
+            return
+
+        # Exact active sums & current Base Ego
+        S_m = sum(it["weight"] * it["bs_m"] for it in all_settled if not it["excluded"])
+        S_u = sum(it["weight"] * it["bs_u"] for it in all_settled if not it["excluded"])
+        curr_ego = (S_m / (S_u + S_m)) if (S_u + S_m) > 0 else 0.50
+
+        # Exact counterfactual Delta Ego if toggled
         for it in all_settled:
-            it["ref"]["exclude_from_ego"] = False
-        save_history(history)
-        print("[+] All markets restored to Active in Base Ego.")
-    elif sel.lower().startswith("adj "):
-        adj_num = sel.split()[1]
-        if adj_num.isdigit():
-            idx = int(adj_num) - 1
-            if 0 <= idx < len(all_settled):
-                target_item = all_settled[idx]
-                curr_k = float(target_item["ref"].get("kelly", 0.0) or 0.0)
-                new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.1f}%, e.g. 1.0 for 1%): ").strip()
-                try:
-                    new_k_val = float(new_k_raw) / 100.0 if float(new_k_raw) > 1.0 else float(new_k_raw)
-                    target_item["ref"]["kelly"] = new_k_val
-                    save_history(history)
-                    print(f"[+] Market #{adj_num} Kelly updated to {new_k_val*100:.2f}%.")
-                except ValueError:
-                    print("[!] Invalid percentage entered.")
-    elif sel.isdigit():
-        idx = int(sel) - 1
-        if 0 <= idx < len(all_settled):
-            curr = all_settled[idx]["ref"].get("exclude_from_ego", False)
-            all_settled[idx]["ref"]["exclude_from_ego"] = not curr
-            save_history(history)
-            new_st = "EXCLUDED from" if not curr else "INCLUDED in"
-            print(f"[+] Market #{sel} is now {new_st} Base Ego calculation.")
-        else:
-            print("[!] Invalid row number.")
+            w = it["weight"]
+            bs_u = it["bs_u"]
+            bs_m = it["bs_m"]
+            if not it["excluded"]:
+                new_Sm = S_m - (w * bs_m)
+                new_Su = S_u - (w * bs_u)
+            else:
+                new_Sm = S_m + (w * bs_m)
+                new_Su = S_u + (w * bs_u)
+            new_ego = (new_Sm / (new_Su + new_Sm)) if (new_Su + new_Sm) > 0 else 0.50
+            it["delta_ego"] = new_ego - curr_ego
 
+        # Sort settled markets
+        if sort_mode == "ego_impact":
+            all_settled.sort(key=lambda x: (0 if x["excluded"] else 1, x["delta_ego"]), reverse=True)
+            sort_label = "Ego Impact / Delta Ego (Detractors First)"
+        elif sort_mode == "adv":
+            all_settled.sort(key=lambda x: (0 if x.get("net_adv") is None else 1, x.get("net_adv") or 0.0), reverse=True)
+            sort_label = "Net Advantage (Benefactors First)"
+        elif sort_mode == "kelly":
+            all_settled.sort(key=lambda x: float(x["ref"].get("kelly", 0.0) or 0.0), reverse=True)
+            sort_label = "Kelly %"
+        elif sort_mode == "pnl":
+            all_settled.sort(key=lambda x: x["pnl"], reverse=True)
+            sort_label = "Realized PnL"
+        elif sort_mode == "date":
+            all_settled.sort(key=lambda x: x["date"], reverse=True)
+            sort_label = "Settled Date (Newest First)"
+
+        w_mode = getattr(cfg, "EGO_WEIGHTING", "kelly").upper()
+
+        print("\n" + "=" * 114)
+        print(f"--- EGO CALIBRATION MARKET SELECTOR [Sorted by {sort_label}] ---")
+        active_cnt = sum(1 for x in all_settled if not x["excluded"])
+        print(f"Current Base Ego: {curr_ego:.3f} ({w_mode} mode) | Active: {active_cnt} / {len(all_settled)} markets")
+        print("=" * 114)
+        print(f"{'#':<3} | {'Status':<10} | {'dEgo':<8} | {'Net Adv':<9} | {'Kelly':<7} | {'Type':<8} | {'Side':<6} | {'PnL':<10} | {'Question'}")
+        print("-" * 114)
+        for i, it in enumerate(all_settled, 1):
+            st = "[EXCLUDED]" if it["excluded"] else "[ACTIVE]"
+            k_val = float(it["ref"].get("kelly", 0.0) or 0.0)
+            adv_str = f"{it['net_adv']:>+8.4f}"
+            dego_str = f"{it['delta_ego']:>+7.4f}"
+            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {k_val*100:>5.1f}% | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {it['question'][:36]}")
+
+        sel = input(f"\nSelect row # to toggle, 'adj <#>' (edit Kelly), 'sort' (toggle view), 'reset', or Enter to finish: ").strip()
+        if not sel:
+            break
+        elif sel.lower() == "reset":
+            for it in all_settled:
+                it["ref"]["exclude_from_ego"] = False
+            save_history(history)
+            new_ego = calculate_base_ego(history, verbose=False)
+            print(f"[+] All markets restored to Active in Base Ego. Updated Base Ego: {curr_ego:.3f} -> {new_ego:.3f}")
+        elif sel.lower() in ("sort", "s"):
+            next_sort = {
+                "ego_impact": "adv",
+                "adv": "kelly",
+                "kelly": "pnl",
+                "pnl": "date",
+                "date": "ego_impact",
+            }
+            sort_mode = next_sort.get(sort_mode, "ego_impact")
+            continue
+        elif sel.lower().startswith("sort "):
+            sub_s = sel.lower().split()[1]
+            if sub_s in ("ego", "impact", "drag", "dego"):
+                sort_mode = "ego_impact"
+            elif sub_s in ("adv", "edge"):
+                sort_mode = "adv"
+            elif sub_s in ("kelly", "k"):
+                sort_mode = "kelly"
+            elif sub_s in ("pnl", "profit"):
+                sort_mode = "pnl"
+            elif sub_s in ("date", "d", "time"):
+                sort_mode = "date"
+            continue
+        elif sel.lower().startswith("adj "):
+            parts = sel.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                idx = int(parts[1]) - 1
+                if 0 <= idx < len(all_settled):
+                    target_item = all_settled[idx]
+                    curr_k = float(target_item["ref"].get("kelly", 0.0) or 0.0)
+                    new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.1f}%, e.g. 1.0 for 1%): ").strip()
+                    try:
+                        clean_k = new_k_raw.strip()
+                        if clean_k.endswith("%"):
+                            parsed_num = float(clean_k[:-1].strip()) / 100.0
+                        else:
+                            raw_num = float(clean_k)
+                            parsed_num = (raw_num / 100.0) if raw_num >= 1.0 else raw_num
+                        new_k_val = max(0.0, min(1.0, parsed_num))
+                        target_item["ref"]["kelly"] = new_k_val
+                        save_history(history)
+                        new_ego = calculate_base_ego(history, verbose=False)
+                        delta = new_ego - curr_ego
+                        print(f"[+] Market #{parts[1]} Kelly updated to {new_k_val*100:.2f}%. Base Ego updated: {curr_ego:.3f} -> {new_ego:.3f} ({delta:+.3f})")
+                    except ValueError:
+                        print("[!] Invalid percentage entered.")
+            else:
+                print("[!] Format: 'adj <row#>'")
+        elif sel.isdigit():
+            idx = int(sel) - 1
+            if 0 <= idx < len(all_settled):
+                curr = all_settled[idx]["ref"].get("exclude_from_ego", False)
+                all_settled[idx]["ref"]["exclude_from_ego"] = not curr
+                save_history(history)
+                new_st = "EXCLUDED from" if not curr else "INCLUDED in"
+                new_ego = calculate_base_ego(history, verbose=False)
+                delta = new_ego - curr_ego
+                print(f"[+] Market #{sel} is now {new_st} Base Ego calculation.")
+                print(f"[*] Base Ego updated: {curr_ego:.3f} -> {new_ego:.3f} ({delta:+.3f})")
+            else:
+                print("[!] Invalid row number.")
+        else:
+            print("[!] Unrecognized input.")
 
 def manual_resolve(history):
     """Audit resolutions automatically or prompt user to resolve a market manually."""
@@ -355,16 +473,16 @@ def settings_menu():
     history = load_history(active_pid)
 
     print("\n--- SETTINGS / FILTERS ---")
-    print(f" 1: Min Edge       = {config.MIN_EDGE*100:.2f}%  (skip bets below this edge)")
-    print(f" 2: Max Days       = {config.MAX_DAYS}  (ignore markets beyond this horizon)")
-    print(f" 3: Min Days       = {config.MIN_DAYS}  (ignore markets resolving sooner than this)")
-    print(f" 4: Extreme Odds   = {config.EXTREME_ODDS*100:.2f}%  (tail-risk filter - skip near 0% or 100%)")
+    print(f" 1: Min Edge       = {cfg.MIN_EDGE*100:.2f}%  (skip bets below this edge)")
+    print(f" 2: Max Days       = {cfg.MAX_DAYS}  (ignore markets beyond this horizon)")
+    print(f" 3: Min Days       = {cfg.MIN_DAYS}  (ignore markets resolving sooner than this)")
+    print(f" 4: Extreme Odds   = {cfg.EXTREME_ODDS*100:.2f}%  (tail-risk filter - skip near 0% or 100%)")
 
     if is_wallet:
         bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
         print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}  (off-platform funds added to live wallet total, default $0)")
     else:
-        print(f" 5: Paper Bankroll = ${config.BANKROLL:,.2f}  (sandbox capital)")
+        print(f" 5: Paper Bankroll = ${cfg.BANKROLL:,.2f}  (sandbox capital)")
 
     print("\nEnter setting number to edit [Enter to cancel]:")
     s_choice = input("> ").strip()
@@ -372,12 +490,12 @@ def settings_menu():
 
     if s_choice in setting_map:
         param = setting_map[s_choice]
-        current_val = getattr(config, param)
+        current_val = getattr(cfg, param)
         new_raw = input(f"New value for {param} (currently {current_val}): ").strip()
         if new_raw:
             try:
                 new_val = float(new_raw)
-                setattr(config, param, new_val)
+                setattr(cfg, param, new_val)
                 print(f"[+] {param} updated to {new_val}.")
             except ValueError:
                 print("[!] Invalid value - setting unchanged.")
@@ -391,19 +509,19 @@ def settings_menu():
                     history["bankroll_add"] = new_add
                     cash_val = float(history.get("wallet_summary", {}).get("cash", 0.0) or 0.0)
                     pos_val = float(history.get("wallet_summary", {}).get("portfolio", 0.0) or 0.0)
-                    config.BANKROLL = round(cash_val + pos_val + new_add, 4)
+                    cfg.BANKROLL = round(cash_val + pos_val + new_add, 4)
                     history.setdefault("wallet_summary", {})["bankroll_add"] = new_add
-                    history["wallet_summary"]["bankroll"] = config.BANKROLL
+                    history["wallet_summary"]["bankroll"] = cfg.BANKROLL
                     save_history(history, profile_id=active_pid)
-                    print(f"[+] Off-platform bankroll add set to +${new_add:,.2f}. Total Bankroll is now ${config.BANKROLL:,.2f}.")
+                    print(f"[+] Off-platform bankroll add set to +${new_add:,.2f}. Total Bankroll is now ${cfg.BANKROLL:,.2f}.")
                 except ValueError:
                     print("[!] Invalid dollar amount.")
         else:
-            new_raw = input(f"New paper sandbox bankroll (currently ${config.BANKROLL:,.2f}): ").strip()
+            new_raw = input(f"New paper sandbox bankroll (currently ${cfg.BANKROLL:,.2f}): ").strip()
             if new_raw:
                 try:
                     new_val = max(1.0, float(new_raw))
-                    config.BANKROLL = new_val
+                    cfg.BANKROLL = new_val
                     history.setdefault("wallet_summary", {})["bankroll"] = new_val
                     history["wallet_summary"]["cash"] = new_val
                     save_history(history, profile_id=active_pid)
