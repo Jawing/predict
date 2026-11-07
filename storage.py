@@ -196,6 +196,13 @@ def load_history(profile_id=None):
                     if saved_br and float(saved_br) > 0:
                         cfg.BANKROLL = float(saved_br)
 
+                # Restore profile settings if saved
+                saved_st = data.get("settings")
+                if isinstance(saved_st, dict):
+                    for k in ["MIN_EDGE", "MAX_DAYS", "MIN_DAYS", "EXTREME_ODDS"]:
+                        if k in saved_st:
+                            setattr(cfg, k, saved_st[k])
+
                 return data
         except json.JSONDecodeError:
             pass

@@ -1,3 +1,10 @@
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 """manage.py - History data management and manual resolution utilities.
 
 Allows selective deletion of markets, category clears, manual resolution overrides,
@@ -5,12 +12,12 @@ and interactive settings/filters configuration.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import config as cfg
-from utils import ensure_list, get_history_counts
+from utils import ensure_list, get_history_counts, parse_market_date
 from storage import load_history, save_history, get_active_profile, get_profile_path
 from wallet import update_resolutions
-from model import calculate_base_ego, calculate_trade_ego_metrics
+from model import calculate_base_ego, calculate_trade_ego_metrics, restore_snapshot_to_prediction
 
 
 def delete_specific_markets(history):
@@ -43,26 +50,56 @@ def delete_specific_markets(history):
         for m_id, item in history.get(cat, {}).items():
             if isinstance(item, list) and len(item) > 0:
                 q = item[0].get("question", "Unknown")
-                tranche_info = f" ({len(item)} tranches)" if len(item) > 1 else ""
+                snaps_0 = item[0].get("snapshots")
+                has_snaps = isinstance(snaps_0, list) and len(snaps_0) > 1
+                if len(item) > 1:
+                    sub_info = f" ({len(item)} tranches)"
+                elif has_snaps:
+                    sub_info = f" ({len(snaps_0)} updates)"
+                else:
+                    sub_info = ""
             elif isinstance(item, dict):
                 q = item.get("question", "Unknown")
-                tranche_info = ""
+                sub_info = ""
             else:
                 q = "Unknown"
-                tranche_info = ""
+                sub_info = ""
 
             idx = len(indexed_markets) + 1
             indexed_markets.append((cat, m_id, item))
-            print(f"{idx:<4} | {cat.upper():<9} | {str(m_id):<20} | {q[:45]}{tranche_info}")
+            print(f"{idx:<4} | {cat.upper():<9} | {str(m_id):<20} | {q[:45]}{sub_info}")
+            if isinstance(item, list) and len(item) > 1:
+                for t_i, t_p in enumerate(item, 1):
+                    src = t_p.get("source", "local").upper()
+                    t_pos = t_p.get("position", "Yes")
+                    t_cb = float(t_p.get("cost_basis", 0.0) or 0.0)
+                    t_sh = float(t_p.get("shares", 0.0) or 0.0)
+                    t_k = float(t_p.get("kelly", 0.0) or 0.0)
+                    t_date = str(t_p.get("date", ""))[:16]
+                    t_is = "Staged Tranche" if t_p.get("is_tranche") else ("Wallet Holding" if src == "WALLET" else "Initial Position")
+                    print(f"      |-- {idx}.{t_i}: [{src}] {t_is} ({t_pos}) | Kelly: {t_k*100:.1f}% | ${t_cb:,.2f} ({t_sh:,.1f} sh) | {t_date}")
+            elif isinstance(item, list) and len(item) == 1:
+                p_0 = item[0]
+                snaps = p_0.get("snapshots")
+                if isinstance(snaps, list) and len(snaps) > 1:
+                    for s_i, s in enumerate(snaps, 1):
+                        s_pu = float(s.get("pu", 0.0))
+                        s_pm = float(s.get("pm", 0.0))
+                        s_date = str(s.get("date", ""))[:16]
+                        s_k = float(s.get("kelly", 0.0) or 0.0)
+                        k_str = f" | Kelly: {s_k*100:.1f}%" if s_k > 0 else ""
+                        s_tag = "Initial Prediction" if s_i == 1 else f"Update #{s_i - 1}"
+                        s_src = s.get("source", p_0.get("source", "local")).upper()
+                        print(f"      |-- {idx}.{s_i}: [{s_src}] {s_tag} | pu: {s_pu*100:.1f}% | pm: {s_pm*100:.1f}%{k_str} | {s_date}")
 
     if not indexed_markets:
         print("[!] No markets found in selected filter.")
         return
 
-    print("\nSelect market(s) to delete:")
-    print(" - Single index: '4'")
+    print("\nSelect market(s) or update(s) to delete / undo:")
+    print(" - Single index: '4' (deletes entire market #4)")
     print(" - Multiple indices: '1, 3, 5' or '1-4'")
-    print(" - Specific tranche of a market: '4.2' (market #4, tranche #2)")
+    print(" - Specific update / tranche: '4.2' (market #4, update #2 / tranche #2)")
     print(" - Press Enter to cancel")
 
     del_input = input("> ").strip()
@@ -78,56 +115,80 @@ def delete_specific_markets(history):
                 start, end = map(int, p.split("-"))
                 for i in range(start, end + 1):
                     if 1 <= i <= len(indexed_markets):
-                        to_delete.append((indexed_markets[i - 1], None))
+                        to_delete.append((indexed_markets[i - 1], "market", None))
             elif "." in p:
-                m_idx, t_idx = map(int, p.split("."))
+                m_idx, sub_idx = map(int, p.split("."))
                 if 1 <= m_idx <= len(indexed_markets):
-                    to_delete.append((indexed_markets[m_idx - 1], t_idx - 1))
+                    entry = indexed_markets[m_idx - 1]
+                    cat, m_id, item = entry
+                    if isinstance(item, list) and len(item) > 1:
+                        if 1 <= sub_idx <= len(item):
+                            to_delete.append((entry, "tranche", sub_idx - 1))
+                    elif isinstance(item, list) and len(item) == 1:
+                        snaps = item[0].get("snapshots", [])
+                        if isinstance(snaps, list) and len(snaps) > 1:
+                            if sub_idx == 1:
+                                to_delete.append((entry, "market", None))
+                            elif 1 < sub_idx <= len(snaps):
+                                to_delete.append((entry, "snapshot", sub_idx - 1))
             else:
                 i = int(p)
                 if 1 <= i <= len(indexed_markets):
-                    to_delete.append((indexed_markets[i - 1], None))
+                    to_delete.append((indexed_markets[i - 1], "market", None))
     except ValueError:
         print("[!] Invalid input format. Deletion cancelled.")
         return
 
     if not to_delete:
-        print("[!] No valid markets selected.")
+        print("[!] No valid markets or updates selected.")
         return
 
-    print("\nMarkets marked for deletion:")
-    for (cat, m_id, item), t_idx in to_delete:
+    print("\nMarkets / Updates marked for deletion / rollback:")
+    for (cat, m_id, item), op_type, target_idx in to_delete:
         q = ensure_list(item)[0].get("question", "Unknown") if item else "Unknown"
-        t_str = f" [Tranche #{t_idx + 1}]" if t_idx is not None else " [Entire Market]"
-        print(f" - [{cat.upper()}] {m_id}: {q[:50]}{t_str}")
+        if op_type == "tranche":
+            desc = f" [Tranche #{target_idx + 1}]"
+        elif op_type == "snapshot":
+            desc = f" [Undo Update #{target_idx} -> Rollback to prior state]"
+        else:
+            desc = " [Entire Market]"
+        print(f" - [{cat.upper()}] {m_id}: {q[:45]}{desc}")
 
     confirm = input(
-        f"\nAre you sure you want to delete these {len(to_delete)} item(s)? (y/n): "
+        f"\nAre you sure you want to proceed with these {len(to_delete)} action(s)? (y/n): "
     ).strip().lower()
     if confirm != "y":
-        print("[!] Deletion cancelled.")
+        print("[!] Operation cancelled.")
         return
 
-    grouped_deletions = {}
-    for (cat, m_id, item), t_idx in to_delete:
-        grouped_deletions.setdefault((cat, m_id), []).append(t_idx)
-
-    for (cat, m_id), t_indices in grouped_deletions.items():
+    for (cat, m_id, item), op_type, target_idx in to_delete:
         if cat in history and m_id in history[cat]:
             cat_dict = history[cat]
-            if None in t_indices:
+            if op_type == "market":
                 cat_dict.pop(m_id, None)
-            else:
+            elif op_type == "tranche":
                 curr_list = ensure_list(cat_dict[m_id])
-                del_indices = set(t_indices)
-                new_list = [p for idx, p in enumerate(curr_list) if idx not in del_indices]
+                new_list = [p for idx, p in enumerate(curr_list) if idx != target_idx]
                 if new_list:
                     cat_dict[m_id] = new_list
                 else:
                     cat_dict.pop(m_id, None)
+            elif op_type == "snapshot":
+                curr_list = ensure_list(cat_dict[m_id])
+                if curr_list:
+                    p_target = curr_list[0]
+                    snaps = p_target.get("snapshots", [])
+                    if isinstance(snaps, list) and 0 <= target_idx < len(snaps):
+                        snaps.pop(target_idx)
+                        if snaps:
+                            prev = snaps[-1]
+                            base_ego = calculate_base_ego(history, verbose=False)
+                            restore_snapshot_to_prediction(p_target, prev, base_ego=base_ego)
+                        else:
+                            cat_dict.pop(m_id, None)
 
     save_history(history)
-    print(f"[+] Successfully deleted {len(to_delete)} item(s) from prediction history.\n")
+    print(f"[+] Successfully processed {len(to_delete)} item(s) in prediction history.\n")
 
 
 def clear_specific_category(history):
@@ -161,6 +222,128 @@ def clear_specific_category(history):
         print(f"[+] All '{target_cat}' markets cleared from history.\n")
     else:
         print("[!] Category clear cancelled.")
+
+
+
+
+def prune_closed_skipped_markets(history, verbose=True):
+
+    """Audits history['skipped'] against Polymarket Gamma API and removes closed/resolved markets."""
+
+    skipped = history.get("skipped", {})
+
+    if not skipped:
+
+        if verbose:
+
+            print("[*] No skipped markets in history to prune.")
+
+        return 0
+
+
+
+    all_ids = list(skipped.keys())
+
+    closed_ids = set()
+
+    chunk_size = 40
+
+
+
+    if verbose:
+
+        print(f"[*] Auditing {len(all_ids)} skipped markets against Polymarket Gamma API...")
+
+
+
+    for i in range(0, len(all_ids), chunk_size):
+
+        chunk = all_ids[i:i + chunk_size]
+
+        q_ids = "&".join(f"id={mid}" for mid in chunk if not str(mid).startswith("custom_"))
+
+        if not q_ids:
+
+            continue
+
+        try:
+
+            url = f"{cfg.GAMMA_API}/markets?closed=true&{q_ids}"
+
+            resp = cfg.api.get(url, timeout=8).json()
+
+            if isinstance(resp, list):
+
+                for item in resp:
+
+                    if item.get("closed") or item.get("umaResolutionStatus") in ("resolved", "finalized"):
+
+                        closed_ids.add(str(item.get("id")))
+
+        except Exception as e:
+
+            if verbose:
+
+                print(f"[!] Warning checking chunk: {e}")
+
+
+
+    # Also check end dates for any remaining
+
+    now_utc = datetime.now(timezone.utc)
+
+    for mid, item in list(skipped.items()):
+
+        if str(mid) in closed_ids:
+
+            continue
+
+        if isinstance(item, dict):
+
+            end_d = item.get("endDate") or item.get("end_date")
+
+            if end_d:
+
+                res_dt, _, _ = parse_market_date(end_d)
+
+                if res_dt and res_dt < now_utc - timedelta(days=2):
+
+                    closed_ids.add(str(mid))
+
+
+
+    pruned_count = 0
+
+    for mid in closed_ids:
+
+        if mid in skipped:
+
+            skipped.pop(mid, None)
+
+            pruned_count += 1
+
+
+
+    if pruned_count > 0:
+
+        save_history(history)
+
+        if verbose:
+
+            print(f"[+] Successfully pruned {pruned_count} closed/resolved markets from Skipped ({len(skipped)} remaining active).\n")
+
+    else:
+
+        if verbose:
+
+            print(f"[*] All {len(skipped)} skipped markets are currently active. None pruned.\n")
+
+
+
+    return pruned_count
+
+
+
 
 
 def handle_delete_data():
@@ -222,7 +405,11 @@ def toggle_ego_market_inclusion(history):
     sort_mode = "ego_impact"  # Default: Ego impact (detractors first)
 
     while True:
-        live_bankroll = cfg.BANKROLL if cfg.BANKROLL > 0 else 100.0
+        ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
+        live_bankroll = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
+        if live_bankroll <= 0:
+            live_bankroll = 100.0
+        is_live_w = bool(isinstance(history, dict) and str(history.get("profile_id") or history.get("wallet_address") or "").startswith("0x"))
         all_settled = []
         for cat in ["resolved", "exited"]:
             for m_id, preds in history.get(cat, {}).items():
@@ -234,7 +421,7 @@ def toggle_ego_market_inclusion(history):
                     
                     # Unmask exclude_from_ego temporarily to get intrinsic metrics & weight
                     p["exclude_from_ego"] = False
-                    m_ego = calculate_trade_ego_metrics(p, cat=cat, bankroll=live_bankroll)
+                    m_ego = calculate_trade_ego_metrics(p, cat=cat, bankroll=live_bankroll, is_live_wallet=is_live_w)
                     p["exclude_from_ego"] = is_excl
 
                     # Concluded / settled date resolution (never in future)
@@ -302,7 +489,7 @@ def toggle_ego_market_inclusion(history):
             all_settled.sort(key=lambda x: (0 if x.get("net_adv") is None else 1, x.get("net_adv") or 0.0), reverse=True)
             sort_label = "Net Advantage (Benefactors First)"
         elif sort_mode == "kelly":
-            all_settled.sort(key=lambda x: float(x["ref"].get("kelly", 0.0) or 0.0), reverse=True)
+            all_settled.sort(key=lambda x: float(x.get("weight", 0.0) or 0.0), reverse=True)
             sort_label = "Kelly %"
         elif sort_mode == "pnl":
             all_settled.sort(key=lambda x: x["pnl"], reverse=True)
@@ -322,10 +509,10 @@ def toggle_ego_market_inclusion(history):
         print("-" * 114)
         for i, it in enumerate(all_settled, 1):
             st = "[EXCLUDED]" if it["excluded"] else "[ACTIVE]"
-            k_val = float(it["ref"].get("kelly", 0.0) or 0.0)
+            k_val = float(it.get("weight", 0.0) or 0.0)
             adv_str = f"{it['net_adv']:>+8.4f}"
             dego_str = f"{it['delta_ego']:>+7.4f}"
-            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {k_val*100:>5.1f}% | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {it['question'][:36]}")
+            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {k_val*100:>5.2f}% | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {it['question'][:36]}")
 
         sel = input(f"\nSelect row # to toggle, 'adj <#>' (edit Kelly), 'sort' (toggle view), 'reset', or Enter to finish: ").strip()
         if not sel:
@@ -365,8 +552,8 @@ def toggle_ego_market_inclusion(history):
                 idx = int(parts[1]) - 1
                 if 0 <= idx < len(all_settled):
                     target_item = all_settled[idx]
-                    curr_k = float(target_item["ref"].get("kelly", 0.0) or 0.0)
-                    new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.1f}%, e.g. 1.0 for 1%): ").strip()
+                    curr_k = float(target_item.get("weight", 0.0) or 0.0)
+                    new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.2f}%, e.g. 1.0 for 1%): ").strip()
                     try:
                         clean_k = new_k_raw.strip()
                         if clean_k.endswith("%"):
@@ -376,6 +563,8 @@ def toggle_ego_market_inclusion(history):
                             parsed_num = (raw_num / 100.0) if raw_num >= 1.0 else raw_num
                         new_k_val = max(0.0, min(1.0, parsed_num))
                         target_item["ref"]["kelly"] = new_k_val
+                        target_item["ref"]["entry_kelly"] = new_k_val
+                        target_item["ref"]["actual_kelly"] = new_k_val
                         save_history(history)
                         new_ego = calculate_base_ego(history, verbose=False)
                         delta = new_ego - curr_ego
@@ -433,8 +622,13 @@ def manual_resolve(history):
         return history
 
     bucket_name, preds = combined_open[sel]
-    print(f"\nResolving: {ensure_list(preds)[0].get('question')}")
-    print(" 1: WON / YES (1.0)   2: LOST / NO (0.0)   3: HALF (0.5)")
+    primary_p = ensure_list(preds)[0]
+    pos_side = primary_p.get("position", "Yes")
+    print(f"\nResolving: {primary_p.get('question')} (Position: {pos_side})")
+    if pos_side == "No":
+        print(" 1: WON (1.0) - Market Resolved NO   2: LOST (0.0) - Market Resolved YES   3: HALF / SPLIT (0.5)")
+    else:
+        print(" 1: WON (1.0) - Market Resolved YES  2: LOST (0.0) - Market Resolved NO    3: HALF / SPLIT (0.5)")
     out_sel = input("> ").strip()
     outcome = {"1": 1.0, "2": 0.0, "3": 0.5}.get(out_sel)
     if outcome is None:
@@ -447,8 +641,11 @@ def manual_resolve(history):
         if p.get("realized_pnl") is None or float(p.get("realized_pnl", 0.0) or 0.0) == 0.0:
             cb = float(p.get("cost_basis", 0.0) or 0.0)
             sh = float(p.get("shares", 0.0) or 0.0)
-            if cb == 0.0 and p.get("kelly"):
-                cb = float(p.get("kelly", 0.0)) * cfg.BANKROLL
+            ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
+            active_b = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
+            k_eval = float(p.get("entry_kelly") or p.get("kelly", 0.0) or 0.0)
+            if cb == 0.0 and k_eval > 0:
+                cb = k_eval * active_b
                 if sh == 0.0 and p.get("pm", 0.0):
                     sh = cb / float(p["pm"])
             if sh > 0 or cb > 0:
@@ -486,19 +683,56 @@ def settings_menu():
 
     print("\nEnter setting number to edit [Enter to cancel]:")
     s_choice = input("> ").strip()
-    setting_map = {"1": "MIN_EDGE", "2": "MAX_DAYS", "3": "MIN_DAYS", "4": "EXTREME_ODDS"}
-
-    if s_choice in setting_map:
-        param = setting_map[s_choice]
-        current_val = getattr(cfg, param)
-        new_raw = input(f"New value for {param} (currently {current_val}): ").strip()
+    if s_choice == "1":
+        curr_pct = cfg.MIN_EDGE * 100.0
+        new_raw = input(f"Enter new Min Edge in % (e.g. '1' for 1.0%, '1.5' for 1.5%, currently {curr_pct:.2f}%): ").strip()
         if new_raw:
             try:
-                new_val = float(new_raw)
-                setattr(cfg, param, new_val)
-                print(f"[+] {param} updated to {new_val}.")
+                val_clean = new_raw.replace("%", "").strip()
+                raw_f = float(val_clean)
+                new_val = max(0.0, raw_f / 100.0 if ("%" in new_raw or raw_f >= 0.05) else raw_f)
+                cfg.MIN_EDGE = new_val
+                history.setdefault("settings", {})["MIN_EDGE"] = new_val
+                save_history(history, profile_id=active_pid)
+                print(f"[+] Min Edge updated to {new_val*100:.2f}% (edge hurdle: {new_val:.4f}).")
             except ValueError:
-                print("[!] Invalid value - setting unchanged.")
+                print("[!] Invalid percentage - setting unchanged.")
+    elif s_choice == "2":
+        new_raw = input(f"Enter Max Days horizon (currently {cfg.MAX_DAYS}): ").strip()
+        if new_raw:
+            try:
+                new_val = max(0, int(float(new_raw)))
+                cfg.MAX_DAYS = new_val
+                history.setdefault("settings", {})["MAX_DAYS"] = new_val
+                save_history(history, profile_id=active_pid)
+                print(f"[+] Max Days updated to {new_val} days.")
+            except ValueError:
+                print("[!] Invalid integer - setting unchanged.")
+    elif s_choice == "3":
+        new_raw = input(f"Enter Min Days horizon (currently {cfg.MIN_DAYS}): ").strip()
+        if new_raw:
+            try:
+                new_val = max(0, int(float(new_raw)))
+                cfg.MIN_DAYS = new_val
+                history.setdefault("settings", {})["MIN_DAYS"] = new_val
+                save_history(history, profile_id=active_pid)
+                print(f"[+] Min Days updated to {new_val} days.")
+            except ValueError:
+                print("[!] Invalid integer - setting unchanged.")
+    elif s_choice == "4":
+        curr_pct = cfg.EXTREME_ODDS * 100.0
+        new_raw = input(f"Enter Extreme Odds filter in % (e.g. '5' for 5%, '0' to disable, currently {curr_pct:.2f}%): ").strip()
+        if new_raw:
+            try:
+                val_clean = new_raw.replace("%", "").strip()
+                raw_f = float(val_clean)
+                new_val = max(0.0, min(0.45, raw_f / 100.0 if ("%" in new_raw or raw_f >= 0.5) else raw_f))
+                cfg.EXTREME_ODDS = new_val
+                history.setdefault("settings", {})["EXTREME_ODDS"] = new_val
+                save_history(history, profile_id=active_pid)
+                print(f"[+] Extreme Odds filter updated to {new_val*100:.2f}% (skips odds < {new_val*100:.1f}% or > {(1.0-new_val)*100:.1f}%).")
+            except ValueError:
+                print("[!] Invalid percentage - setting unchanged.")
     elif s_choice == "5":
         if is_wallet:
             curr_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)

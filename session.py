@@ -4,7 +4,9 @@ Handles interactive market streaming, Kelly calculations, VWAP orderbook walking
 and custom hypothetical market calculations.
 """
 
+import copy
 import math
+import time
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
@@ -15,9 +17,11 @@ from utils import (
     format_time_remaining,
     parse_market_date,
     calculate_position_holding,
+    ansi_link,
 )
 from storage import load_history, save_history
 from model import (
+    compute_dynamic_ego,
     calculate_base_ego,
     calculate_allocation,
     calculate_annualized_yield,
@@ -25,6 +29,8 @@ from model import (
     calculate_dynamic_kelly_action,
     parse_user_input,
     calculate_vwap,
+    calculate_optimal_market_buy,
+    restore_snapshot_to_prediction,
 )
 from market import (
     generate_market_stream,
@@ -33,6 +39,7 @@ from market import (
     stream_clob_book,
     get_event_sub_markets,
     get_market_clob_tokens,
+    enrich_market_scale_metrics,
 )
 
 
@@ -83,6 +90,14 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
     parent_title = current_m.get("parent_name") or "Event Sub-Markets"
     current_page = 0
 
+    def _prepare_chosen_sub(raw_sm):
+        chosen = raw_sm.copy()
+        chosen["parent_slug"] = current_m.get("parent_slug")
+        chosen["parent_name"] = current_m.get("parent_name")
+        chosen["event_markets"] = sub_markets
+        chosen["discovery_vector"] = current_m.get("discovery_vector")
+        return enrich_market_scale_metrics(chosen, discovery_vector=current_m.get("discovery_vector"))
+
     while True:
         start_idx = current_page * page_size
         end_idx = min(start_idx + page_size, total_items)
@@ -131,21 +146,13 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
             print("=" * 76)
             sel = input(f"Select # to predict (1-{total_items}) [Enter to cancel]: ").strip()
             if sel.isdigit() and 1 <= int(sel) <= total_items:
-                chosen = available[int(sel) - 1].copy()
-                chosen["parent_slug"] = current_m.get("parent_slug")
-                chosen["parent_name"] = current_m.get("parent_name")
-                chosen["event_markets"] = sub_markets
-                return chosen
+                return _prepare_chosen_sub(available[int(sel) - 1])
             return None
 
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < total_items:
-                chosen = available[idx].copy()
-                chosen["parent_slug"] = current_m.get("parent_slug")
-                chosen["parent_name"] = current_m.get("parent_name")
-                chosen["event_markets"] = sub_markets
-                return chosen
+                return _prepare_chosen_sub(available[idx])
             else:
                 print(f"[!] Invalid selection. Please enter a number between 1 and {total_items}.\n")
                 continue
@@ -159,11 +166,7 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
             idx, chosen = matches[0]
             m_title = chosen.get("groupItemTitle") or chosen.get("question")
             print(f"[+] Matched #{idx + 1}: {m_title}")
-            chosen_ret = chosen.copy()
-            chosen_ret["parent_slug"] = current_m.get("parent_slug")
-            chosen_ret["parent_name"] = current_m.get("parent_name")
-            chosen_ret["event_markets"] = sub_markets
-            return chosen_ret
+            return _prepare_chosen_sub(chosen)
         elif len(matches) > 1:
             print(f"\n[+] Found {len(matches)} matches for '{choice}':")
             for idx, sm in matches:
@@ -172,11 +175,7 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
                 print(f" {idx + 1:2d} | {t_disp}")
             sel = input(f"\nSelect # to predict [Enter to cancel]: ").strip()
             if sel.isdigit() and 1 <= int(sel) <= total_items:
-                chosen = available[int(sel) - 1].copy()
-                chosen["parent_slug"] = current_m.get("parent_slug")
-                chosen["parent_name"] = current_m.get("parent_name")
-                chosen["event_markets"] = sub_markets
-                return chosen
+                return _prepare_chosen_sub(available[int(sel) - 1])
             continue
         else:
             print(f"[!] No matches for '{choice}'. Please enter a number (1-{total_items}), 'n', 'p', or Enter to cancel.\n")
@@ -195,8 +194,10 @@ def _capture_market_state(m, history, portfolio_len):
     }
 
 
-def _check_and_enqueue_sibling_submarket(m, sub_markets, history, session_candidates, session_markets, current_index, portfolio_len):
-    """Offers to predict another sibling sub-market for the parent event."""
+def _check_and_enqueue_sibling_submarket(m, sub_markets, history, session_candidates, session_markets, current_index, portfolio_len, mode="discover"):
+    """Offers to predict another sibling sub-market for the parent event (skipped in targeted mode)."""
+    if mode == "target":
+        return
     avail_after = get_available_sub_markets(m, sub_markets, history, session_candidates)
     if avail_after:
         another = input(f"Predict another sub-market for '{m.get('parent_name')}'? [y/N]: ").strip().lower()
@@ -207,14 +208,98 @@ def _check_and_enqueue_sibling_submarket(m, sub_markets, history, session_candid
                 session_markets.insert(current_index + 1, chosen)
 
 
-def _print_market_card(m, exact_date_str, days_str, num_avail, event_url):
-    """Renders the standard terminal market header card."""
+def _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discovery_order=None):
+    """Renders the standard terminal market header card with CEY, EII, Volume, and active discovery vector value."""
     sub_tag = f" ({num_avail} other available)" if num_avail > 0 else ""
     print(f"==================================================")
     print(f"Event    : {m.get('parent_name')}{sub_tag}")
     print(f"URL      : {event_url}")
     print(f"Market   : {m.get('question', 'unknown')}")
-    print(f"Resolves : {exact_date_str} ({days_str})\n")
+    print(f"Resolves : {exact_date_str} ({days_str})")
+
+    enrich_market_scale_metrics(m)
+    vol_val = float(m.get("volume", 0.0) or m.get("volumeNum", 0.0) or 0.0)
+    eii_val = float(m.get("eii", 0.0) or 0.0)
+    cey_val = float(m.get("cey", 0.0) or 0.0)
+
+    parts = [
+        f"CEY: {cey_val:,.0f}",
+        f"EII: ${eii_val:,.0f}",
+        f"Vol: ${vol_val:,.0f}",
+    ]
+
+    vec = str(m.get("discovery_vector") or discovery_order or "").lower()
+    if vec == "volume24hr":
+        v24 = float(m.get("volume24hr", 0.0) or 0.0)
+        parts.append(f"24h Vol: ${v24:,.0f}")
+    elif vec == "liquidity":
+        liq = float(m.get("liquidity", 0.0) or m.get("liquidityNum", 0.0) or 0.0)
+        parts.append(f"Liq: ${liq:,.0f}")
+    elif vec == "competitive":
+        comp = float(m.get("competitive") if m.get("competitive") is not None else m.get("eff", 0.0) or 0.0)
+        parts.append(f"Comp: {comp*100:.1f}%")
+    elif vec == "startdate":
+        s_date = str(m.get("startDate") or "")[:10] or "unknown"
+        parts.append(f"Listed: {s_date}")
+    elif vec in ("enddate", "enddate_desc"):
+        d_u = float(m.get("days_until", 0.0) or 0.0)
+        lbl = "Soonest" if vec == "enddate" else "Far Horizon"
+        parts.append(f"{lbl}: {d_u:.1f}d")
+    elif vec == "volume_asc":
+        parts.append(f"Niche Vol: ${vol_val:,.0f}")
+
+    print(f"Scale    : {' | '.join(parts)}")
+    print()
+
+
+def _print_market_resolution_details(m, exact_date_str, days_str):
+    """Fetches and displays full resolution criteria, sources, and rules for market m."""
+    desc = m.get("description")
+    ev_desc = m.get("event_description")
+    res_src = m.get("resolutionSource")
+
+    if not desc:
+        m_id = m.get("id")
+        if m_id and not str(m_id).startswith("custom_"):
+            try:
+                resp = cfg.api.get(f"{cfg.GAMMA_API}/markets/{m_id}", timeout=5).json()
+                if isinstance(resp, dict):
+                    desc = resp.get("description")
+                    if not res_src:
+                        res_src = resp.get("resolutionSource")
+                    m["description"] = desc
+                    if res_src:
+                        m["resolutionSource"] = res_src
+            except Exception:
+                pass
+
+    if not desc and not ev_desc:
+        ev_slug = m.get("parent_slug") or m.get("slug")
+        if ev_slug and ev_slug != "unknown":
+            try:
+                ev_list = cfg.api.get(f"{cfg.GAMMA_API}/events?slug={ev_slug}", timeout=5).json()
+                if isinstance(ev_list, list) and ev_list:
+                    ev_desc = ev_list[0].get("description")
+                    if not res_src:
+                        res_src = ev_list[0].get("resolutionSource")
+            except Exception:
+                pass
+
+    print("\n" + "-" * 72)
+    print(" RESOLUTION CRITERIA & MARKET DETAILS ".center(72, "="))
+    print("-" * 72)
+    print(f"Market   : {m.get('question', 'unknown')}")
+    if res_src:
+        print(f"Source   : {res_src}")
+    print(f"Resolves : {exact_date_str} ({days_str})")
+
+    content = desc or ev_desc
+    if content:
+        print("\nRules & Resolution Condition:")
+        print(content.strip())
+    else:
+        print("\n[!] No specific resolution text provided by the API for this market.")
+    print("-" * 72 + "\n")
 
 
 def run_prediction_session(
@@ -243,11 +328,34 @@ def run_prediction_session(
     for pred_value in history.get("predicted", {}).values():
         preds = ensure_list(pred_value)
         for p in preds:
+            cur_p_v = float(p.get("cur_pm") if p.get("cur_pm") is not None else p.get("pm", 0.5))
+            lv_p, h_k_p, _ = calculate_position_holding(p, cur_p_v, current_bankroll)
+            is_h_p = (h_k_p > 0 or lv_p > 0)
+            eval_px_p = p.get("cur_pm") if is_h_p else (float(p.get("bestAsk") or p.get("cur_pm") or p.get("pm", 0.5)))
+            f_rate_p = float(p.get("fee_rate", 0.0) or 0.0)
+            ego_p = compute_dynamic_ego(base_ego, float(p.get("u_spread", 0.0) or 0.0))
             lm_p = calculate_logistic_metrics(
-                p.get("pu", 0.5), p.get("pm", 0.5), float(p.get("dynamic_ego", base_ego)),
-                held_kelly=float(p.get("kelly", 0.0) or 0.0), cur_pm=p.get("cur_pm")
+                p.get("pu", 0.5), p.get("pm", 0.5), ego_p,
+                held_kelly=None, cur_pm=eval_px_p,
+                fee_rate=(0.0 if is_h_p else f_rate_p)
             )
-            cumulative_exposure += lm_p["eff_kelly"]
+            if is_h_p:
+                sp_p = float(p.get("spread", 0.01) or 0.01)
+                k_p = max(0.0, float(p.get("entry_kelly") or p.get("effective_kelly", 0.0) or p.get("kelly", 0.0) or 0.0))
+                dyn_p = calculate_dynamic_kelly_action(
+                    win_prob_bal=lm_p["win_prob_bal"],
+                    cur_p=cur_p_v,
+                    held_frac=h_k_p,
+                    bankroll=current_bankroll,
+                    fee_rate=f_rate_p,
+                    half_spread=max(0.0005, sp_p / 2.0),
+                    entry_kelly=max(lm_p["eff_kelly"], k_p),
+                    best_bid=p.get("bestBid"),
+                    best_ask=p.get("bestAsk")
+                )
+                cumulative_exposure += dyn_p["f_star_eff"]
+            else:
+                cumulative_exposure += lm_p["eff_kelly"]
 
     vec_note = f" | {discovery_order.upper()}" if mode == "discover" else ""
     cat_note = f" [{category.upper()}]" if mode == "discover" and category.upper() != "ALL" else ""
@@ -282,7 +390,8 @@ def run_prediction_session(
                 new_m["original_state"] = _capture_market_state(new_m, history, len(portfolio_data))
                 session_markets.append(new_m)
             except (StopIteration, TypeError):
-                print("\n[*] Data stream ended or exhausted.")
+                if not target_market_id:
+                    print("\n[*] Data stream ended or exhausted.")
                 break
 
         m = session_markets[current_index]
@@ -304,14 +413,25 @@ def run_prediction_session(
         exact_date_str = res_dt.strftime("%B %d, %Y") if res_dt else "unknown"
         days_str = format_time_remaining(seconds_left) if seconds_left is not None else "unknown"
 
-        _print_market_card(m, exact_date_str, days_str, num_avail, event_url)
+        _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discovery_order=discovery_order)
 
-        prompt_sub = f", 'sub' (list {num_avail} mkts)" if num_avail > 0 else ""
+        prompt_sub = f", 'o' (list {num_avail} mkts)" if num_avail > 0 else ""
+        existing_preds_check = ensure_list(history.get("predicted", {}).get(market_id, []))
+        has_undo_opt = False
+        if existing_preds_check:
+            s_chk = existing_preds_check[0].get("snapshots")
+            if isinstance(s_chk, list) and len(s_chk) >= 2:
+                has_undo_opt = True
+        prompt_undo = ", 'u' (undo update)" if has_undo_opt else ""
+
         while True:
             user_input = input(
-                f"Enter % bounds ('36-48' or '42'){prompt_sub}, 'l' (live), 's' (skip), 'r' (redo), 'q' (quit): "
+                f"Enter % bounds ('36-48' or '42'){prompt_sub}{prompt_undo}, 'd' (details), 'l' (live), 's' (skip), 'r' (redo), 'q' (quit): "
             ).strip()
             cmd_parts = user_input.split()
+            if cmd_parts and cmd_parts[0].lower() in ("d", "details", "rules", "info", "cond", "condition"):
+                _print_market_resolution_details(m, exact_date_str, days_str)
+                continue
             if cmd_parts and cmd_parts[0].lower() in ("l", "live"):
                 custom_tok = cmd_parts[1] if len(cmd_parts) > 1 else None
                 follow_up = stream_clob_book(m, custom_token_id=custom_tok)
@@ -320,12 +440,14 @@ def run_prediction_session(
                     user_input = follow_up
                     break
                 continue
-            if user_input.lower() in ("sub", "m", "markets", "list") and num_avail > 0:
+            if user_input.lower() in ("o", "sub", "m", "markets", "list") and num_avail > 0:
                 chosen = select_sub_market(m, sub_markets, history, session_candidates)
                 if chosen:
                     chosen = refresh_prices_from_clob(chosen)
                     b_p, a_p, m_p = extract_prices(chosen)
                     chosen["cached_bid"], chosen["cached_ask"], chosen["cached_mid"] = b_p, a_p, m_p
+                    chosen["_selected_via_sub"] = True
+
                     chosen["original_state"] = _capture_market_state(chosen, history, len(portfolio_data))
                     session_markets[current_index] = chosen
                     m = chosen
@@ -339,8 +461,8 @@ def run_prediction_session(
                     pm_bid, pm_ask, pm_mid = m["cached_bid"], m["cached_ask"], m["cached_mid"]
                     avail_subs = get_available_sub_markets(m, sub_markets, history, session_candidates)
                     num_avail = len(avail_subs)
-                    prompt_sub = f", 'sub' (list {num_avail} mkts)" if num_avail > 0 else ""
-                    _print_market_card(m, exact_date_str, days_str, num_avail, event_url)
+                    prompt_sub = f", 'o' (list {num_avail} mkts)" if num_avail > 0 else ""
+                    _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discovery_order=discovery_order)
                     continue
                 else:
                     continue
@@ -349,6 +471,26 @@ def run_prediction_session(
         if user_input.lower() == "q":
             print("\nSaving and quitting session...")
             break
+
+        elif user_input.lower() in ("u", "undo"):
+            existing_preds = ensure_list(history.get("predicted", {}).get(market_id, []))
+            if existing_preds:
+                primary_p = existing_preds[0]
+                snaps = primary_p.get("snapshots")
+                if isinstance(snaps, list) and len(snaps) >= 2:
+                    popped = snaps.pop()
+                    prev = snaps[-1]
+                    restore_snapshot_to_prediction(primary_p, prev, base_ego=base_ego)
+                    save_history(history)
+                    print(f"\n[+] Undid latest update. Reverted to previous snapshot: pu={primary_p['pu']*100:.1f}%, pm={primary_p['pm']*100:.1f}% ({prev.get('date', 'prior')})\n")
+                    current_index += 1
+                    continue
+                else:
+                    print("\n[!] No previous updates to undo for this market (only initial prediction exists).\n")
+                    continue
+            else:
+                print("\n[!] Market is not currently predicted. Nothing to undo.\n")
+                continue
 
         elif user_input.lower() == "r":
             if current_index > 0:
@@ -388,9 +530,6 @@ def run_prediction_session(
                     "slug": event_slug,
                     "date": today_str,
                 }
-            _check_and_enqueue_sibling_submarket(
-                m, sub_markets, history, session_candidates, session_markets, current_index, len(portfolio_data)
-            )
             current_index += 1
             continue
 
@@ -408,6 +547,7 @@ def run_prediction_session(
             is_existing = len(existing_preds) > 0
             live_held_val = 0.0
             held_shares = 0.0
+            has_real_holdings = False
             if is_existing:
                 for p in existing_preds:
                     is_p_no = (p.get("position", "Yes") == "No")
@@ -415,16 +555,18 @@ def run_prediction_session(
                     v, _, sh = calculate_position_holding(p, p_live, current_bankroll)
                     live_held_val += v
                     held_shares += sh
+                    if (p.get("source") == "wallet") or (float(p.get("shares", 0.0) or 0.0) > 0) or (float(p.get("cost_basis", 0.0) or 0.0) > 0):
+                        has_real_holdings = True
 
-            held_mtm_k = (live_held_val / current_bankroll) if (current_bankroll > 0 and live_held_val > 0) else sum(float(p.get("kelly", 0.0) or 0.0) for p in existing_preds)
+            held_mtm_k = (live_held_val / current_bankroll) if (current_bankroll > 0 and live_held_val > 0) else (sum(float(p.get("kelly", 0.0) or 0.0) for p in existing_preds) if has_real_holdings else 0.0)
+            cumul_auth_k = sum(float(p.get("entry_kelly", 0.0) or p.get("effective_kelly", 0.0) or p.get("kelly", 0.0) or 0.0) for p in existing_preds) if is_existing else 0.0
 
             action, true_price, raw_kelly, eff_kelly, full_alloc, dynamic_ego, edge, lm = calculate_allocation(
-                lower, upper, pm_bid, pm_ask, fee_rate, current_bankroll, base_ego,
-                held_kelly=held_mtm_k if is_existing else None
+                lower, upper, pm_bid, pm_ask, fee_rate, current_bankroll, base_ego
             )
 
             # Incremental tranche allocation if position already held
-            if is_existing and held_mtm_k > 0:
+            if has_real_holdings and held_mtm_k > 0:
                 delta_k = max(0.0, eff_kelly - held_mtm_k)
                 final_alloc = delta_k * current_bankroll
             else:
@@ -436,11 +578,14 @@ def run_prediction_session(
 
             roi, apy = calculate_annualized_yield(edge, true_price, days_until)
 
-            # Orderbook VWAP calculation
+            # Orderbook VWAP & Optimal Immediate Market-Buy calculation
             vwap_true = true_price
             slippage = 0.0
             adjusted_edge = edge
             adjusted_apy = apy
+            opt_buy_usd = None
+            opt_buy_vwap = None
+            opt_buy_edge = None
 
             if action in ["YES", "NO"] and final_alloc > 0:
                 yes_token, no_token = get_market_clob_tokens(m)
@@ -454,26 +599,36 @@ def run_prediction_session(
                     except Exception:
                         pass
                 if asks_list:
-                    vwap, _ = calculate_vwap(asks_list, final_alloc)
-                    if vwap > 0:
-                        vwap_true = vwap + (fee_rate * vwap * (1.0 - vwap))
-                        slippage = max(0.0, vwap_true - true_price)
-                        win_prob = true_price + edge
-                        adjusted_edge = win_prob - vwap_true
+                    p_norm_eval = lm["pu_norm"] if action == "YES" else (1.0 - lm["pu_norm"])
+                    opt_usd, opt_vwap, opt_edge = calculate_optimal_market_buy(
+                        asks_list, final_alloc, p_norm=p_norm_eval,
+                        fee_rate=fee_rate, min_edge=cfg.MIN_EDGE
+                    )
+                    opt_buy_usd = opt_usd
+                    opt_buy_vwap = opt_vwap
+                    opt_buy_edge = opt_edge
+                    if opt_usd > 0:
+                        vwap_true = opt_vwap
+                        raw_ask = pm_ask if action == "YES" else (1.0 - pm_bid)
+                        slippage = max(0.0, vwap_true - raw_ask)
+                        adjusted_edge = opt_edge
                         _, adjusted_apy = calculate_annualized_yield(adjusted_edge, vwap_true, days_until)
-                        if adjusted_edge < cfg.MIN_EDGE:
-                            action = "THIN_EDGE"
+                    else:
+                        adjusted_edge = opt_edge
+                        action = "THIN_EDGE"
 
             pu_mid_val = (lower + upper) / 2.0
 
             pos_side = action.capitalize() if action in ("YES", "NO") else ("Yes" if lm["is_yes"] else "No")
             is_pos_no = (pos_side == "No")
             stored_pu = round(1.0 - pu_mid_val, 6) if is_pos_no else round(pu_mid_val, 6)
-            stored_pm = round(true_price if true_price > 0 else (1.0 - pm_mid), 6) if is_pos_no else round(pm_mid, 6)
+            stored_pm = round(1.0 - pm_mid, 6) if is_pos_no else round(pm_mid, 6)
             stored_cur_pm = round(1.0 - pm_mid, 6) if is_pos_no else round(pm_mid, 6)
+            stored_entry_px = round(vwap_true if vwap_true > 0 else (true_price if true_price > 0 else pm_mid), 4)
+
             if is_pos_no:
                 lm = calculate_logistic_metrics(
-                    stored_pu, stored_pm, dynamic_ego, held_kelly=eff_kelly if is_existing else raw_kelly,
+                    stored_pu, stored_pm, dynamic_ego,
                     cur_pm=stored_cur_pm, fee_rate=fee_rate
                 )
 
@@ -481,146 +636,381 @@ def run_prediction_session(
                 lm["regime"] = "ACTIVE"
 
             if is_existing:
-                primary_p = existing_preds[0].copy()
+                wallet_items = [p for p in existing_preds if p.get("source") == "wallet"]
+                if wallet_items:
+                    primary_p = copy.deepcopy(wallet_items[0])
+                    tot_cb = sum(float(w.get("cost_basis", 0.0) or 0.0) for w in wallet_items)
+                    tot_sh = sum(float(w.get("shares", 0.0) or 0.0) for w in wallet_items)
+                    primary_p["cost_basis"] = round(tot_cb, 4)
+                    primary_p["shares"] = round(tot_sh, 4)
+                else:
+                    primary_p = copy.deepcopy(existing_preds[0])
+
+                # Capture full pre-update state BEFORE mutating primary_p
+                prior_pu = float(primary_p.get("pu", stored_pu))
+                prior_pm = float(primary_p.get("pm", stored_pm))
+                prior_entry_px = float(primary_p.get("entry_price") or prior_pm)
+                prior_k = float(primary_p.get("kelly") or primary_p.get("entry_kelly") or 0.0)
+                prior_entry_k = float(primary_p.get("entry_kelly") or prior_k)
+                prior_raw_k = float(primary_p.get("raw_kelly") or prior_k)
+                prior_edge = float(primary_p.get("edge", 0.0) or 0.0)
+                prior_apy = float(primary_p.get("apy", 0.0) or 0.0)
+                prior_ego = float(primary_p.get("dynamic_ego", dynamic_ego))
+                prior_date = str(primary_p.get("date", today_str))
+                prior_action = primary_p.get("action", "HOLD")
+                prior_source = primary_p.get("source", "local")
+
+                now_ts = int(time.time())
+                prior_snap_defaults = {
+                    "ts": int(primary_p.get("last_synced_ts") or now_ts),
+                    "date": prior_date,
+                    "pu": prior_pu,
+                    "pm": prior_pm,
+                    "entry_price": prior_entry_px,
+                    "kelly": prior_k,
+                    "entry_kelly": prior_entry_k,
+                    "raw_kelly": prior_raw_k,
+                    "edge": prior_edge,
+                    "apy": prior_apy,
+                    "dynamic_ego": prior_ego,
+                    "action": prior_action,
+                    "source": prior_source,
+                }
+                if "snapshots" not in primary_p or not isinstance(primary_p["snapshots"], list) or not primary_p["snapshots"]:
+                    primary_p["snapshots"] = [prior_snap_defaults]
+                else:
+                    last_existing = primary_p["snapshots"][-1]
+                    if isinstance(last_existing, dict):
+                        for k_def, v_def in prior_snap_defaults.items():
+                            if last_existing.get(k_def) is None:
+                                last_existing[k_def] = v_def
+
+                if has_real_holdings:
+                    pos_side = primary_p.get("position", pos_side)
+                    is_pos_no = (pos_side == "No")
+                    stored_pu = round(1.0 - pu_mid_val, 6) if is_pos_no else round(pu_mid_val, 6)
+                    stored_cur_pm = round(1.0 - pm_mid, 6) if is_pos_no else round(pm_mid, 6)
+                    stored_entry_px = primary_p.get("entry_price") or stored_entry_px
+                    primary_p["entry_price"] = stored_entry_px
+                    primary_p["entry_kelly"] = float(primary_p.get("entry_kelly", 0.0) or primary_p.get("kelly", 0.0) or eff_kelly)
+                    stored_pm = stored_cur_pm
+                    primary_p["pm"] = stored_pm
+                    # Recompute logistic metrics anchored to current decision market quote
+                    lm_fee = calculate_logistic_metrics(
+                        stored_pu, stored_pm, dynamic_ego,
+                        held_kelly=None,
+                        cur_pm=stored_cur_pm, fee_rate=fee_rate
+                    )
+                    lm = calculate_logistic_metrics(
+                        stored_pu, stored_pm, dynamic_ego,
+                        held_kelly=held_mtm_k if held_mtm_k > 0 else None,
+                        cur_pm=stored_cur_pm, fee_rate=0.0
+                    )
+                    adjusted_edge = lm["live_active_edge"]
+                    _, adjusted_apy = calculate_annualized_yield(adjusted_edge, stored_cur_pm, days_until)
+                    eff_kelly = lm_fee["eff_live_model_kelly"]
+                    raw_kelly = lm_fee["live_model_kelly"]
+                    if lm["live_active_edge"] <= 0:
+                        action = "OVER-TGT"
+                else:
+                    primary_p["entry_price"] = primary_p.get("entry_price") or stored_entry_px
+                    stored_pm = stored_cur_pm
+                    primary_p["pm"] = stored_pm
+
                 primary_p["pu"] = stored_pu
+                primary_p["u_spread"] = round(upper - lower, 6)
                 primary_p["cur_pm"] = stored_cur_pm
                 primary_p["dynamic_ego"] = dynamic_ego
                 primary_p["edge"] = adjusted_edge
                 primary_p["apy"] = adjusted_apy
                 primary_p["date"] = today_str
-                if delta_k >= 0.005:
-                    primary_p["kelly"] = raw_kelly
-                    new_shares = final_alloc / true_price if true_price > 0 else 0.0
-                    old_cb = float(primary_p.get("cost_basis", 0.0) or 0.0)
-                    old_sh = float(primary_p.get("shares", 0.0) or (old_cb / float(primary_p.get("pm", stored_pm))))
-                    tot_sh = old_sh + new_shares
-                    tot_cb = old_cb + final_alloc
-                    primary_p["cost_basis"] = round(tot_cb, 4)
-                    primary_p["shares"] = round(tot_sh, 4)
-                    primary_p["pm"] = round(tot_cb / tot_sh, 6) if tot_sh > 0 else stored_pm
-                    primary_p["tranche_added"] = final_alloc
-                    if m.get("endDate"):
-                        primary_p["endDate"] = m.get("endDate")
-                    if m.get("volume") is not None:
-                        primary_p["volume"] = float(m.get("volume") or 0.0)
-                    if m.get("volume24hr") is not None:
-                        primary_p["volume24hr"] = float(m.get("volume24hr") or 0.0)
-                elif primary_p.get("kelly") is None or float(primary_p.get("kelly", 0.0)) <= 0:
-                    primary_p["kelly"] = raw_kelly
+                primary_p["position"] = pos_side
+                primary_p["spread"] = float(m.get("spread") or (pm_ask - pm_bid) or 0.01)
+                primary_p["volume"] = float(m.get("volume") or 0.0)
+                primary_p["volume24hr"] = float(m.get("volume24hr") or 0.0)
+                primary_p["fee_rate"] = fee_rate
+                primary_p["entry_bankroll"] = float(primary_p.get("entry_bankroll") or current_bankroll)
+
+                if has_real_holdings:
+                    primary_p["entry_kelly"] = max(float(primary_p.get("entry_kelly", 0.0) or 0.0), eff_kelly)
+                else:
+                    primary_p["entry_kelly"] = eff_kelly
+
+                new_snap = {
+                    "ts": now_ts,
+                    "date": today_str,
+                    "pu": stored_pu,
+                    "pm": stored_cur_pm,
+                    "entry_price": stored_entry_px,
+                    "kelly": eff_kelly,
+                    "entry_kelly": float(primary_p.get("entry_kelly", eff_kelly)),
+                    "raw_kelly": raw_kelly,
+                    "edge": adjusted_edge,
+                    "apy": adjusted_apy,
+                    "dynamic_ego": dynamic_ego,
+                    "action": action,
+                    "source": "wallet" if has_real_holdings else "local",
+                }
+
+                last_snap = primary_p["snapshots"][-1]
+                snap_appended = False
+                if (
+                    abs(float(last_snap.get("pu", 0.0)) - stored_pu) > 1e-4
+                    or abs(float(last_snap.get("pm", 0.0)) - stored_cur_pm) > 1e-4
+                    or abs(float(last_snap.get("dynamic_ego", dynamic_ego)) - dynamic_ego) > 1e-4
+                ):
+                    primary_p["snapshots"].append(new_snap)
+                    snap_appended = True
+
+                primary_p["kelly"] = eff_kelly
+                primary_p["raw_kelly"] = raw_kelly
+                primary_p["action"] = action
+                primary_p["is_watch"] = (action == "WATCH")
+                primary_p["opt_buy_usd"] = opt_buy_usd
+                primary_p["opt_buy_vwap"] = opt_buy_vwap
+                primary_p["opt_buy_edge"] = opt_buy_edge
+                primary_p["vwap"] = vwap_true
+                primary_p["slippage"] = slippage
                 candidate_to_commit = primary_p
             else:
+                commit_k = eff_kelly
+                commit_raw_k = raw_kelly
+                cand_action = action
+                snap_appended = True
                 candidate_to_commit = {
                     "question": question,
                     "slug": event_slug,
+                    "entry_price": stored_entry_px,
                     "date": today_str,
                     "pu": stored_pu,
+                    "u_spread": round(upper - lower, 6),
                     "pm": stored_pm,
                     "cur_pm": stored_cur_pm,
+                    "snapshots": [{
+                        "ts": int(time.time()),
+                        "date": today_str,
+                        "pu": stored_pu,
+                        "pm": stored_pm,
+                        "entry_price": stored_entry_px,
+                        "kelly": commit_k,
+                        "entry_kelly": commit_k,
+                        "raw_kelly": commit_raw_k,
+                        "edge": adjusted_edge,
+                        "apy": adjusted_apy,
+                        "dynamic_ego": dynamic_ego,
+                        "action": cand_action,
+                        "source": "local",
+                    }],
                     "dynamic_ego": dynamic_ego,
-                    "kelly": raw_kelly,
+                    "kelly": commit_k,
+                    "entry_kelly": commit_k,
+                    "raw_kelly": commit_raw_k,
                     "edge": adjusted_edge,
                     "apy": adjusted_apy,
+                    "fee_rate": fee_rate,
                     "conditionId": m.get("conditionId"),
                     "position": pos_side,
                     "source": "local",
-                    "cost_basis": round(final_alloc, 4),
-                    "shares": round(final_alloc / true_price, 4) if true_price > 0 else 0.0,
+                    "action": cand_action,
+                    "is_watch": (cand_action == "WATCH"),
+                    "cost_basis": 0.0,
+                    "shares": 0.0,
+                    "entry_bankroll": current_bankroll,
                     "endDate": m.get("endDate"),
+                    "clobTokenIds": m.get("clobTokenIds"),
                     "volume": float(m.get("volume") or 0.0),
                     "volume24hr": float(m.get("volume24hr") or 0.0),
+                    "spread": float(m.get("spread") or (pm_ask - pm_bid) or 0.01),
+                    "opt_buy_usd": opt_buy_usd,
+                    "opt_buy_vwap": opt_buy_vwap,
+                    "opt_buy_edge": opt_buy_edge,
+                    "vwap": vwap_true,
+                    "slippage": slippage,
                 }
 
             norm_target = lm["target_win_m"]
             side_tag = f" ({pos_side})" if is_pos_no else ""
-            print(f"\n--- MARKET ANALYSIS ---")
-            print(f"Spread       : Bid {pm_bid*100:.1f}% | Ask {pm_ask*100:.1f}% (Spread: {(pm_ask - pm_bid)*100:.1f}%)")
-            conv_str = f"User {lower*100:.1f}%" if lower == upper else f"User [{lower*100:.1f}%-{upper*100:.1f}%]"
-            print(f"Conviction   : {conv_str} -> Active Target: {norm_target*100:.1f}%{side_tag} (Ego: {dynamic_ego:.2f})")
-            ref_px = stored_pm if not is_existing else stored_cur_pm
-            dist_tgt = norm_target - ref_px
-            print(f"Runway       : {dist_tgt*100:+.1f}% | Efficiency: {lm['eff_live']*100:.1f}% ({lm['regime']})")
+            if is_pos_no:
+                no_bid = 1.0 - pm_ask
+                no_ask = 1.0 - pm_bid
+                no_mid = 1.0 - pm_mid
+                u_no_low = (1.0 - upper) * 100.0
+                u_no_high = (1.0 - lower) * 100.0
+                conv_yes_str = f"User YES {lower*100:.1f}%" if lower == upper else f"User YES [{lower*100:.1f}%-{upper*100:.1f}%]"
+                conv_no_str = f"User NO {u_no_low:.1f}%" if lower == upper else f"User NO [{u_no_low:.1f}%-{u_no_high:.1f}%]"
+                print(f"\n--- MARKET ANALYSIS [Side: NO (Betting AGAINST question)] ---")
+                print(f"NO Contract  : Bid {no_bid*100:.1f}% | Ask {no_ask*100:.1f}% (Mid: {no_mid*100:.1f}%) [YES Mid: {pm_mid*100:.1f}%]")
+                print(f"Conviction   : {conv_yes_str} -> {conv_no_str} -> Target NO: {norm_target*100:.1f}% (Ego: {dynamic_ego:.2f})")
+                ref_px = stored_cur_pm if is_existing else stored_pm
+                dist_tgt = norm_target - ref_px
+                print(f"Runway       : {dist_tgt*100:+.1f}% | Efficiency: {lm['eff_live']*100:.1f}% ({lm['regime']})")
+            else:
+                print(f"\n--- MARKET ANALYSIS ---")
+                print(f"Spread       : Bid {pm_bid*100:.1f}% | Ask {pm_ask*100:.1f}% (Spread: {(pm_ask - pm_bid)*100:.1f}%)")
+                conv_str = f"User {lower*100:.1f}%" if lower == upper else f"User [{lower*100:.1f}%-{upper*100:.1f}%]"
+                print(f"Conviction   : {conv_str} -> Active Target: {norm_target*100:.1f}% (Ego: {dynamic_ego:.2f})")
+                ref_px = stored_cur_pm if is_existing else stored_pm
+                dist_tgt = norm_target - ref_px
+                print(f"Runway       : {dist_tgt*100:+.1f}% | Efficiency: {lm['eff_live']*100:.1f}% ({lm['regime']})")
 
             vel_str = format_velocity_display(adjusted_edge, vwap_true, days_until) if (action in ["YES", "NO"] and final_alloc > 0 and adjusted_edge > 0) else "N/A (No trade / 0 allocation)"
             print(f"Velocity     : {vel_str}")
 
-            if action in ["YES", "NO"]:
-                if is_existing and (held_mtm_k > 0 or live_held_val > 0):
-                    spread_val = (pm_ask - pm_bid) if (pm_ask > pm_bid) else 0.01
-                    half_sp = max(0.0025, spread_val / 2.0)
-                    dyn_action = calculate_dynamic_kelly_action(
-                        win_prob_bal=norm_target,
-                        cur_p=ref_px,
-                        held_frac=held_mtm_k,
-                        bankroll=current_bankroll,
-                        fee_rate=fee_rate,
-                        half_spread=half_sp
-                    )
-                    action_label = dyn_action["action_label"]
-                    print(f"Action       : {action_label} | Net Edge: {adjusted_edge*100:+.2f}%")
-                    sh_tag = f" | {held_shares:,.1f} shares" if held_shares > 0 else ""
-                    dyn_target_usd = dyn_action["f_star_hold"] * current_bankroll
-                    print(f"Position     : Held {held_mtm_k*100:.2f}% (${live_held_val:,.2f}{sh_tag}) -> Dynamic Optimal {dyn_action['f_star_hold']*100:.2f}% (${dyn_target_usd:,.2f})")
-                else:
-                    slip_note = f" (Slippage: +{slippage*100:.2f}%)" if slippage > 0.0001 else ""
-                    print(f"Action       : BUY {action} @ {vwap_true*100:.1f}% VWAP{slip_note} | Net Edge: {adjusted_edge*100:+.2f}%")
-                    print(f"Allocation   : ${final_alloc:,.2f} ({eff_kelly*100:.2f}% Eff-Kelly | {raw_kelly*100:.2f}% Raw)")
+            def _print_cash_shortfall_alert(req_alloc):
+                ws_curr = history.get("wallet_summary", {})
+                wallet_cash = float(ws_curr.get("cash", current_bankroll) or current_bankroll) if isinstance(ws_curr, dict) else current_bankroll
+                if req_alloc > wallet_cash + 0.50:
+                    shortfall = req_alloc - wallet_cash
+                    print(f"Cash Alert   : Target allocation exceeds cash by ${shortfall:,.2f} (Available Cash: ${wallet_cash:,.2f})")
+                    rebal_candidates = []
+                    for m_id, p_list in history.get("predicted", {}).items():
+                        if str(m_id) == str(market_id):
+                            continue
+                        for p_item in ensure_list(p_list):
+                            if p_item.get("source") == "wallet":
+                                p_ed = float(p_item.get("edge", 0.0) or 0.0)
+                                p_sh = float(p_item.get("shares", 0.0) or 0.0)
+                                p_cp = float(p_item.get("cur_pm", p_item.get("pm", 0.5)))
+                                p_val = p_sh * p_cp
+                                if p_val > 1.0:
+                                    rebal_candidates.append((p_val, p_ed, p_item.get("question", "")))
+                    rebal_candidates.sort(key=lambda x: x[1])
+                    if rebal_candidates:
+                        c_val, c_edge, c_q = rebal_candidates[0]
+                        c_q_disp = (c_q[:35] + "...") if len(c_q) > 38 else c_q
+                        print(f"  -> Rebalance Suggestion: Liquidate/Trim {c_q_disp} [Edge: {c_edge*100:+.1f}% | Equity: ${c_val:,.2f}]")
 
-                    ws_curr = history.get("wallet_summary", {})
-                    wallet_cash = float(ws_curr.get("cash", current_bankroll) or current_bankroll) if isinstance(ws_curr, dict) else current_bankroll
-                    if final_alloc > wallet_cash + 0.50:
-                        shortfall = final_alloc - wallet_cash
-                        print(f"Cash Alert   : Target allocation exceeds cash by ${shortfall:,.2f} (Available Cash: ${wallet_cash:,.2f})")
-                        rebal_candidates = []
-                        for m_id, p_list in history.get("predicted", {}).items():
-                            for p_item in ensure_list(p_list):
-                                if p_item.get("source") == "wallet":
-                                    p_ed = float(p_item.get("edge", 0.0) or 0.0)
-                                    p_sh = float(p_item.get("shares", 0.0) or 0.0)
-                                    p_cp = float(p_item.get("cur_pm", p_item.get("pm", 0.5)))
-                                    p_val = p_sh * p_cp
-                                    if p_val > 1.0:
-                                        rebal_candidates.append((p_val, p_ed, p_item.get("question", "")))
-                        rebal_candidates.sort(key=lambda x: x[1])
-                        if rebal_candidates:
-                            c_val, c_edge, c_q = rebal_candidates[0]
-                            c_q_disp = (c_q[:35] + "...") if len(c_q) > 38 else c_q
-                            print(f"  -> Rebalance Suggestion: Liquidate/Trim {c_q_disp} [Edge: {c_edge*100:+.1f}% | Equity: ${c_val:,.2f}]")
+            if has_real_holdings and (held_mtm_k > 0 or live_held_val > 0):
+                spread_val = (pm_ask - pm_bid) if (pm_ask > pm_bid) else 0.01
+                half_sp = max(0.0005, spread_val / 2.0)
+                tot_target_k = max(eff_kelly, cumul_auth_k)
+                pos_bid = (1.0 - pm_ask) if is_pos_no else pm_bid
+                pos_ask = (1.0 - pm_bid) if is_pos_no else pm_ask
+                dyn_action = calculate_dynamic_kelly_action(
+                    win_prob_bal=norm_target,
+                    cur_p=ref_px,
+                    held_frac=held_mtm_k,
+                    bankroll=current_bankroll,
+                    fee_rate=fee_rate,
+                    half_spread=half_sp,
+                    entry_kelly=tot_target_k,
+                    best_bid=pos_bid,
+                    best_ask=pos_ask
+                )
+                action_label = dyn_action["action_label"]
+                print(f"Action       : {action_label} | Net Edge: {adjusted_edge*100:+.2f}%")
+                sh_tag = f" | {held_shares:,.1f} shares" if held_shares > 0 else ""
+                dyn_target_k = dyn_action["f_star_eff"]
+                dyn_target_usd = dyn_target_k * current_bankroll
+                hold_ceil_k = dyn_action["f_star_hold"]
+                ceil_note = f" [Hold Ceiling: {hold_ceil_k*100:.2f}%]" if hold_ceil_k > dyn_target_k + 0.0005 else ""
+                print(f"Position     : Held {held_mtm_k*100:.2f}% (${live_held_val:,.2f}{sh_tag}) -> Target {dyn_target_k*100:.2f}% (${dyn_target_usd:,.2f}){ceil_note}")
+                if dyn_action.get("signal_code") == "ADD" and dyn_action.get("delta_usd", 0.0) > 0:
+                    _print_cash_shortfall_alert(dyn_action["delta_usd"])
+            elif action in ["YES", "NO"]:
+                    slip_note = f" (Slippage: +{slippage*100:.2f}%)" if slippage > 0.0001 else ""
+                    if opt_buy_usd is not None and opt_buy_usd > 0 and opt_buy_usd < final_alloc * 0.95:
+                        print(f"Action       : BUY {action} (Book Depth Capped) | Net Edge: {adjusted_edge*100:+.2f}%")
+                        print(f"Optimal Order: Market-buy ${opt_buy_usd:,.2f} @ {vwap_true*100:.2f}% mean VWAP{slip_note}")
+                        print(f"Allocation   : ${opt_buy_usd:,.2f} immediate market order (${final_alloc:,.2f} target Eff-Kelly)")
+                    else:
+                        print(f"Action       : BUY {action} @ {vwap_true*100:.1f}% VWAP{slip_note} | Net Edge: {adjusted_edge*100:+.2f}%")
+                        print(f"Allocation   : ${final_alloc:,.2f} ({eff_kelly*100:.2f}% Eff-Kelly | {raw_kelly*100:.2f}% Raw)")
+
+                    _print_cash_shortfall_alert(final_alloc)
             else:
+                disp_px = stored_cur_pm if is_pos_no else pm_mid
+                disp_label = f"NO {disp_px*100:.1f}%" if is_pos_no else f"{disp_px*100:.1f}%"
+                tgt_label = f"target NO {norm_target*100:.1f}%" if is_pos_no else f"target {norm_target*100:.1f}%"
                 if lm["live_active_edge"] <= 0:
-                    reason = f"Price {pm_mid*100:.1f}% at/above target {lm['pu_norm']*100:.1f}% (Exit Signal: SELL)"
+                    if is_existing and live_held_val > 0:
+                        reason = f"Price {disp_label} reached {tgt_label} (Exit Signal: SELL)"
+                    else:
+                        reason = f"Price {disp_label} reached {tgt_label} (Pass: No edge)"
                 elif action == "THIN_EDGE":
                     if edge > 0 and adjusted_edge <= 0:
-                        reason = f"Orderbook slippage on ${final_alloc:,.2f} order (Ask {true_price*100:.1f}% -> VWAP {vwap_true*100:.1f}%) wiped raw edge"
+                        reason = f"Orderbook slippage on ${final_alloc:,.2f} order wiped raw edge"
                     elif edge > 0 and adjusted_edge < cfg.MIN_EDGE:
-                        reason = f"Net edge {adjusted_edge*100:.2f}% below {cfg.MIN_EDGE*100:.1f}% threshold after slippage"
+                        reason = f"Net edge {adjusted_edge*100:.2f}% below {cfg.MIN_EDGE*100:.1f}% threshold"
                     else:
                         reason = f"Edge below {cfg.MIN_EDGE*100:.1f}% threshold"
                 elif action == "NONE":
-                    reason = "Trapped inside bid-ask spread"
+                    reason = f"Trapped inside bid-ask spread (Ask {disp_px*100:.1f}% >= Target {norm_target*100:.1f}%)"
                 else:
                     reason = "Unknown"
                 print(f"Action       : $0 ({reason}) | Edge: {adjusted_edge*100:+.2f}%")
                 if is_existing and live_held_val > 0:
                     sh_tag = f" | {held_shares:,.1f} shares" if held_shares > 0 else ""
-                    print(f"Existing Pos : {held_mtm_k*100:.2f}% MTM (${live_held_val:,.2f}{sh_tag}) | Target: 0.00% ($0.00)")
+                    print(f"Existing Pos : {held_mtm_k*100:.2f}% MTM (${live_held_val:,.2f}{sh_tag}) | Target: {eff_kelly*100:.2f}% (${eff_kelly*current_bankroll:,.2f})")
 
-            if action in ["YES", "NO"] and adjusted_edge > 0 and final_alloc > 0:
-                k_disp = delta_k if (is_existing and held_mtm_k > 0) else eff_kelly
+            stage_item = False
+            cand_action = action
+            cand_alloc = opt_buy_usd if (opt_buy_usd is not None and opt_buy_usd > 0 and opt_buy_usd < final_alloc) else final_alloc
+            cand_k = eff_kelly
+
+            if has_real_holdings:
+                stage_item = True
+                cand_action = dyn_action.get("signal_code", "HOLD") if (held_mtm_k > 0 and 'dyn_action' in locals()) else ("HOLD" if held_mtm_k > 0 else (action if action in ("YES", "NO") else "PASS"))
+                cand_alloc = dyn_action.get("delta_usd", 0.0) if ('dyn_action' in locals() and dyn_action.get("signal_code") == "ADD") else 0.0
+                cand_k = dyn_action.get("f_star_eff", eff_kelly) if (held_mtm_k > 0 and 'dyn_action' in locals()) else eff_kelly
+                candidate_to_commit["kelly"] = cand_k
+                candidate_to_commit["edge"] = adjusted_edge
+                if cand_action != "ADD":
+                    candidate_to_commit["opt_buy_usd"] = None
+                    candidate_to_commit["opt_buy_vwap"] = None
+                    candidate_to_commit["opt_buy_edge"] = None
+                alloc_msg = f" (Allocation: +${cand_alloc:,.2f})" if cand_alloc > 0 else ""
+                print(f"Status       : [+] Updated existing position forecast (Action: {cand_action}{alloc_msg})\n")
+            elif action in ["YES", "NO"] and adjusted_edge > 0 and cand_alloc > 0:
+                stage_item = True
+            elif is_existing:
+                stage_item = True
+                cand_action = "WATCH"
+                cand_alloc = 0.0
+                cand_k = eff_kelly
+                print(f"Status       : [+] Updated local prediction forecast (Action: WATCH)\n")
+            elif mode == "target":
+                stage_item = True
+                cand_action = "WATCH"
+                cand_alloc = 0.0
+                cand_k = eff_kelly
+                print(f"Status       : [+] Staged as tracked watch prediction (Eff-Kelly: {eff_kelly*100:.2f}% | $0 allocation)\n")
+            else:
+                track_ans = input(f"Status       : [-] Pass. Save as tracked watch prediction? [y/N]: ").strip().lower()
+                if track_ans in ("y", "yes"):
+                    stage_item = True
+                    cand_action = "WATCH"
+                    cand_alloc = 0.0
+                    cand_k = eff_kelly
+                    print(f"Status       : [+] Staged as tracked watch prediction (Eff-Kelly: {eff_kelly*100:.2f}% | $0 allocation)\n")
+                else:
+                    print(f"Status       : [-] Pass (Edge: {adjusted_edge*100:+.2f}%)\n")
+
+            if stage_item:
+                candidate_to_commit["action"] = cand_action
+                candidate_to_commit["is_watch"] = (cand_action == "WATCH")
+                if snap_appended and isinstance(candidate_to_commit.get("snapshots"), list) and candidate_to_commit["snapshots"]:
+                    candidate_to_commit["snapshots"][-1]["kelly"] = cand_k
+                    candidate_to_commit["snapshots"][-1]["entry_kelly"] = float(candidate_to_commit.get("entry_kelly", cand_k))
+                    candidate_to_commit["snapshots"][-1]["action"] = cand_action
                 cand = {
                     "market_id": market_id,
                     "question": question,
                     "slug": event_slug,
-                    "action": action,
+                    "action": cand_action,
                     "side": pos_side,
-                    "price": vwap_true,
+                    "pu": stored_pu,
+                    "pm": stored_cur_pm if is_existing else stored_pm,
+                    "price": vwap_true if (vwap_true and vwap_true > 0) else (true_price if true_price > 0 else pm_mid),
                     "raw_kelly": raw_kelly,
-                    "eff_kelly": k_disp,
-                    "delta_k": delta_k,
-                    "alloc": final_alloc,
+                    "eff_kelly": cand_k,
+                    "delta_k": delta_k if has_real_holdings else 0.0,
+                    "alloc": cand_alloc,
                     "edge": adjusted_edge,
                     "apy": adjusted_apy,
                     "dynamic_ego": dynamic_ego,
                     "is_existing": is_existing,
+                    "has_real_holdings": has_real_holdings,
                     "held_val": live_held_val,
                     "held_mtm_k": held_mtm_k,
                     "held_shares": held_shares,
@@ -636,9 +1026,10 @@ def run_prediction_session(
                 staged_alloc = sum(c["alloc"] for c in session_candidates)
                 staged_k = sum(c["eff_kelly"] for c in session_candidates)
                 c_cnt = len(session_candidates)
-                print(f"Status       : [+] Staged ({c_cnt} candidate{'s' if c_cnt > 1 else ''} | ${staged_alloc:,.2f} / ${current_bankroll:,.2f} [{staged_k*100:.1f}% Kelly])\n")
+                if cand_alloc > 0:
+                    print(f"Status       : [+] Staged ({c_cnt} candidate{'s' if c_cnt > 1 else ''} | ${staged_alloc:,.2f} / ${current_bankroll:,.2f} [{staged_k*100:.1f}% Kelly])\n")
 
-                if staged_alloc >= current_bankroll:
+                if staged_alloc >= current_bankroll and current_bankroll > 0:
                     print("=" * 80)
                     print(f"[!] CAPITAL POOL SATURATED: Staged candidates reach ${staged_alloc:,.2f} ({staged_alloc/current_bankroll*100:.1f}% of Bankroll).")
                     c_choice = input("    Continue scanning [Enter] | Finalize & Review candidates now [f/q]: ").strip().lower()
@@ -646,11 +1037,9 @@ def run_prediction_session(
                         print("\n[*] Finalizing session to review candidate pool...")
                         break
                     print("=" * 80 + "\n")
-            else:
-                print(f"Status       : [-] Pass (Edge: {adjusted_edge*100:+.2f}%)\n")
 
             _check_and_enqueue_sibling_submarket(
-                m, sub_markets, history, session_candidates, session_markets, current_index, len(portfolio_data)
+                m, sub_markets, history, session_candidates, session_markets, current_index, len(portfolio_data), mode=mode
             )
             current_index += 1
 
@@ -662,17 +1051,36 @@ def run_prediction_session(
         history=history,
         current_bankroll=current_bankroll,
         portfolio_data=portfolio_data,
-        session_trades=session_trades
+        session_trades=session_trades,
+        auto_commit=bool(target_market_id and len(session_candidates) == 1),
     )
 
     save_history(history)
     return pd.DataFrame(portfolio_data)
 
 
-def _review_and_commit_candidates(session_candidates, history, current_bankroll, portfolio_data, session_trades):
+def _review_and_commit_candidates(session_candidates, history, current_bankroll, portfolio_data, session_trades, auto_commit=False):
     """Presents staged session candidates sorted by edge with smart default recommendation within Kelly limits."""
     if not session_candidates:
         print("\n[*] Session completed with 0 candidates staged.")
+        return
+
+    if auto_commit and len(session_candidates) == 1:
+        c = session_candidates[0]
+        m_id = c["market_id"]
+        history.setdefault("predicted", {})[m_id] = [c["payload"]]
+        history.get("skipped", {}).pop(m_id, None)
+        session_trades[m_id] = c["alloc"]
+        portfolio_data.append({
+            "Question": c["question"][:50] + "..",
+            "Action": c["action"],
+            "Ego": f"{c['dynamic_ego']:.2f}",
+            "Price": f"{c['price']*100:.1f}%",
+            "Kelly": f"{c['eff_kelly']*100:.2f}%",
+            "EffKelly": f"{c['eff_kelly']*100:.2f}%",
+            "Alloc": f"${c['alloc']:,.2f}",
+        })
+        save_history(history)
         return
 
     # Sort: highest edge first
@@ -697,20 +1105,28 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
             c["recommended"] = False
 
     while True:
-        box_len = 106
+        box_len = 117
         print("\n" + "=" * box_len)
-        print(" " * 36 + "[ SESSION CANDIDATES REVIEW ]")
+        print(" " * ((box_len - 31) // 2) + "[ SESSION CANDIDATES REVIEW ]")
         print("-" * box_len)
-        print("  # | Sel | Side | Edge    | Eff-Kelly | Allocation | Cumulative | Question")
-        print("----+-----+------+---------+-----------+------------+------------+-----------------------------------------------")
-        running_tot = 0.0
+        print("  # | Sel | Side |    pu |    pm |    Edge | Eff-Kelly | Allocation | Question")
+        print("----+-----+------+-------+-------+---------+-----------+------------+------------------------------------------------")
         for i, c in enumerate(session_candidates, 1):
             sel_mark = "[*]" if c["selected"] else "[ ]"
-            running_tot += c["alloc"] if c["selected"] else 0.0
+            pu_val = float(c.get("pu", 0.0) or c.get("payload", {}).get("pu", 0.0) or 0.0)
+            pm_val = float(c.get("pm", 0.0) or c.get("payload", {}).get("cur_pm", 0.0) or c.get("price", 0.0) or 0.0)
+            pu_str = f"{pu_val*100:.1f}%"
+            pm_str = f"{pm_val*100:.1f}%"
+            edge_str = f"{c['edge']*100:+6.2f}%"
+            k_str = f"{c['eff_kelly']*100:8.2f}%"
+            alloc_str = f"${c['alloc']:>9,.2f}"
             q_txt = c["question"]
-            q_disp = (q_txt[:43] + "...") if len(q_txt) > 46 else q_txt
-            exceed_tag = " (Exceeds Bankroll)" if (running_tot > current_bankroll and c["selected"]) else ""
-            print(f" {i:2d} | {sel_mark} | {c['side']:<4} | {c['edge']*100:+6.2f}% | {c['eff_kelly']*100:8.2f}% | ${c['alloc']:>9,.2f} | ${running_tot:>9,.2f} | {q_disp}{exceed_tag}")
+            q_disp = (q_txt[:44] + "...") if len(q_txt) > 47 else q_txt
+            q_padded = q_disp.ljust(48)
+            slug_val = c.get("slug") or c.get("payload", {}).get("slug")
+            event_url = f"https://polymarket.com/event/{slug_val}" if slug_val and slug_val != "custom" else ""
+            q_cell = ansi_link(event_url, q_padded) if event_url else q_padded
+            print(f" {i:2d} | {sel_mark} | {c['side']:<4} | {pu_str:>5} | {pm_str:>5} | {edge_str} | {k_str} | {alloc_str} | {q_cell}")
         print("=" * box_len)
 
         sel_candidates = [c for c in session_candidates if c["selected"]]
@@ -732,7 +1148,8 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
                 break
             for c in sel_candidates:
                 m_id = c["market_id"]
-                history.setdefault("predicted", {})[m_id] = [c["payload"]]
+                payload = c["payload"]
+                history.setdefault("predicted", {})[m_id] = [payload]
                 history.get("skipped", {}).pop(m_id, None)
                 session_trades[m_id] = c["alloc"]
                 portfolio_data.append({
@@ -791,7 +1208,7 @@ def custom_calculator():
         pu_mid_c = round((lower + upper) / 2.0, 6)
         pm_mid_c = round((m_lower + m_upper) / 2.0, 6)
         action, true_price, raw_kelly, eff_kelly, final_alloc, dynamic_ego, edge, lm_c = calculate_allocation(
-            lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego, held_kelly=raw_kelly
+            lower, upper, m_lower, m_upper, fee_rate, calc_bankroll, base_ego
         )
         _, apy = calculate_annualized_yield(edge, true_price, days_until)
 
@@ -817,11 +1234,21 @@ def custom_calculator():
                 "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
                 "pu": round(1.0 - pu_mid_c, 6) if is_no_c else pu_mid_c,
                 "pm": round(true_price if true_price > 0 else (1.0 - pm_mid_c), 6) if is_no_c else pm_mid_c,
+                "entry_price": round(true_price if true_price > 0 else (1.0 - pm_mid_c), 6) if is_no_c else pm_mid_c,
                 "cur_pm": round(1.0 - pm_mid_c, 6) if is_no_c else pm_mid_c,
                 "dynamic_ego": dynamic_ego,
-                "kelly": raw_kelly,
+                "kelly": eff_kelly,
+                "entry_kelly": eff_kelly,
+                "raw_kelly": raw_kelly,
                 "edge": edge,
                 "apy": apy,
+                "fee_rate": fee_rate,
+                "snapshots": [{
+                    "ts": int(datetime.now(timezone.utc).timestamp()),
+                    "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                    "pu": round(1.0 - pu_mid_c, 6) if is_no_c else pu_mid_c,
+                    "pm": round(true_price if true_price > 0 else (1.0 - pm_mid_c), 6) if is_no_c else pm_mid_c
+                }],
                 "conditionId": "custom",
                 "position": pos_side_c,
                 "source": "local",

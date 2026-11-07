@@ -1,5 +1,6 @@
 """Synchronization of Polymarket wallet positions and automatic market resolution auditing."""
 from datetime import datetime, timezone
+import time
 import config as cfg
 from config import api
 from utils import ensure_list, parse_outcome_prices, parse_market_date, ansi_link
@@ -42,61 +43,77 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
     def _fetch_v2_positions(status_filter):
         pos_list = []
         cursor = None
+        max_retries = 3
         while True:
-            try:
-                c_param = f"&cursor={cursor}" if cursor else ""
-                url = f"https://data-api.polymarket.com/v2/positions?user={wallet_address}&status={status_filter}&limit=100{c_param}"
-                resp = api.get(url, timeout=10).json()
-                raw_list = resp.get("data", []) if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
-                for p in raw_list:
-                    if not isinstance(p, dict):
-                        continue
-                    c_id = p.get("condition_id") or p.get("conditionId")
-                    if not c_id:
-                        continue
-                    tb = float(p.get("total_size") if p.get("total_size") is not None else p.get("totalBought", 0.0) or 0.0)
-                    cur_sz = float(p.get("current_size") if p.get("current_size") is not None else p.get("size", 0.0) or 0.0)
-                    sz = cur_sz if status_filter == "OPEN" else (tb if tb > 0 else cur_sz)
-                    avg_p = float(p.get("avg_price") if p.get("avg_price") is not None else p.get("avgPrice", 0.5) or 0.5)
-                    cur_p = float(p.get("current_price") if p.get("current_price") is not None else p.get("curPrice", avg_p) or avg_p)
-                    init_val = float(p.get("total_cost_usdc") if p.get("total_cost_usdc") is not None else p.get("initialValue", sz * avg_p) or (sz * avg_p))
-                    cur_val = float(p.get("current_value") if p.get("current_value") is not None else p.get("currentValue", sz * cur_p) or (sz * cur_p))
-                    r_pnl = float(p.get("realized_pnl") if p.get("realized_pnl") is not None else p.get("realizedPnl", 0.0) or 0.0)
-                    pos_list.append({
-                        "conditionId": c_id,
-                        "outcome": p.get("outcome", "Yes"),
-                        "outcomeIndex": int(p.get("outcome_index") if p.get("outcome_index") is not None else p.get("outcomeIndex", 0) or 0),
-                        "avgPrice": avg_p,
-                        "curPrice": cur_p,
-                        "size": sz,
-                        "totalBought": tb,
-                        "initialValue": init_val,
-                        "currentValue": cur_val,
-                        "realizedPnl": r_pnl,
-                        "redeemable": bool(p.get("redeemable")),
-                        "title": p.get("title") or p.get("question"),
-                        "slug": p.get("slug"),
-                        "endDate": p.get("end_date") or p.get("endDate"),
-                        "status": p.get("status", status_filter),
-                        "eventId": p.get("event_id"),
-                        "eventSlug": p.get("event_slug"),
-                        "timestamp": p.get("timestamp") or 0,
-                        "last_event_at": p.get("last_event_at") or p.get("timestamp") or 0,
-                        "first_entry_at": p.get("first_entry_at") or 0,
-                        "_from_closed": (status_filter == "CLOSED")
-                    })
-                pagination = resp.get("pagination", {}) if isinstance(resp, dict) else {}
-                if pagination.get("has_more") and pagination.get("next_cursor"):
-                    cursor = pagination["next_cursor"]
-                else:
+            success = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    c_param = f"&cursor={cursor}" if cursor else ""
+                    url = f"https://data-api.polymarket.com/v2/positions?user={wallet_address}&status={status_filter}&limit=100{c_param}"
+                    resp = api.get(url, timeout=10).json()
+                    raw_list = resp.get("data", []) if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
+                    for p in raw_list:
+                        if not isinstance(p, dict):
+                            continue
+                        c_id = p.get("condition_id") or p.get("conditionId")
+                        if not c_id:
+                            continue
+                        tb = float(p.get("total_size") if p.get("total_size") is not None else p.get("totalBought", 0.0) or 0.0)
+                        cur_sz = float(p.get("current_size") if p.get("current_size") is not None else p.get("size", 0.0) or 0.0)
+                        sz = cur_sz if status_filter == "OPEN" else (tb if tb > 0 else cur_sz)
+                        avg_p = float(p.get("avg_price") if p.get("avg_price") is not None else p.get("avgPrice", 0.5) or 0.5)
+                        cur_p = float(p.get("current_price") if p.get("current_price") is not None else p.get("curPrice", avg_p) or avg_p)
+                        init_val = float(p.get("total_cost_usdc") if p.get("total_cost_usdc") is not None else p.get("initialValue", sz * avg_p) or (sz * avg_p))
+                        cur_val = float(p.get("current_value") if p.get("current_value") is not None else p.get("currentValue", sz * cur_p) or (sz * cur_p))
+                        r_pnl = float(p.get("realized_pnl") if p.get("realized_pnl") is not None else p.get("realizedPnl", 0.0) or 0.0)
+                        pos_list.append({
+                            "conditionId": c_id,
+                            "outcome": p.get("outcome", "Yes"),
+                            "outcomeIndex": int(p.get("outcome_index") if p.get("outcome_index") is not None else p.get("outcomeIndex", 0) or 0),
+                            "avgPrice": avg_p,
+                            "curPrice": cur_p,
+                            "size": sz,
+                            "totalBought": tb,
+                            "initialValue": init_val,
+                            "currentValue": cur_val,
+                            "realizedPnl": r_pnl,
+                            "redeemable": bool(p.get("redeemable")),
+                            "title": p.get("title") or p.get("question"),
+                            "slug": p.get("slug"),
+                            "endDate": p.get("end_date") or p.get("endDate"),
+                            "status": p.get("status", status_filter),
+                            "eventId": p.get("event_id"),
+                            "eventSlug": p.get("event_slug"),
+                            "timestamp": p.get("timestamp") or 0,
+                            "last_event_at": p.get("last_event_at") or p.get("timestamp") or 0,
+                            "first_entry_at": p.get("first_entry_at") or 0,
+                            "_from_closed": (status_filter == "CLOSED")
+                        })
+                    pagination = resp.get("pagination", {}) if isinstance(resp, dict) else {}
+                    if pagination.get("has_more") and pagination.get("next_cursor"):
+                        cursor = pagination["next_cursor"]
+                    else:
+                        cursor = None
+                    success = True
                     break
-            except Exception as e:
-                print(f"[!] Error fetching {status_filter} positions: {e}")
+                except Exception as e:
+                    if attempt < max_retries:
+                        time.sleep(1.0 * attempt)
+                    else:
+                        print(f"[!] Error fetching {status_filter} positions after {max_retries} attempts: {e}")
+                        return None
+            if not success or not cursor:
                 break
         return pos_list
 
     open_positions = _fetch_v2_positions("OPEN")
+    if open_positions is None:
+        print("[!] Network error fetching open positions from Polymarket. Preserving existing active portfolio state.")
+        return history
+
     closed_positions = _fetch_v2_positions("CLOSED")
+    if closed_positions is None:
+        closed_positions = []
 
     open_keys = {((p.get("conditionId") or "").lower(), p.get("outcome")) for p in open_positions if isinstance(p, dict)}
     for cp in closed_positions:
@@ -238,34 +255,31 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 if not matching_ex:
                     continue
                 already_in_exited = True
-                if bool(pos.get("redeemable")) or cur_price >= 0.99 or cur_price <= 0.01:
-                    out_v = 1.0 if cur_price >= 0.99 else 0.0
-                    for e in matching_ex:
-                        e["cur_pm"] = cur_price
-                        e["realized_pnl"] = realized_pnl
-                        e["outcome"] = out_v
-                        updated_existing += 1
-                    rem_ex = [e for e in ex_list if e not in matching_ex]
-                    if rem_ex:
-                        history["exited"][m_id] = rem_ex
-                    else:
-                        history["exited"].pop(m_id, None)
-                    history["resolved"].setdefault(m_id, []).extend(matching_ex)
-                else:
-                    for e in matching_ex:
-                        e["cur_pm"] = cur_price
-                        e["realized_pnl"] = realized_pnl
-                        if calc_exit_price is not None:
-                            e["exit_price"] = calc_exit_price
-                        if exit_date_str:
-                            e["date"] = exit_date_str
-                        updated_existing += 1
+                for e in matching_ex:
+                    e["cur_pm"] = cur_price
+                    e["realized_pnl"] = realized_pnl
+                    if tot_bought > 0 and avg_price > 0:
+                        e["entry_cost"] = round(tot_bought * avg_price, 4)
+                        e["total_size"] = tot_bought
+                        e["avg_price"] = avg_price
+                        e["entry_price"] = avg_price
+                        if len(e.get("snapshots", [])) <= 1:
+                            e["pm"] = avg_price
+                            if e.get("snapshots"):
+                                e["snapshots"][0]["pm"] = avg_price
+                                e["snapshots"][0]["entry_price"] = avg_price
+                    e["entry_bankroll"] = float(e.get("entry_bankroll") or total_bankroll)
+                    if calc_exit_price is not None:
+                        e["exit_price"] = calc_exit_price
+                    if exit_date_str:
+                        e["date"] = exit_date_str
+                    updated_existing += 1
                 break
             if already_in_exited:
                 continue
 
         m, market_id, question, slug, end_date = resolve_position_market_metadata(pos, event_cache)
-        cond_trades = trades_by_cond.get(cond_id, [])
+        cond_trades = trades_by_cond.get((cond_id or "").lower(), [])
         latest_trade_ts = max((t["ts"] for t in cond_trades), default=int(pos.get("timestamp") or 0))
 
         is_market_resolved = bool(m and (m.get("closed") or m.get("umaResolutionStatus") == "resolved"))
@@ -278,11 +292,12 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         days_until = days_until or 0.0
 
         already_stored = False
+        c_id_lower = (cond_id or "").lower()
         for m_id in list(history.get("predicted", {}).keys()):
             preds_list = ensure_list(history["predicted"][m_id])
             matching_preds = [
                 p for p in preds_list
-                if p.get("conditionId") == cond_id and (
+                if (p.get("conditionId") or "").lower() == c_id_lower and (
                     p.get("source") != "wallet" or p.get("position", pos_outcome_str) == pos_outcome_str
                 )
             ]
@@ -361,17 +376,21 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 )
                 web_link = f"https://polymarket.com/event/{slug}"
                 linked_q = ansi_link(web_link, question)
-                print(f"\n[SYNC TRANCHE] On-chain execution detected (+${delta_usdc:,.2f} @ {delta_pm*100:.2f}%) for: {linked_q}")
-                for i_lp, lp_item in enumerate(local_preds, 1):
-                    rec_tag = " (Recommended match)" if i_lp == default_idx else ""
-                    t_usd = float(lp_item.get("kelly", 0.0)) * cfg.BANKROLL
-                    print(f"  [{i_lp}] Date: {lp_item.get('date')} | pu: {float(lp_item.get('pu', 0.5))*100:.1f}% | pm: {float(lp_item.get('pm', 0.5))*100:.1f}% | Target: ${t_usd:,.2f} ({float(lp_item.get('kelly', 0))*100:.2f}%){rec_tag}")
-                print("  [0] None (keep local prediction(s) unexecuted & import on-chain trade separately)")
-                sel_raw = input(f"  Select which local prediction was executed [Enter for {default_idx}]: ").strip()
-                try:
-                    sel_idx = int(sel_raw) if sel_raw else default_idx
-                except ValueError:
+                if auto_sync or len(local_preds) == 1:
                     sel_idx = default_idx
+                    print(f"\n[SYNC TRANCHE] Automatically matched on-chain execution (+${delta_usdc:,.2f}) with local prediction: {linked_q}")
+                else:
+                    print(f"\n[SYNC TRANCHE] On-chain execution detected (+${delta_usdc:,.2f} @ {delta_pm*100:.2f}%) for: {linked_q}")
+                    for i_lp, lp_item in enumerate(local_preds, 1):
+                        rec_tag = " (Recommended match)" if i_lp == default_idx else ""
+                        t_usd = float(lp_item.get("kelly", 0.0)) * cfg.BANKROLL
+                        print(f"  [{i_lp}] Date: {lp_item.get('date')} | pu: {float(lp_item.get('pu', 0.5))*100:.1f}% | pm: {float(lp_item.get('pm', 0.5))*100:.1f}% | Target: ${t_usd:,.2f} ({float(lp_item.get('kelly', 0))*100:.2f}%){rec_tag}")
+                    print("  [0] None (keep local prediction(s) unexecuted & import on-chain trade separately)")
+                    sel_raw = input(f"  Select which local prediction was executed [Enter for {default_idx}]: ").strip()
+                    try:
+                        sel_idx = int(sel_raw) if sel_raw else default_idx
+                    except ValueError:
+                        sel_idx = default_idx
 
                 if 1 <= sel_idx <= len(local_preds):
                     chosen_lp = local_preds.pop(sel_idx - 1)
@@ -381,17 +400,30 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                             w_sh = (float(wp.get("cost_basis", float(wp.get("kelly", 0.0)) * prev_bankroll)) / prev_tot) if prev_tot > 0 else (1.0 / len(wallet_preds))
                             wp["cost_basis"] = round(max(0.0, initial_val - delta_usdc) * w_sh, 4)
                     ego_lp = float(chosen_lp.get("dynamic_ego", base_ego))
-                    lm_lp = calculate_logistic_metrics(chosen_lp.get("pu", delta_pm), delta_pm, ego_lp)
+                    lp_fee = float(chosen_lp.get("fee_rate", 0.0) or (m.get("fee_rate", 0.0) if m else 0.0) or 0.0)
+                    orig_lp_pm = float(chosen_lp.get("pm", delta_pm))
+                    lp_sp = float(chosen_lp.get("spread", 0.01) or (m.get("spread", 0.01) if m else 0.01) or 0.01)
+                    ref_lp_pm = orig_lp_pm if abs(orig_lp_pm - delta_pm) <= max(0.02, lp_sp + 0.005) else delta_pm
+                    lm_lp = calculate_logistic_metrics(chosen_lp.get("pu", ref_lp_pm), ref_lp_pm, ego_lp, fee_rate=lp_fee)
+                    tot_b_lp = float(pos.get("totalBought") or size or 0.0)
                     chosen_lp["question"] = question
                     chosen_lp["slug"] = slug
                     chosen_lp["tranche_pm"] = delta_pm
-                    chosen_lp["pm"] = delta_pm
+                    chosen_lp["entry_price"] = delta_pm
+                    chosen_lp["avg_price"] = avg_price
+                    chosen_lp["pm"] = ref_lp_pm
                     chosen_lp["cur_pm"] = cur_price
+                    chosen_lp["fee_rate"] = lp_fee
                     chosen_lp["cost_basis"] = round(0.0 if is_exited_open_pos else delta_usdc, 4)
+                    chosen_lp["entry_cost"] = round(tot_b_lp * avg_price, 4) if (tot_b_lp > 0 and avg_price > 0) else round(delta_usdc, 4)
+                    chosen_lp["total_size"] = round(tot_b_lp if tot_b_lp > 0 else size, 4)
+                    chosen_lp["entry_bankroll"] = float(chosen_lp.get("entry_bankroll") or total_bankroll)
                     chosen_lp["shares"] = round(size, 4) if not is_exited_open_pos else 0.0
                     chosen_lp["current_value"] = round(float(pos.get("currentValue", size * cur_price)), 4) if not is_exited_open_pos else 0.0
                     chosen_lp["realized_pnl"] = realized_pnl
-                    chosen_lp["kelly"] = lm_lp["model_kelly"]
+                    chosen_lp["kelly"] = lm_lp["eff_model_kelly"]
+                    chosen_lp["raw_kelly"] = lm_lp["model_kelly"]
+                    chosen_lp["entry_kelly"] = max(float(chosen_lp.get("entry_kelly", 0.0) or 0.0), lm_lp["eff_model_kelly"])
                     chosen_lp["edge"] = lm_lp["active_edge"]
                     _, chosen_lp["apy"] = calculate_annualized_yield(chosen_lp["edge"], lm_lp["win_prob_m"], days_until)
                     chosen_lp["position"] = pos.get("outcome", "Yes")
@@ -399,8 +431,26 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     chosen_lp["source"] = "wallet"
                     chosen_lp["wallet"] = wallet_address
                     chosen_lp["exited"] = is_exited_open_pos
+                    chosen_lp["is_watch"] = False
+                    if chosen_lp.get("action") in ("WATCH", "PASS", "NONE", "THIN_EDGE", None):
+                        chosen_lp["action"] = "HOLD"
                     if latest_trade_ts > 0:
                         chosen_lp["last_synced_ts"] = latest_trade_ts
+                    chosen_lp["snapshots"] = [{
+                        "ts": int(latest_trade_ts if latest_trade_ts > 0 else time.time()),
+                        "date": chosen_lp.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d")),
+                        "pu": float(chosen_lp.get("pu", ref_lp_pm)),
+                        "pm": ref_lp_pm,
+                        "entry_price": delta_pm,
+                        "kelly": chosen_lp["kelly"],
+                        "entry_kelly": chosen_lp["entry_kelly"],
+                        "raw_kelly": chosen_lp["raw_kelly"],
+                        "edge": chosen_lp["edge"],
+                        "apy": chosen_lp["apy"],
+                        "dynamic_ego": float(chosen_lp.get("dynamic_ego", base_ego)),
+                        "action": chosen_lp.get("action", "HOLD"),
+                        "source": "wallet",
+                    }]
                     wallet_preds.append(chosen_lp)
                     if is_exited_open_pos:
                         imported_exited += 1
@@ -425,20 +475,45 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     for wp in wallet_preds
                 ]
                 total_w = sum(raw_weights)
+                tot_b_wp = float(pos.get("totalBought") or size or 0.0)
                 for wp, w_i in zip(wallet_preds, raw_weights):
                     share = (w_i / total_w) if total_w > 0 else (1.0 / len(wallet_preds))
                     tranche_pm = float(wp.get("tranche_pm", wp.get("pm", avg_price)))
                     ego_wp = float(wp.get("dynamic_ego", base_ego))
-                    lm_wp = calculate_logistic_metrics(wp.get("pu", tranche_pm), tranche_pm, ego_wp)
+                    f_rate_wp = float(wp.get("fee_rate", 0.0) or (m.get("fee_rate", 0.0) if m else 0.0) or 0.0)
+                    absorbed_add = (not local_preds and delta_usdc > 0.05 and avg_price > 0)
+                    if absorbed_add:
+                        wp["entry_price"] = avg_price
+                        prev_ec = float(wp.get("entry_cost") or max(0.0, (wallet_target_usdc - delta_usdc) * share))
+                        prev_eb = float(wp.get("entry_bankroll") or prev_bankroll or total_bankroll)
+                        add_sh_usdc = delta_usdc * share
+                        wp["entry_bankroll"] = round((prev_ec * prev_eb + add_sh_usdc * total_bankroll) / max(0.01, prev_ec + add_sh_usdc), 4)
+                    else:
+                        wp["entry_price"] = wp.get("entry_price") or tranche_pm
+                        wp["entry_bankroll"] = float(wp.get("entry_bankroll") or total_bankroll)
+                    decision_pm = float(wp.get("pm", tranche_pm))
+                    lm_wp = calculate_logistic_metrics(wp.get("pu", decision_pm), decision_pm, ego_wp, fee_rate=f_rate_wp)
+                    base_ek = float(wp.get("entry_kelly", 0.0) or wp.get("kelly", 0.0) or lm_wp["eff_model_kelly"])
+                    if absorbed_add:
+                        lm_avg = calculate_logistic_metrics(wp.get("pu", avg_price), avg_price, ego_wp, fee_rate=f_rate_wp)
+                        lm_del = calculate_logistic_metrics(wp.get("pu", delta_pm), delta_pm, ego_wp, fee_rate=f_rate_wp)
+                        wp["entry_kelly"] = max(base_ek, lm_avg["eff_model_kelly"], lm_del["eff_model_kelly"])
+                    else:
+                        wp["entry_kelly"] = base_ek
                     wp["question"] = question
                     wp["slug"] = slug
-                    wp["pm"] = tranche_pm
+                    wp["pm"] = decision_pm
                     wp["cur_pm"] = cur_price
+                    wp["fee_rate"] = f_rate_wp
                     wp["cost_basis"] = round(0.0 if is_exited_open_pos else (wallet_target_usdc * share), 4)
+                    wp["entry_cost"] = round((tot_b_wp * avg_price if (tot_b_wp > 0 and avg_price > 0) else wallet_target_usdc) * share, 4)
+                    wp["total_size"] = round((tot_b_wp if tot_b_wp > 0 else size) * share, 4)
+                    wp["avg_price"] = avg_price
                     wp["shares"] = round(size * share, 4) if not is_exited_open_pos else 0.0
                     wp["current_value"] = round(float(pos.get("currentValue", size * cur_price)) * share, 4) if not is_exited_open_pos else 0.0
                     wp["realized_pnl"] = round(realized_pnl * share, 4)
-                    wp["kelly"] = lm_wp["model_kelly"]
+                    wp["kelly"] = lm_wp["eff_model_kelly"]
+                    wp["raw_kelly"] = lm_wp["model_kelly"]
                     wp["edge"] = lm_wp["active_edge"]
                     _, wp["apy"] = calculate_annualized_yield(wp["edge"], lm_wp["win_prob_m"], days_until)
                     wp["position"] = pos.get("outcome", "Yes")
@@ -446,6 +521,9 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     wp["source"] = "wallet"
                     wp["wallet"] = wallet_address
                     wp["exited"] = is_exited_open_pos
+                    wp["is_watch"] = False
+                    if wp.get("action") in ("WATCH", "PASS", "NONE", "THIN_EDGE", None):
+                        wp["action"] = "HOLD"
                     if end_date or (m and m.get("endDate")):
                         wp["endDate"] = end_date or m.get("endDate")
                     if m and m.get("volume") is not None:
@@ -502,6 +580,14 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 else:
                     history["predicted"].pop(target_key, None)
                 for p in to_resolve:
+                    tot_b_res = float(pos.get("totalBought") or size or 0.0)
+                    if tot_b_res > 0 and avg_price > 0:
+                        p["entry_cost"] = round(tot_b_res * avg_price, 4)
+                        p["total_size"] = tot_b_res
+                        p["avg_price"] = avg_price
+                    elif not p.get("entry_cost") and float(p.get("cost_basis", 0.0) or 0.0) > 0:
+                        p["entry_cost"] = float(p.get("cost_basis", 0.0))
+                    p["entry_bankroll"] = float(p.get("entry_bankroll") or total_bankroll)
                     p["outcome"] = outcome_val
                     p["position"] = pos_outcome_str
                     p["outcomeIndex"] = pos_outcome_idx
@@ -526,6 +612,19 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 last_evt_ts = int(pos.get("last_event_at") or pos.get("timestamp") or latest_trade_ts or 0)
                 exit_date_str = datetime.fromtimestamp(last_evt_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if last_evt_ts > 0 else None
                 for p in to_exit:
+                    if tot_bought > 0 and avg_price > 0:
+                        p["entry_cost"] = round(tot_bought * avg_price, 4)
+                        p["total_size"] = tot_bought
+                        p["avg_price"] = avg_price
+                        p["entry_price"] = avg_price
+                        if len(p.get("snapshots", [])) <= 1:
+                            p["pm"] = avg_price
+                            if p.get("snapshots"):
+                                p["snapshots"][0]["pm"] = avg_price
+                                p["snapshots"][0]["entry_price"] = avg_price
+                    elif not p.get("entry_cost") and float(p.get("cost_basis", 0.0) or 0.0) > 0:
+                        p["entry_cost"] = float(p.get("cost_basis", 0.0))
+                    p["entry_bankroll"] = float(p.get("entry_bankroll") or total_bankroll)
                     p["exited"] = True
                     p["cost_basis"] = 0.0
                     p["realized_pnl"] = realized_pnl
@@ -541,6 +640,31 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 if to_exit:
                     history["exited"].setdefault(target_key, []).extend(to_exit)
             break
+
+        # If open wallet position was previously archived in exited, revive it automatically
+        if not already_stored and not is_from_closed:
+            for m_id in list(history.get("exited", {}).keys()):
+                ex_list = ensure_list(history["exited"][m_id])
+                revive_matches = [
+                    e for e in ex_list
+                    if (e.get("conditionId") or "").lower() == c_id_lower
+                    and (e.get("source") != "wallet" or e.get("position", pos_outcome_str) == pos_outcome_str)
+                ]
+                if revive_matches:
+                    rem_ex = [e for e in ex_list if e not in revive_matches]
+                    if rem_ex:
+                        history["exited"][m_id] = rem_ex
+                    else:
+                        history["exited"].pop(m_id, None)
+                    for e in revive_matches:
+                        e["exited"] = False
+                        e["source"] = "wallet"
+                        e["cost_basis"] = initial_val
+                        e["shares"] = size
+                        e["current_value"] = float(pos.get("currentValue", size * cur_price))
+                    history.setdefault("predicted", {}).setdefault(m_id, []).extend(revive_matches)
+                    already_stored = True
+                    break
 
         if already_stored:
             continue
@@ -573,6 +697,9 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         for p in preds_list:
             c_id = p.get("conditionId")
             if p.get("source") == "wallet" and c_id and (c_id or "").lower() not in wallet_cond_ids:
+                if not p.get("entry_cost") and float(p.get("cost_basis", 0.0) or 0.0) > 0:
+                    p["entry_cost"] = float(p.get("cost_basis", 0.0))
+                p["entry_bankroll"] = float(p.get("entry_bankroll") or total_bankroll)
                 p["cost_basis"] = 0.0
                 p["exited"] = True
                 cp_match = closed_lookup.get(((c_id or "").lower(), p.get("position", "Yes")))
@@ -580,7 +707,16 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     p["realized_pnl"] = round(float(cp_match.get("realizedPnl", 0.0) or 0.0), 4)
                     cp_tb = float(cp_match.get("totalBought") or cp_match.get("size") or 0.0)
                     cp_avg = float(cp_match.get("avgPrice") or p.get("pm", 0.5))
-                    if cp_tb > 0:
+                    if cp_tb > 0 and cp_avg > 0:
+                        p["entry_cost"] = round(cp_tb * cp_avg, 4)
+                        p["total_size"] = cp_tb
+                        p["avg_price"] = cp_avg
+                        p["entry_price"] = cp_avg
+                        if len(p.get("snapshots", [])) <= 1:
+                            p["pm"] = cp_avg
+                            if p.get("snapshots"):
+                                p["snapshots"][0]["pm"] = cp_avg
+                                p["snapshots"][0]["entry_price"] = cp_avg
                         p["exit_price"] = max(0.0001, min(0.9999, round(cp_avg + (p["realized_pnl"] / cp_tb), 4)))
                     cp_ts = int(cp_match.get("last_event_at") or cp_match.get("timestamp") or 0)
                     if cp_ts > 0:
@@ -702,10 +838,16 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             break
 
         pu_val = round((lower + upper) / 2.0, 6)
-        dynamic_ego = compute_dynamic_ego(base_ego, upper - lower, 0.0)
-        lm = calculate_logistic_metrics(pu_val, avg_price, dynamic_ego)
+        dynamic_ego = compute_dynamic_ego(base_ego, upper - lower)
+        m_fee = (m.get("feeSchedule") or {}).get("rate") if m else None
+        if m_fee is None and m:
+            f = float(m.get("makerBaseFee") or 0.0)
+            m_fee = f / 1e18 if f > 1 else f
+        m_fee = float(m_fee or 0.0)
+        lm = calculate_logistic_metrics(pu_val, avg_price, dynamic_ego, fee_rate=m_fee)
         edge = lm["active_edge"]
-        kelly_val = lm["model_kelly"]
+        kelly_val = lm["eff_model_kelly"]
+        raw_kelly_val = lm["model_kelly"]
         _, apy = calculate_annualized_yield(edge, lm["win_prob_m"], days_until)
 
         is_exited_flag = bool(pos.get("_exited"))
@@ -738,9 +880,30 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             "pu": pu_val,
             "pm": avg_price,
             "cur_pm": cur_price,
+            "snapshots": [{
+                "ts": int(latest_trade_ts if latest_trade_ts > 0 else time.time()),
+                "date": rec_date,
+                "pu": pu_val,
+                "pm": avg_price,
+                "entry_price": avg_price,
+                "kelly": kelly_val,
+                "entry_kelly": kelly_val,
+                "raw_kelly": raw_kelly_val,
+                "edge": edge,
+                "apy": apy,
+                "dynamic_ego": dynamic_ego,
+                "action": "HOLD",
+                "source": "wallet",
+            }],
             "dynamic_ego": dynamic_ego,
             "kelly": kelly_val,
+            "entry_kelly": kelly_val,
+            "raw_kelly": raw_kelly_val,
             "cost_basis": round(0.0 if is_exited_flag else initial_val, 4),
+            "entry_cost": round(tot_sz_import * avg_price, 4) if (tot_sz_import > 0 and avg_price > 0) else round(initial_val, 4),
+            "total_size": round(tot_sz_import, 4) if tot_sz_import > 0 else round(size, 4),
+            "avg_price": avg_price,
+            "entry_bankroll": total_bankroll,
             "shares": round(size, 4) if not is_exited_flag else 0.0,
             "current_value": round(float(pos.get("currentValue", size * cur_price)), 4) if not is_exited_flag else 0.0,
             "realized_pnl": realized_pnl,
@@ -755,7 +918,10 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             "exited": is_exited_flag,
             "endDate": end_date or (m.get("endDate") if m else None),
             "volume": float(m.get("volume") or 0.0) if m else 0.0,
-            "volume24hr": float(m.get("volume24hr") or 0.0) if m else 0.0
+            "volume24hr": float(m.get("volume24hr") or 0.0) if m else 0.0,
+            "fee_rate": m_fee,
+            "spread": float(m.get("spread") or 0.01) if m else 0.01,
+            "clobTokenIds": m.get("clobTokenIds") if m else None
         }
         if latest_trade_ts > 0:
             pred_entry["last_synced_ts"] = latest_trade_ts
@@ -801,68 +967,74 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
 
 
 def update_resolutions(history):
-    """Audits unresolved predictions in predicted and exited buckets against Gamma API."""
+    """Audits unresolved predictions in predicted bucket against Gamma API."""
     resolved_count = 0
-    history.setdefault("exited", {})
+    history.setdefault("predicted", {})
     history.setdefault("resolved", {})
-    open_buckets = [("predicted", list(history.get("predicted", {}).keys())), ("exited", list(history.get("exited", {}).keys()))]
-    total_to_audit = sum(len(k_list) for _, k_list in open_buckets)
-    if total_to_audit:
-        print(f"[*] Auditing {total_to_audit} unresolved market(s) (active + exited) for resolution...")
+    market_ids = list(history.get("predicted", {}).keys())
+    if market_ids:
+        print(f"[*] Auditing {len(market_ids)} unresolved market(s) for resolution...")
 
-    for bucket_name, market_ids in open_buckets:
-        for market_id in market_ids:
-            if str(market_id).startswith("custom_"):
-                continue
-            try:
-                resp = api.get(f"{cfg.GAMMA_API}/markets/{market_id}", timeout=10).json()
-                is_closed = resp.get("closed", False)
-                uma_resolved = resp.get("umaResolutionStatus") == "resolved"
+    for market_id in market_ids:
+        if str(market_id).startswith("custom_"):
+            continue
+        try:
+            resp = api.get(f"{cfg.GAMMA_API}/markets/{market_id}", timeout=10).json()
+            is_closed = resp.get("closed", False)
+            uma_resolved = resp.get("umaResolutionStatus") == "resolved"
 
-                if is_closed or uma_resolved:
-                    prices = parse_outcome_prices(resp)
-                    if len(prices) < 2:
-                        prices = [0.5, 0.5]
+            if is_closed or uma_resolved:
+                prices = parse_outcome_prices(resp)
+                if len(prices) < 2:
+                    prices = [0.5, 0.5]
 
-                    pred_list = ensure_list(history[bucket_name][market_id])
-                    history["resolved"].setdefault(market_id, [])
+                pred_list = ensure_list(history["predicted"][market_id])
+                history["resolved"].setdefault(market_id, [])
+                is_wallet_prof = bool(str(history.get("profile_id") or history.get("wallet_address") or "").startswith("0x"))
 
-                    for pred_data in pred_list:
-                        if pred_data.get("source") == "wallet":
-                            try:
-                                out_idx = int(pred_data.get("outcomeIndex", 0))
-                            except Exception:
-                                out_idx = 0
-                            if len(prices) > out_idx:
-                                outcome = 1.0 if prices[out_idx] >= 0.99 else (0.0 if prices[out_idx] <= 0.01 else 0.5)
-                            else:
-                                outcome = 0.5
-                        else:
-                            if prices[0] >= 0.99: outcome = 1.0
-                            elif prices[1] >= 0.99: outcome = 0.0
-                            else: outcome = 0.5
-                        resolved_entry = dict(pred_data)
-                        resolved_entry["outcome"] = outcome
-                        if resolved_entry.get("realized_pnl") is None or float(resolved_entry.get("realized_pnl", 0.0) or 0.0) == 0.0:
-                            cb = float(resolved_entry.get("cost_basis", 0.0) or 0.0)
-                            sh = float(resolved_entry.get("shares", 0.0) or 0.0)
-                            if cb == 0.0 and resolved_entry.get("kelly"):
-                                cb = float(resolved_entry.get("kelly", 0.0)) * cfg.BANKROLL
-                                if sh == 0.0 and resolved_entry.get("pm", 0.0):
-                                    sh = cb / float(resolved_entry["pm"])
-                            if sh > 0 or cb > 0:
-                                if outcome == 1.0:
-                                    resolved_entry["realized_pnl"] = round(sh * 1.0 - cb, 2)
-                                elif outcome == 0.0:
-                                    resolved_entry["realized_pnl"] = round(-cb, 2)
-                                elif outcome == 0.5:
-                                    resolved_entry["realized_pnl"] = round(sh * 0.5 - cb, 2)
-                        history["resolved"][market_id].append(resolved_entry)
+                for pred_data in pred_list:
+                    cb = float(pred_data.get("cost_basis", 0.0) or pred_data.get("entry_cost", 0.0) or 0.0)
+                    sh = float(pred_data.get("shares", 0.0) or 0.0)
+                    is_unexec_local = (is_wallet_prof and pred_data.get("source") != "wallet" and cb <= 0.0 and sh <= 0.0)
+                    is_watch_pred = bool(pred_data.get("is_watch") or pred_data.get("action") == "WATCH")
+                    pos_pos = str(pred_data.get("position", "Yes")).lower()
+                    out_idx = 1 if pos_pos in ("no", "1") else 0
+                    if "outcomeIndex" in pred_data:
+                        try:
+                            out_idx = int(pred_data.get("outcomeIndex", out_idx))
+                        except Exception:
+                            pass
+                    if len(prices) > out_idx:
+                        outcome = 1.0 if prices[out_idx] >= 0.99 else (0.0 if prices[out_idx] <= 0.01 else 0.5)
+                    else:
+                        outcome = 0.5
+                    resolved_entry = dict(pred_data)
+                    resolved_entry["outcome"] = outcome
+                    if is_unexec_local or is_watch_pred:
+                        resolved_entry["realized_pnl"] = None
+                    elif resolved_entry.get("realized_pnl") is None or float(resolved_entry.get("realized_pnl", 0.0) or 0.0) == 0.0:
+                        ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
+                        active_b = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
+                        k_eval = float(resolved_entry.get("entry_kelly") or resolved_entry.get("kelly", 0.0) or 0.0)
+                        if not is_wallet_prof and cb == 0.0 and k_eval > 0:
+                            cb = k_eval * active_b
+                            if sh == 0.0 and resolved_entry.get("pm", 0.0):
+                                sh = cb / float(resolved_entry["pm"])
+                        if sh > 0 or cb > 0:
+                            if outcome == 1.0:
+                                resolved_entry["realized_pnl"] = round(sh * 1.0 - cb, 2)
+                            elif outcome == 0.0:
+                                resolved_entry["realized_pnl"] = round(-cb, 2)
+                            elif outcome == 0.5:
+                                resolved_entry["realized_pnl"] = round(sh * 0.5 - cb, 2)
+                    history["resolved"][market_id].append(resolved_entry)
+                if not history["resolved"][market_id]:
+                    history["resolved"].pop(market_id, None)
 
-                    del history[bucket_name][market_id]
-                    resolved_count += 1
-            except Exception:
-                continue
+                del history["predicted"][market_id]
+                resolved_count += 1
+        except Exception:
+            continue
 
     if resolved_count > 0:
         print(f"[+] Auto-resolved and scored {resolved_count} closed market(s).")

@@ -21,6 +21,6 @@ MAX_DAYS = 420       # Ignore markets resolving beyond X days
 MIN_DAYS = 0         # Ignore markets resolving within X days
 EXTREME_ODDS = 0.00  # Tail-odds filter: skip near 0% or 100%
 KELLY_GAMMA = 0.5    # 0.5 = Balanced (sqrt, Fisher geodesic), 1.0 = Full Eff, 0.0 = Normal Kelly
-EGO_WEIGHTING = "kelly"  # 'kelly' = Pure Theoretical Model Kelly (default), 'capital' = Risked Capital %, 'equal' = 1:1
+EGO_WEIGHTING = "kelly"  # Kelly capital allocation fraction (pure, authorized capital weighting)
 
 api = requests.Session()

@@ -6,6 +6,12 @@ and auditing portfolio performance.
 """
 
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 import pandas as pd
 
 import config as cfg
@@ -39,6 +45,13 @@ def main():
         except Exception as e:
             print(f"[!] Startup auto-sync warning: {e}")
 
+    try:
+        from views import auto_prune_closed_markets
+        h_init = load_history()
+        auto_prune_closed_markets(h_init)
+    except Exception:
+        pass
+
     while True:
         history = load_history()
         print_main_menu_dashboard(history)
@@ -69,33 +82,49 @@ def main():
             break
 
         elif choice == "1":
-            category_input = input(
-                "\nCategory Tag (e.g., 'Politics', 'Crypto') [Enter for 'All']: "
-            ).strip()
+            while True:
+                category_input = input(
+                    "\nCategory Tag(s) (e.g. 'Politics, Geopolitics', '-Sports', or '?' for list) [Enter for 'All']: "
+                ).strip()
+                if category_input in ("?", "list", "help"):
+                    print("\n[+] Top Polymarket Categories & Tags:")
+                    print("    - Politics (Elections, World Elections, US Politics, Geopolitics)")
+                    print("    - Crypto (Bitcoin, Ethereum, Solana, DeFi, Airdrops)")
+                    print("    - Sports (Soccer, Football, Basketball, Tennis, Esports)")
+                    print("    - Business & Economy (Macro, Fed Rates, CPI, Stocks, Tech)")
+                    print("    - Science & AI (AI Models, Tech, Space, Biotech)")
+                    print("    - Pop Culture (Movies, Awards, Music, Social Media)")
+                    print("    Syntax: Include multiple with comma (e.g. 'Politics, Crypto') or exclude with minus (e.g. '-Sports').")
+                    continue
+                break
             category = category_input if category_input else "All"
             print("\nDiscovery Vector:")
-            print(" 1: Volume (Macro Dollars) [Enter]")
-            print(" 2: 24h Volume (Trending Repricing)")
-            print(" 3: Liquidity (Orderbook TVL)")
-            print(" 4: Ending Soonest (Fast Compounding)")
-            print(" 5: Far Horizon (Long-Term Compounding)")
-            print(" 6: Competitive (50/50 Information Velocity)")
-            print(" 7: Niche / Low Volume (Asymmetric Tail Bids)")
-            print(" 8: Freshly Listed (Start Date)")
-            print(" 9: Multi-Vector Aggregated (All Vectors Unified)")
+            print(" 1: Compounding Epistemic Yield (CEY: Event-Diverse EII / sqrt(Time)) [Enter]")
+            print(" 2: Epistemic Impact Index (EII: Event-Diverse Pure Macro Stakes)")
+            print(" 3: Volume (Macro Dollars)")
+            print(" 4: 24h Volume (Trending Repricing)")
+            print(" 5: Liquidity (Orderbook TVL)")
+            print(" 6: Ending Soonest (Fast Compounding)")
+            print(" 7: Far Horizon (Long-Term Compounding)")
+            print(" 8: Competitive (50/50 Information Velocity)")
+            print(" 9: Niche / Low Volume (Asymmetric Tail Bids)")
+            print(" 10: Freshly Listed (Start Date)")
+            print(" 11: Multi-Vector Aggregated (All Vectors Unified)")
             vec_choice = input("> ").strip()
             vec_map = {
-                "1": "volume",
-                "2": "volume24hr",
-                "3": "liquidity",
-                "4": "endDate",
-                "5": "endDate_desc",
-                "6": "competitive",
-                "7": "volume_asc",
-                "8": "startDate",
-                "9": "multi",
+                "1": "cey",
+                "2": "eii",
+                "3": "volume",
+                "4": "volume24hr",
+                "5": "liquidity",
+                "6": "endDate",
+                "7": "endDate_desc",
+                "8": "competitive",
+                "9": "volume_asc",
+                "10": "startDate",
+                "11": "multi",
             }
-            discovery_order = vec_map.get(vec_choice, "volume")
+            discovery_order = vec_map.get(vec_choice, "cey")
 
             print("Reach: [1] Full Platform Depth (20 pages, 2,000 events) [Enter]  [2] High Velocity (Top 5 pages)  [3] Custom Pages (1-20)")
             reach_choice = input("> ").strip()
@@ -115,7 +144,7 @@ def main():
 
         elif choice == "2":
             print(f"\nReview Portfolio & History:")
-            print(f" 1: Active Predictions ({n_pred})")
+            print(f" 1: Active Predictions ({n_pred}) [Enter]")
             print(f" 2: Exited Positions ({n_exit})")
             print(f" 3: Resolved Markets ({n_res})")
             print(f" 4: Skipped Markets ({n_skip})")
@@ -290,6 +319,7 @@ def main():
             print(" 2: Asset vs. Binary Leverage & Efficiency Calculator")
             print(" 3: Data Management (Delete Data, Reset, Manual Resolve)")
             print(" 4: Settings & Threshold Filters (Min Edge, Gamma, Bankroll)")
+            print(" 5: Platform Market Analyzer & Global Category Overview")
             print(" 0: Back to Main Menu")
             t_choice = input("> ").strip()
             if t_choice == "1":
@@ -300,6 +330,9 @@ def main():
                 handle_delete_data()
             elif t_choice == "4":
                 settings_menu()
+            elif t_choice == "5":
+                from analyse import run_interactive_analyzer
+                run_interactive_analyzer()
             continue
 
         else:
