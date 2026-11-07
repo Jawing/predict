@@ -661,10 +661,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 continue
 
             total_scanned_events += len(events)
-            if not is_epistemic_sort:
-                random.shuffle(events)
-
-            batch_event_markets = []
+            random.shuffle(events)
 
             for event in events:
                 if not isinstance(event, dict):
@@ -697,22 +694,9 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                         valid_markets.append(m)
                 
                 if valid_markets:
-                    if is_epistemic_sort:
-                        sort_k = 'cey' if discovery_order == 'cey' else 'eii'
-                        best_m = max(valid_markets, key=lambda x: x.get(sort_k, 0.0))
-                        batch_event_markets.append(best_m)
-                    else:
-                        chosen_m = random.choice(valid_markets)
-                        seen_market_ids.add(chosen_m.get('id'))
-                        yield chosen_m 
-
-            if is_epistemic_sort and batch_event_markets:
-                sort_k = 'cey' if discovery_order == 'cey' else 'eii'
-                batch_event_markets.sort(key=lambda x: x.get(sort_k, 0.0), reverse=True)
-                for chosen_m in batch_event_markets:
-                    if chosen_m.get('id') not in seen_market_ids:
-                        seen_market_ids.add(chosen_m.get('id'))
-                        yield chosen_m 
+                    chosen_m = random.choice(valid_markets)
+                    seen_market_ids.add(chosen_m.get('id'))
+                    yield chosen_m 
 
         print(f"\n[*] Reached end of discovery depth ({total_scanned_events} events checked across {len(query_plans)} page queries for category: '{category}').")
         return

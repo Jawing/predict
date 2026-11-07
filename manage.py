@@ -195,9 +195,9 @@ def clear_specific_category(history):
     """Empties all entries from a selected history category."""
     counts = get_history_counts(history)
     print("\nSelect Category to Clear:")
-    print(f" 1: Active Predictions ({counts['active_markets']} mkts, {counts['active']} tranches)")
-    print(f" 2: Exited Positions ({counts['exited_markets']} mkts, {counts['exited']} tranches)")
-    print(f" 3: Resolved Markets ({counts['resolved_markets']} mkts, {counts['resolved']} tranches)")
+    print(f" 1: Active Predictions ({counts['active_markets']} mkts, {counts['active']} predictions)")
+    print(f" 2: Exited Positions ({counts['exited_markets']} mkts, {counts['exited']} predictions)")
+    print(f" 3: Resolved Markets ({counts['resolved_markets']} mkts, {counts['resolved']} predictions)")
     print(f" 4: Skipped Markets ({counts['skipped']})")
     print(" 5: Cancel")
 

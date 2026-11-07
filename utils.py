@@ -145,6 +145,8 @@ def calculate_position_holding(pred, cur_pm=None, bankroll=100.0):
         return 0.0, 0.0, 0.0
 
     is_wallet = (pred.get("source", "local") == "wallet")
+    if pred.get("exited"):
+        return 0.0, 0.0, 0.0
     has_holdings = is_wallet or (float(pred.get("shares", 0.0) or 0.0) > 0) or (float(pred.get("cost_basis", 0.0) or 0.0) > 0)
     if not has_holdings:
         return 0.0, 0.0, 0.0

@@ -588,6 +588,8 @@ def restore_snapshot_to_prediction(p_target, prev_snap, base_ego=0.5):
         p_target["dynamic_ego"] = float(prev_snap["dynamic_ego"])
     if prev_snap.get("date") is not None:
         p_target["date"] = prev_snap["date"]
+        p_target["last_pu_date"] = prev_snap["date"]
+        p_target.pop("last_pu_ts", None)
     if prev_snap.get("action") is not None:
         p_target["action"] = prev_snap["action"]
         p_target["is_watch"] = (prev_snap["action"] == "WATCH")

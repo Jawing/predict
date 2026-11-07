@@ -63,7 +63,7 @@ def main():
         n_skip = counts["skipped"]
 
         print(" 1: Discover Markets (Scan & Predict)")
-        print(" 2: Review Portfolio & History (Active, Exited, Resolved, Skipped)")
+        print(" 2: Review Portfolio & History (Active, Resolved, Skipped, Calibrate Ego)")
         print(" 3: Target Specific URLs or Slugs")
         print(" 4: Wallet Profiles & Sync (Switch, Add, Sync)")
         print(" 5: Tools & Settings (Calculators, Data Management, Parameters)")
@@ -144,25 +144,23 @@ def main():
 
         elif choice == "2":
             print(f"\nReview Portfolio & History:")
-            print(f" 1: Active Predictions ({n_pred}) [Enter]")
-            print(f" 2: Exited Positions ({n_exit})")
-            print(f" 3: Resolved Markets ({n_res})")
-            print(f" 4: Skipped Markets ({n_skip})")
-            print(f" 5: All Predictions (Active + Exited + Resolved)")
-            print(f" 6: Calibrate Base Ego (Include/Exclude & Custom Kelly)")
+            print(f" 1: Active Markets ({n_pred + n_exit}) [Enter]")
+            print(f" 2: Resolved Markets ({n_res})")
+            print(f" 3: Skipped Markets ({n_skip})")
+            print(f" 4: All Predictions (Active + Resolved)")
+            print(f" 5: Calibrate Base Ego (Include/Exclude & Custom Kelly)")
             review_mode = input("> ").strip()
-            if review_mode == "6":
+            if review_mode == "5":
                 from manage import toggle_ego_market_inclusion
                 toggle_ego_market_inclusion(history)
                 continue
-            if review_mode not in ["1", "2", "3", "4", "5"]:
+            if review_mode not in ["1", "2", "3", "4"]:
                 review_mode = "1"
             sub_mode = {
                 "1": "predicted",
-                "2": "exited",
-                "3": "resolved",
-                "4": "skipped",
-                "5": "all",
+                "2": "resolved",
+                "3": "skipped",
+                "4": "all",
             }[review_mode]
             print_review_table(history, sub_mode)
             continue

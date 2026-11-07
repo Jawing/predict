@@ -188,6 +188,8 @@ def _capture_market_state(m, history, portfolio_len):
     return {
         "in_pred": m_id in history.get("predicted", {}),
         "pred_data": history.get("predicted", {}).get(m_id),
+        "in_exit": m_id in history.get("exited", {}),
+        "exit_data": history.get("exited", {}).get(m_id),
         "in_skip": m_id in history.get("skipped", {}),
         "skip_data": history.get("skipped", {}).get(m_id),
         "portfolio_len": portfolio_len,
@@ -416,7 +418,7 @@ def run_prediction_session(
         _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discovery_order=discovery_order)
 
         prompt_sub = f", 'o' (list {num_avail} mkts)" if num_avail > 0 else ""
-        existing_preds_check = ensure_list(history.get("predicted", {}).get(market_id, []))
+        existing_preds_check = ensure_list(history.get("predicted", {}).get(market_id, [])) or ensure_list(history.get("exited", {}).get(market_id, []))
         has_undo_opt = False
         if existing_preds_check:
             s_chk = existing_preds_check[0].get("snapshots")
@@ -473,7 +475,7 @@ def run_prediction_session(
             break
 
         elif user_input.lower() in ("u", "undo"):
-            existing_preds = ensure_list(history.get("predicted", {}).get(market_id, []))
+            existing_preds = ensure_list(history.get("predicted", {}).get(market_id, [])) or ensure_list(history.get("exited", {}).get(market_id, []))
             if existing_preds:
                 primary_p = existing_preds[0]
                 snaps = primary_p.get("snapshots")
@@ -512,6 +514,11 @@ def run_prediction_session(
                 else:
                     history["predicted"].pop(prev_market_id, None)
 
+                if orig.get("in_exit"):
+                    history["exited"][prev_market_id] = orig["exit_data"]
+                else:
+                    history["exited"].pop(prev_market_id, None)
+
                 if orig["in_skip"]:
                     history["skipped"][prev_market_id] = orig["skip_data"]
                 else:
@@ -543,7 +550,7 @@ def run_prediction_session(
                 except Exception:
                     fee_rate = 0.0
 
-            existing_preds = ensure_list(history.get("predicted", {}).get(market_id, []))
+            existing_preds = ensure_list(history.get("predicted", {}).get(market_id, [])) + ensure_list(history.get("exited", {}).get(market_id, []))
             is_existing = len(existing_preds) > 0
             live_held_val = 0.0
             held_shares = 0.0
@@ -555,7 +562,7 @@ def run_prediction_session(
                     v, _, sh = calculate_position_holding(p, p_live, current_bankroll)
                     live_held_val += v
                     held_shares += sh
-                    if (p.get("source") == "wallet") or (float(p.get("shares", 0.0) or 0.0) > 0) or (float(p.get("cost_basis", 0.0) or 0.0) > 0):
+                    if not p.get("exited") and ((p.get("source") == "wallet") or (float(p.get("shares", 0.0) or 0.0) > 0) or (float(p.get("cost_basis", 0.0) or 0.0) > 0)):
                         has_real_holdings = True
 
             held_mtm_k = (live_held_val / current_bankroll) if (current_bankroll > 0 and live_held_val > 0) else (sum(float(p.get("kelly", 0.0) or 0.0) for p in existing_preds) if has_real_holdings else 0.0)
@@ -685,7 +692,10 @@ def run_prediction_session(
                             if last_existing.get(k_def) is None:
                                 last_existing[k_def] = v_def
 
-                if has_real_holdings:
+                is_wallet_p = (primary_p.get("source") == "wallet")
+                is_exited_p = bool(primary_p.get("exited"))
+
+                if has_real_holdings or (is_wallet_p and is_exited_p):
                     pos_side = primary_p.get("position", pos_side)
                     is_pos_no = (pos_side == "No")
                     stored_pu = round(1.0 - pu_mid_val, 6) if is_pos_no else round(pu_mid_val, 6)
@@ -724,6 +734,8 @@ def run_prediction_session(
                 primary_p["edge"] = adjusted_edge
                 primary_p["apy"] = adjusted_apy
                 primary_p["date"] = today_str
+                primary_p["last_pu_ts"] = now_ts
+                primary_p["last_pu_date"] = today_str
                 primary_p["position"] = pos_side
                 primary_p["spread"] = float(m.get("spread") or (pm_ask - pm_bid) or 0.01)
                 primary_p["volume"] = float(m.get("volume") or 0.0)
@@ -749,7 +761,7 @@ def run_prediction_session(
                     "apy": adjusted_apy,
                     "dynamic_ego": dynamic_ego,
                     "action": action,
-                    "source": "wallet" if has_real_holdings else "local",
+                    "source": "wallet" if (has_real_holdings or is_wallet_p) else "local",
                 }
 
                 last_snap = primary_p["snapshots"][-1]
@@ -1068,7 +1080,10 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
     if auto_commit and len(session_candidates) == 1:
         c = session_candidates[0]
         m_id = c["market_id"]
-        history.setdefault("predicted", {})[m_id] = [c["payload"]]
+        target_bucket = "exited" if (c["payload"].get("exited") or (m_id in history.get("exited", {}) and m_id not in history.get("predicted", {}))) else "predicted"
+        other_bucket = "predicted" if target_bucket == "exited" else "exited"
+        history.get(other_bucket, {}).pop(m_id, None)
+        history.setdefault(target_bucket, {})[m_id] = [c["payload"]]
         history.get("skipped", {}).pop(m_id, None)
         session_trades[m_id] = c["alloc"]
         portfolio_data.append({
@@ -1149,7 +1164,10 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
             for c in sel_candidates:
                 m_id = c["market_id"]
                 payload = c["payload"]
-                history.setdefault("predicted", {})[m_id] = [payload]
+                target_bucket = "exited" if (payload.get("exited") or (m_id in history.get("exited", {}) and m_id not in history.get("predicted", {}))) else "predicted"
+                other_bucket = "predicted" if target_bucket == "exited" else "exited"
+                history.get(other_bucket, {}).pop(m_id, None)
+                history.setdefault(target_bucket, {})[m_id] = [payload]
                 history.get("skipped", {}).pop(m_id, None)
                 session_trades[m_id] = c["alloc"]
                 portfolio_data.append({

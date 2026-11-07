@@ -1,4 +1,5 @@
 """Synchronization of Polymarket wallet positions and automatic market resolution auditing."""
+import concurrent.futures
 from datetime import datetime, timezone
 import time
 import config as cfg
@@ -106,12 +107,58 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 break
         return pos_list
 
-    open_positions = _fetch_v2_positions("OPEN")
+    def _fetch_trades():
+        tb_map = {}
+        t_cursor = None
+        while True:
+            c_param = f"&cursor={t_cursor}" if t_cursor else ""
+            act_url = f"https://data-api.polymarket.com/v2/trades?user={wallet_address}&limit=500{c_param}"
+            act_resp = api.get(act_url, timeout=10).json()
+            raw_trades = act_resp.get("data", []) if isinstance(act_resp, dict) else (act_resp if isinstance(act_resp, list) else [])
+            for ev in raw_trades:
+                if not isinstance(ev, dict):
+                    continue
+                c_id = ev.get("condition_id") or ev.get("conditionId")
+                if not c_id:
+                    continue
+                c_id_lower = c_id.lower()
+                sz = float(ev.get("size") or 0.0)
+                px = float(ev.get("price") or 0.5)
+                tb_map.setdefault(c_id_lower, []).append({
+                    "ts": int(ev.get("timestamp") or 0),
+                    "side": str(ev.get("side") or "BUY").upper(),
+                    "usdc": round(sz * px, 4),
+                    "shares": sz,
+                    "price": px
+                })
+            pagination = act_resp.get("pagination", {}) if isinstance(act_resp, dict) else {}
+            if pagination.get("has_more") and pagination.get("next_cursor"):
+                t_cursor = pagination["next_cursor"]
+            else:
+                break
+        for c_id in tb_map:
+            tb_map[c_id].sort(key=lambda x: x["ts"])
+        return tb_map
+
+    # Run OPEN positions, CLOSED positions, TRADES, and USDC balance queries concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        fut_open = executor.submit(_fetch_v2_positions, "OPEN")
+        fut_closed = executor.submit(_fetch_v2_positions, "CLOSED")
+        fut_trades = executor.submit(_fetch_trades)
+        fut_cash = executor.submit(get_wallet_usdc_balance, wallet_address)
+
+        open_positions = fut_open.result()
+        closed_positions = fut_closed.result()
+        try:
+            trades_by_cond = fut_trades.result()
+        except Exception:
+            trades_by_cond = {}
+        cash_balance = fut_cash.result()
+
     if open_positions is None:
         print("[!] Network error fetching open positions from Polymarket. Preserving existing active portfolio state.")
         return history
 
-    closed_positions = _fetch_v2_positions("CLOSED")
     if closed_positions is None:
         closed_positions = []
 
@@ -135,43 +182,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         if isinstance(cp, dict) and ((cp.get("conditionId") or "").lower(), cp.get("outcome")) not in open_keys
     ]
 
-    trades_by_cond = {}
-    try:
-        t_cursor = None
-        while True:
-            c_param = f"&cursor={t_cursor}" if t_cursor else ""
-            act_url = f"https://data-api.polymarket.com/v2/trades?user={wallet_address}&limit=500{c_param}"
-            act_resp = api.get(act_url, timeout=10).json()
-            raw_trades = act_resp.get("data", []) if isinstance(act_resp, dict) else (act_resp if isinstance(act_resp, list) else [])
-            for ev in raw_trades:
-                if not isinstance(ev, dict):
-                    continue
-                c_id = ev.get("condition_id") or ev.get("conditionId")
-                if not c_id:
-                    continue
-                c_id_lower = c_id.lower()
-                sz = float(ev.get("size") or 0.0)
-                px = float(ev.get("price") or 0.5)
-                trades_by_cond.setdefault(c_id_lower, []).append({
-                    "ts": int(ev.get("timestamp") or 0),
-                    "side": str(ev.get("side") or "BUY").upper(),
-                    "usdc": round(sz * px, 4),
-                    "shares": sz,
-                    "price": px
-                })
-            pagination = act_resp.get("pagination", {}) if isinstance(act_resp, dict) else {}
-            if pagination.get("has_more") and pagination.get("next_cursor"):
-                t_cursor = pagination["next_cursor"]
-            else:
-                break
-        for c_id in trades_by_cond:
-            trades_by_cond[c_id].sort(key=lambda x: x["ts"])
-    except Exception:
-        trades_by_cond = {}
-
     print("[*] Calculating Live Cash & Portfolio Values...")
     prev_bankroll = float(history.get("wallet_summary", {}).get("bankroll", cfg.BANKROLL) or cfg.BANKROLL)
-    cash_balance = get_wallet_usdc_balance(wallet_address)
     if cash_balance is None:
         cash_balance = history.get("wallet_summary", {}).get("cash", 0.0)
     portfolio_value = get_wallet_portfolio_value(wallet_address, open_positions)
@@ -203,10 +215,33 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
     wallet_cond_ids = {(p.get("conditionId") or "").lower() for p in open_positions if isinstance(p, dict) and p.get("conditionId")}
     to_import = []
 
+    # Fast in-memory indexing of history by conditionId for O(1) matching without network queries
+    resolved_by_cond = {}
+    for m_id, res_val in history.get("resolved", {}).items():
+        for r in ensure_list(res_val):
+            cid = (r.get("conditionId") or "").lower()
+            if cid:
+                resolved_by_cond.setdefault(cid, []).append((str(m_id), r))
+
+    exited_by_cond = {}
+    for m_id, ex_val in history.get("exited", {}).items():
+        for e in ensure_list(ex_val):
+            cid = (e.get("conditionId") or "").lower()
+            if cid:
+                exited_by_cond.setdefault(cid, []).append((str(m_id), e))
+
+    predicted_by_cond = {}
+    for m_id, p_val in history.get("predicted", {}).items():
+        for p in ensure_list(p_val):
+            cid = (p.get("conditionId") or "").lower()
+            if cid:
+                predicted_by_cond.setdefault(cid, []).append((str(m_id), p))
+
     for pos in positions:
         cond_id = pos.get("conditionId")
         if not cond_id:
             continue
+        c_id_lower = cond_id.lower()
         pos_outcome_str = pos.get("outcome", "Yes")
         try:
             pos_outcome_idx = int(pos.get("outcomeIndex", 0))
@@ -220,70 +255,57 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         realized_pnl = round(float(pos.get("realizedPnl", pos.get("cashPnl", 0.0)) or 0.0), 4)
         is_from_closed = bool(pos.get("_from_closed"))
 
-        already_in_resolved = False
-        for m_id, res_val in list(history.get("resolved", {}).items()):
-            res_list = ensure_list(res_val)
-            matching_res = [
-                r for r in res_list
-                if r.get("conditionId") == cond_id
-                and (r.get("source") != "wallet" or r.get("position", pos_outcome_str) == pos_outcome_str)
-            ]
-            if matching_res:
-                already_in_resolved = True
-                for r in matching_res:
-                    if r.get("realized_pnl") is None and realized_pnl != 0.0:
-                        r["realized_pnl"] = realized_pnl
-                    updated_existing += 1
-                break
-        if already_in_resolved:
+        cond_trades = trades_by_cond.get(c_id_lower, [])
+        latest_trade_ts = max((t["ts"] for t in cond_trades), default=int(pos.get("timestamp") or 0))
+
+        # 1. Fast match resolved history without network queries
+        if c_id_lower in resolved_by_cond:
+            for m_id, r in resolved_by_cond[c_id_lower]:
+                if r.get("realized_pnl") is None and realized_pnl != 0.0:
+                    r["realized_pnl"] = realized_pnl
+                updated_existing += 1
             continue
 
-        if is_from_closed:
+        # 2. Fast match exited history for closed positions without network queries
+        if is_from_closed and c_id_lower in exited_by_cond:
             tot_bought = float(pos.get("totalBought") or size or 0.0)
             calc_exit_price = max(0.0001, min(0.9999, round(avg_price + (realized_pnl / tot_bought), 4))) if tot_bought > 0 else cur_price
             last_evt_ts = int(pos.get("last_event_at") or pos.get("timestamp") or 0)
             exit_date_str = datetime.fromtimestamp(last_evt_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if last_evt_ts > 0 else None
+            for m_id, e in exited_by_cond[c_id_lower]:
+                e["cur_pm"] = cur_price
+                e["realized_pnl"] = realized_pnl
+                if tot_bought > 0 and avg_price > 0:
+                    e["entry_cost"] = round(tot_bought * avg_price, 4)
+                    e["total_size"] = tot_bought
+                    e["avg_price"] = avg_price
+                    e["entry_price"] = avg_price
+                    if len(e.get("snapshots", [])) <= 1:
+                        e["pm"] = avg_price
+                        if e.get("snapshots"):
+                            e["snapshots"][0]["pm"] = avg_price
+                            e["snapshots"][0]["entry_price"] = avg_price
+                e["entry_bankroll"] = float(e.get("entry_bankroll") or total_bankroll)
+                if calc_exit_price is not None:
+                    e["exit_price"] = calc_exit_price
+                if exit_date_str:
+                    e["date"] = exit_date_str
+                updated_existing += 1
+            continue
 
-            already_in_exited = False
-            for m_id, ex_val in list(history.get("exited", {}).items()):
-                ex_list = ensure_list(ex_val)
-                matching_ex = [
-                    e for e in ex_list
-                    if e.get("conditionId") == cond_id
-                    and (e.get("source") != "wallet" or e.get("position", pos_outcome_str) == pos_outcome_str)
-                ]
-                if not matching_ex:
-                    continue
-                already_in_exited = True
-                for e in matching_ex:
-                    e["cur_pm"] = cur_price
-                    e["realized_pnl"] = realized_pnl
-                    if tot_bought > 0 and avg_price > 0:
-                        e["entry_cost"] = round(tot_bought * avg_price, 4)
-                        e["total_size"] = tot_bought
-                        e["avg_price"] = avg_price
-                        e["entry_price"] = avg_price
-                        if len(e.get("snapshots", [])) <= 1:
-                            e["pm"] = avg_price
-                            if e.get("snapshots"):
-                                e["snapshots"][0]["pm"] = avg_price
-                                e["snapshots"][0]["entry_price"] = avg_price
-                    e["entry_bankroll"] = float(e.get("entry_bankroll") or total_bankroll)
-                    if calc_exit_price is not None:
-                        e["exit_price"] = calc_exit_price
-                    if exit_date_str:
-                        e["date"] = exit_date_str
-                    updated_existing += 1
-                break
-            if already_in_exited:
-                continue
-
-        m, market_id, question, slug, end_date = resolve_position_market_metadata(pos, event_cache)
-        cond_trades = trades_by_cond.get((cond_id or "").lower(), [])
-        latest_trade_ts = max((t["ts"] for t in cond_trades), default=int(pos.get("timestamp") or 0))
+        # For remaining positions: determine if already in predicted or genuinely new
+        if c_id_lower in predicted_by_cond:
+            m = None
+            market_id = predicted_by_cond[c_id_lower][0][0]
+            p_ref = predicted_by_cond[c_id_lower][0][1]
+            question = p_ref.get("question") or pos.get("title") or "unknown"
+            slug = p_ref.get("slug") or pos.get("slug") or "unknown"
+            end_date = p_ref.get("endDate") or pos.get("endDate")
+        else:
+            m, market_id, question, slug, end_date = resolve_position_market_metadata(pos, event_cache)
 
         is_market_resolved = bool(m and (m.get("closed") or m.get("umaResolutionStatus") == "resolved"))
-        is_resolved_pos = bool(pos.get("redeemable")) or is_market_resolved or (is_from_closed and (cur_price >= 0.99 or cur_price <= 0.01))
+        is_resolved_pos = bool(pos.get("redeemable")) or is_market_resolved
         is_exited_open_pos = is_from_closed and not is_resolved_pos
         pos["redeemable"] = is_resolved_pos
         pos["_exited"] = is_exited_open_pos
@@ -297,9 +319,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             preds_list = ensure_list(history["predicted"][m_id])
             matching_preds = [
                 p for p in preds_list
-                if (p.get("conditionId") or "").lower() == c_id_lower and (
-                    p.get("source") != "wallet" or p.get("position", pos_outcome_str) == pos_outcome_str
-                )
+                if (c_id_lower and (p.get("conditionId") or "").lower() == c_id_lower)
+                or (market_id and str(m_id) == str(market_id))
             ]
             if not matching_preds:
                 continue
@@ -567,6 +588,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                     history["predicted"].pop(target_key, None)
 
             if pos.get("redeemable"):
+                if m is None:
+                    m, _, _, _, _ = resolve_position_market_metadata(pos, event_cache)
                 outcome_val = determine_redeemable_outcome(pos, m)
                 cur_preds = ensure_list(history["predicted"].get(target_key, []))
                 to_resolve = [
@@ -967,74 +990,101 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
 
 
 def update_resolutions(history):
-    """Audits unresolved predictions in predicted bucket against Gamma API."""
+    """Audits unresolved predictions in predicted and exited buckets against Gamma API."""
     resolved_count = 0
     history.setdefault("predicted", {})
+    history.setdefault("exited", {})
     history.setdefault("resolved", {})
-    market_ids = list(history.get("predicted", {}).keys())
+    market_ids = list({
+        str(mid) for mid in list(history.get("predicted", {}).keys()) + list(history.get("exited", {}).keys())
+        if not str(mid).startswith("custom_")
+    })
     if market_ids:
         print(f"[*] Auditing {len(market_ids)} unresolved market(s) for resolution...")
 
-    for market_id in market_ids:
-        if str(market_id).startswith("custom_"):
-            continue
+    chunk_size = 40
+    for i in range(0, len(market_ids), chunk_size):
+        chunk = market_ids[i:i + chunk_size]
+        resp_map = {}
         try:
-            resp = api.get(f"{cfg.GAMMA_API}/markets/{market_id}", timeout=10).json()
-            is_closed = resp.get("closed", False)
-            uma_resolved = resp.get("umaResolutionStatus") == "resolved"
-
-            if is_closed or uma_resolved:
-                prices = parse_outcome_prices(resp)
-                if len(prices) < 2:
-                    prices = [0.5, 0.5]
-
-                pred_list = ensure_list(history["predicted"][market_id])
-                history["resolved"].setdefault(market_id, [])
-                is_wallet_prof = bool(str(history.get("profile_id") or history.get("wallet_address") or "").startswith("0x"))
-
-                for pred_data in pred_list:
-                    cb = float(pred_data.get("cost_basis", 0.0) or pred_data.get("entry_cost", 0.0) or 0.0)
-                    sh = float(pred_data.get("shares", 0.0) or 0.0)
-                    is_unexec_local = (is_wallet_prof and pred_data.get("source") != "wallet" and cb <= 0.0 and sh <= 0.0)
-                    is_watch_pred = bool(pred_data.get("is_watch") or pred_data.get("action") == "WATCH")
-                    pos_pos = str(pred_data.get("position", "Yes")).lower()
-                    out_idx = 1 if pos_pos in ("no", "1") else 0
-                    if "outcomeIndex" in pred_data:
-                        try:
-                            out_idx = int(pred_data.get("outcomeIndex", out_idx))
-                        except Exception:
-                            pass
-                    if len(prices) > out_idx:
-                        outcome = 1.0 if prices[out_idx] >= 0.99 else (0.0 if prices[out_idx] <= 0.01 else 0.5)
-                    else:
-                        outcome = 0.5
-                    resolved_entry = dict(pred_data)
-                    resolved_entry["outcome"] = outcome
-                    if is_unexec_local or is_watch_pred:
-                        resolved_entry["realized_pnl"] = None
-                    elif resolved_entry.get("realized_pnl") is None or float(resolved_entry.get("realized_pnl", 0.0) or 0.0) == 0.0:
-                        ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
-                        active_b = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
-                        k_eval = float(resolved_entry.get("entry_kelly") or resolved_entry.get("kelly", 0.0) or 0.0)
-                        if not is_wallet_prof and cb == 0.0 and k_eval > 0:
-                            cb = k_eval * active_b
-                            if sh == 0.0 and resolved_entry.get("pm", 0.0):
-                                sh = cb / float(resolved_entry["pm"])
-                        if sh > 0 or cb > 0:
-                            if outcome == 1.0:
-                                resolved_entry["realized_pnl"] = round(sh * 1.0 - cb, 2)
-                            elif outcome == 0.0:
-                                resolved_entry["realized_pnl"] = round(-cb, 2)
-                            elif outcome == 0.5:
-                                resolved_entry["realized_pnl"] = round(sh * 0.5 - cb, 2)
-                    history["resolved"][market_id].append(resolved_entry)
-                if not history["resolved"][market_id]:
-                    history["resolved"].pop(market_id, None)
-
-                del history["predicted"][market_id]
-                resolved_count += 1
+            url = f"{cfg.GAMMA_API}/markets?" + "&".join(f"id={mid}" for mid in chunk)
+            batch_res = api.get(url, timeout=6).json()
+            if isinstance(batch_res, list):
+                resp_map = {str(item.get("id")): item for item in batch_res if item.get("id")}
         except Exception:
-            continue
+            resp_map = {}
+
+        for market_id in chunk:
+            try:
+                m_data = resp_map.get(market_id)
+                if not m_data:
+                    try:
+                        m_data = api.get(f"{cfg.GAMMA_API}/markets/{market_id}", timeout=5).json()
+                    except Exception:
+                        continue
+                if not isinstance(m_data, dict):
+                    continue
+
+                resp = m_data
+                is_closed = resp.get("closed", False)
+                uma_resolved = resp.get("umaResolutionStatus") == "resolved"
+
+                if is_closed or uma_resolved:
+                    prices = parse_outcome_prices(resp)
+                    if len(prices) < 2:
+                        prices = [0.5, 0.5]
+
+                    pred_list = ensure_list(history["predicted"].get(market_id, [])) + ensure_list(history["exited"].get(market_id, []))
+                    history["resolved"].setdefault(market_id, [])
+                    is_wallet_prof = bool(str(history.get("profile_id") or history.get("wallet_address") or "").startswith("0x"))
+
+                    for pred_data in pred_list:
+                        is_exited_p = bool(pred_data.get("exited"))
+                        cb = float(pred_data.get("cost_basis", 0.0) or pred_data.get("entry_cost", 0.0) or 0.0)
+                        sh = float(pred_data.get("shares", 0.0) or 0.0)
+                        is_unexec_local = (is_wallet_prof and pred_data.get("source") != "wallet" and cb <= 0.0 and sh <= 0.0)
+                        is_watch_pred = bool(pred_data.get("is_watch") or pred_data.get("action") == "WATCH")
+                        pos_pos = str(pred_data.get("position", "Yes")).lower()
+                        out_idx = 1 if pos_pos in ("no", "1") else 0
+                        if "outcomeIndex" in pred_data:
+                            try:
+                                out_idx = int(pred_data.get("outcomeIndex", out_idx))
+                            except Exception:
+                                pass
+                        if len(prices) > out_idx:
+                            outcome = 1.0 if prices[out_idx] >= 0.99 else (0.0 if prices[out_idx] <= 0.01 else 0.5)
+                        else:
+                            outcome = 0.5
+                        resolved_entry = dict(pred_data)
+                        resolved_entry["outcome"] = outcome
+                        if is_exited_p:
+                            pass  # Preserve already-realized exit PnL
+                        elif is_unexec_local or is_watch_pred:
+                            resolved_entry["realized_pnl"] = None
+                        elif resolved_entry.get("realized_pnl") is None or float(resolved_entry.get("realized_pnl", 0.0) or 0.0) == 0.0:
+                            ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
+                            active_b = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
+                            k_eval = float(resolved_entry.get("entry_kelly") or resolved_entry.get("kelly", 0.0) or 0.0)
+                            if not is_wallet_prof and cb == 0.0 and k_eval > 0:
+                                cb = k_eval * active_b
+                                if sh == 0.0 and resolved_entry.get("pm", 0.0):
+                                    sh = cb / float(resolved_entry["pm"])
+                            if sh > 0 or cb > 0:
+                                if outcome == 1.0:
+                                    resolved_entry["realized_pnl"] = round(sh * 1.0 - cb, 2)
+                                elif outcome == 0.0:
+                                    resolved_entry["realized_pnl"] = round(-cb, 2)
+                                elif outcome == 0.5:
+                                    resolved_entry["realized_pnl"] = round(sh * 0.5 - cb, 2)
+                        history["resolved"][market_id].append(resolved_entry)
+                    if not history["resolved"][market_id]:
+                        history["resolved"].pop(market_id, None)
+
+                    history["predicted"].pop(market_id, None)
+                    history["exited"].pop(market_id, None)
+                    resolved_count += 1
+            except Exception:
+                continue
 
     if resolved_count > 0:
         print(f"[+] Auto-resolved and scored {resolved_count} closed market(s).")
