@@ -223,10 +223,14 @@ def _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discov
     vol_val = float(m.get("volume", 0.0) or m.get("volumeNum", 0.0) or 0.0)
     eii_val = float(m.get("eii", 0.0) or 0.0)
     cey_val = float(m.get("cey", 0.0) or 0.0)
+    pulse_val = float(m.get("pulse", 0.0) or 0.0)
+    churn_val = float(m.get("churn", 0.0) or 0.0)
 
     parts = [
         f"CEY: {cey_val:,.0f}",
         f"EII: ${eii_val:,.0f}",
+        f"Pulse: ${pulse_val:,.0f}",
+        f"Churn: {churn_val:.2f}x",
         f"Vol: ${vol_val:,.0f}",
     ]
 
@@ -1030,6 +1034,8 @@ def run_prediction_session(
                     "days_until": days_until,
                     "regime": lm["regime"],
                     "target": norm_target,
+                    "clobTokenIds": m.get("clobTokenIds"),
+                    "fee_rate": fee_rate,
                     "selected": True,
                 }
                 session_candidates = [c for c in session_candidates if c["market_id"] != market_id]
@@ -1071,19 +1077,15 @@ def run_prediction_session(
     return pd.DataFrame(portfolio_data)
 
 
-def _review_and_commit_candidates(session_candidates, history, current_bankroll, portfolio_data, session_trades, auto_commit=False):
-    """Presents staged session candidates sorted by edge with smart default recommendation within Kelly limits."""
-    if not session_candidates:
-        print("\n[*] Session completed with 0 candidates staged.")
-        return
-
-    if auto_commit and len(session_candidates) == 1:
-        c = session_candidates[0]
+def _commit_selected_candidates_to_history(sel_candidates, history, portfolio_data, session_trades):
+    """Commits selected staged candidates into history buckets and updates portfolio_data."""
+    for c in sel_candidates:
         m_id = c["market_id"]
-        target_bucket = "exited" if (c["payload"].get("exited") or (m_id in history.get("exited", {}) and m_id not in history.get("predicted", {}))) else "predicted"
+        payload = c["payload"]
+        target_bucket = "exited" if (payload.get("exited") or (m_id in history.get("exited", {}) and m_id not in history.get("predicted", {}))) else "predicted"
         other_bucket = "predicted" if target_bucket == "exited" else "exited"
         history.get(other_bucket, {}).pop(m_id, None)
-        history.setdefault(target_bucket, {})[m_id] = [c["payload"]]
+        history.setdefault(target_bucket, {})[m_id] = [payload]
         history.get("skipped", {}).pop(m_id, None)
         session_trades[m_id] = c["alloc"]
         portfolio_data.append({
@@ -1095,7 +1097,120 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
             "EffKelly": f"{c['eff_kelly']*100:.2f}%",
             "Alloc": f"${c['alloc']:,.2f}",
         })
-        save_history(history)
+    save_history(history)
+
+
+def _execute_live_buy_candidates(sel_candidates, history):
+    """Previews buy orders and either prints zero-key browser tickets or submits via CLOB."""
+    from storage import get_active_profile
+    from trade import (
+        get_clob_config,
+        preview_buy_order,
+        execute_order,
+        prompt_browser_confirm_and_sync,
+        sync_wallet_after_trade,
+    )
+
+    active_pid = history.get("profile_id") or get_active_profile()
+    conf = get_clob_config(profile_id=active_pid, detect_remote=False)
+    if not conf["is_live_wallet"]:
+        print("[!] Live orders require an active 0x wallet profile (switch via Option 4).")
+        return False
+
+    buyable = [
+        c for c in sel_candidates
+        if float(c.get("alloc", 0.0) or 0.0) > 0 and c.get("action") in ("YES", "NO", "ADD")
+    ]
+    if not buyable:
+        print("[!] No selected candidates have a positive BUY / ADD allocation.")
+        return False
+
+    previews = []
+    for c in buyable:
+        clob_ids = c.get("clobTokenIds") or c.get("payload", {}).get("clobTokenIds")
+        yes_tok, no_tok = get_market_clob_tokens({"clobTokenIds": clob_ids})
+        tok = no_tok if c.get("side") == "No" else yes_tok
+        if not tok:
+            previews.append({"candidate": c, "preview": {"ok": False, "reason": "Missing CLOB token ID"}})
+            continue
+        try:
+            prev = preview_buy_order(
+                token_id=tok,
+                usdc_amount=float(c["alloc"]),
+                p_norm=c.get("target"),
+                fee_rate=float(c.get("fee_rate", 0.0) or 0.0),
+                min_edge=float(getattr(cfg, "MIN_EDGE", 0.0) or 0.0),
+                order_type="FAK",
+                profile_id=active_pid,
+            )
+        except Exception as e:
+            prev = {"ok": False, "reason": str(e)}
+        previews.append({"candidate": c, "preview": prev})
+
+    mode_hdr = "LIVE CLOB ORDER PREVIEW (FAK Market Orders)" if conf["has_private_key"] else "ZERO-KEY PRE-FLIGHT TICKETS (Confirm in Browser)"
+    print(f"\n--- {mode_hdr} ---")
+    print(f"Wallet   : {active_pid}")
+    if conf["has_private_key"]:
+        conf_full = get_clob_config(profile_id=active_pid, detect_remote=True)
+        print(f"Auth     : {conf_full['signature_label']} ({conf_full['signature_note']})")
+    else:
+        print("Mode     : Zero-Key (no private key on disk)")
+
+    valid_items = []
+    for idx, item in enumerate(previews, 1):
+        c = item["candidate"]
+        p = item["preview"]
+        q_short = (c["question"][:42] + "...") if len(c["question"]) > 45 else c["question"]
+        slug_val = c.get("slug") or c.get("payload", {}).get("slug")
+        ev_url = f"https://polymarket.com/event/{slug_val}" if slug_val and slug_val != "custom" else ""
+        item["url"] = ev_url
+        if p.get("ok"):
+            valid_items.append(item)
+            print(
+                f"  [{idx}] BUY {c['side']:<3} | ${p['amount_usdc']:,.2f} (~{p['est_shares']:,.1f} sh @ {p['est_vwap']*100:.1f}% VWAP, "
+                f"max {p['price_cap']*100:.1f}c) | {q_short}"
+            )
+            if not conf["has_private_key"] and ev_url:
+                print(f"      URL: {ev_url}")
+        else:
+            print(f"  [{idx}] SKIP ({p.get('reason', 'invalid')}) | {q_short}")
+
+    if not valid_items:
+        print("[!] No valid orders to prepare.")
+        return False
+
+    if not conf["has_private_key"]:
+        return prompt_browser_confirm_and_sync([it.get("url") for it in valid_items], active_pid, history)
+
+    tot_live = sum(it["preview"]["amount_usdc"] for it in valid_items)
+    confirm = input(f"\nType 'CONFIRM' to submit {len(valid_items)} live order(s) totaling ${tot_live:,.2f}: ").strip()
+    if confirm != "CONFIRM":
+        print("[*] Live order execution cancelled (candidates remain saved locally).")
+        return False
+
+    succeeded = 0
+    for item in valid_items:
+        c = item["candidate"]
+        res = execute_order(item["preview"], profile_id=active_pid)
+        if res.get("ok"):
+            succeeded += 1
+            print(f"  [+] {c['question'][:40]} -> {res.get('status')} (Order ID: {res.get('order_id') or 'N/A'})")
+        else:
+            print(f"  [!] {c['question'][:40]} -> FAILED: {res.get('error')}")
+
+    if succeeded > 0:
+        sync_wallet_after_trade(active_pid, history)
+    return succeeded > 0
+
+
+def _review_and_commit_candidates(session_candidates, history, current_bankroll, portfolio_data, session_trades, auto_commit=False):
+    """Presents staged session candidates sorted by edge with smart default recommendation within Kelly limits."""
+    if not session_candidates:
+        print("\n[*] Session completed with 0 candidates staged.")
+        return
+
+    if auto_commit and len(session_candidates) == 1:
+        _commit_selected_candidates_to_history(session_candidates, history, portfolio_data, session_trades)
         return
 
     # Sort: highest edge first
@@ -1118,6 +1233,10 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
         else:
             c["selected"] = False
             c["recommended"] = False
+
+    from storage import get_active_profile
+    active_pid = history.get("profile_id") or get_active_profile()
+    is_live_wallet = bool(active_pid and str(active_pid).startswith("0x"))
 
     while True:
         box_len = 117
@@ -1154,33 +1273,26 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
         if tot_sel_alloc > current_bankroll + 1.0:
             print(f"[!] Warning    : Selected allocation exceeds bankroll by ${tot_sel_alloc - current_bankroll:,.2f}")
 
-        act_prompt = f"\nActions: [Enter] Commit Selected  [1-{len(session_candidates)}] Toggle  [a] Select All  [q] Discard All\n> "
+        from trade import is_live_trading_ready
+        live_label = "Commit & Live Buy" if is_live_trading_ready(profile_id=active_pid) else "Commit & Pre-Flight"
+        live_opt = f"  [x] {live_label}" if is_live_wallet else ""
+        act_prompt = f"\nActions: [Enter] Commit Selected{live_opt}  [1-{len(session_candidates)}] Toggle  [a] Select All  [q] Discard All\n> "
         choice = input(act_prompt).strip().lower()
 
         if choice == "":
             if not sel_candidates:
                 print("[*] No candidates selected. Session ended without commits.")
                 break
-            for c in sel_candidates:
-                m_id = c["market_id"]
-                payload = c["payload"]
-                target_bucket = "exited" if (payload.get("exited") or (m_id in history.get("exited", {}) and m_id not in history.get("predicted", {}))) else "predicted"
-                other_bucket = "predicted" if target_bucket == "exited" else "exited"
-                history.get(other_bucket, {}).pop(m_id, None)
-                history.setdefault(target_bucket, {})[m_id] = [payload]
-                history.get("skipped", {}).pop(m_id, None)
-                session_trades[m_id] = c["alloc"]
-                portfolio_data.append({
-                    "Question": c["question"][:50] + "..",
-                    "Action": c["action"],
-                    "Ego": f"{c['dynamic_ego']:.2f}",
-                    "Price": f"{c['price']*100:.1f}%",
-                    "Kelly": f"{c['eff_kelly']*100:.2f}%",
-                    "EffKelly": f"{c['eff_kelly']*100:.2f}%",
-                    "Alloc": f"${c['alloc']:,.2f}",
-                })
-            save_history(history)
+            _commit_selected_candidates_to_history(sel_candidates, history, portfolio_data, session_trades)
             print(f"\n[+] Successfully committed {len(sel_candidates)} candidate(s) to active portfolio (${tot_sel_alloc:,.2f} total).")
+            break
+        elif choice == "x" and is_live_wallet:
+            if not sel_candidates:
+                print("[!] No candidates selected.")
+                continue
+            _commit_selected_candidates_to_history(sel_candidates, history, portfolio_data, session_trades)
+            print(f"\n[+] Committed {len(sel_candidates)} candidate(s) to portfolio.")
+            _execute_live_buy_candidates(sel_candidates, history)
             break
         elif choice == "q":
             print("\n[*] Discarded all staged candidates (0 committed).")

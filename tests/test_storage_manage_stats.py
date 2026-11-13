@@ -7,7 +7,9 @@ import unittest
 from unittest.mock import patch
 
 import config as cfg
+import analyse
 import manage
+import market
 import storage
 import views
 
@@ -210,6 +212,92 @@ class TestViewsPredictionStats(unittest.TestCase):
         tbl_out = tbl_buf.getvalue()
         self.assertIn("WATCH (No Edge:", tbl_out)
         self.assertNotIn("EXEC BUY $0", tbl_out)
+
+    def test_resolved_calibration_bias_and_luck_z_score(self):
+        import io
+        from contextlib import redirect_stdout
+
+        # 6 balanced 50/50 resolved bets all winning -> extremely lucky positive Z-score and positive bias
+        resolved_entries = {
+            f"r{i}": [{
+                "question": f"Resolved Q{i}",
+                "position": "Yes",
+                "pu": 0.60,
+                "pm": 0.50,
+                "cur_pm": 1.0,
+                "outcome": 1.0,
+                "kelly": 0.10,
+                "realized_pnl": 10.0,
+                "source": "local",
+            }]
+            for i in range(6)
+        }
+        history = {
+            "profile_id": "local",
+            "wallet_summary": {"bankroll": 100.0},
+            "predicted": {},
+            "exited": {},
+            "resolved": resolved_entries,
+        }
+        stats = views.calculate_prediction_stats(history, sub_mode="resolved", base_ego=0.5, refresh_meta=False)
+        self.assertEqual(stats["res_count"], 6)
+        self.assertAlmostEqual(stats["res_actual_win_rate"], 1.0)
+        self.assertGreater(stats["res_calib_bias_u"], 0.35)
+        self.assertGreater(stats["res_luck_z"], 2.0)
+        self.assertEqual(views.classify_luck_z(stats["res_luck_z"]), "Extremely Lucky")
+        self.assertEqual(views.classify_luck_z(-2.1), "Extremely Unlucky")
+        self.assertEqual(views.classify_luck_z(0.2), "Normal Variance")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            views.print_prediction_stats(history, sub_mode="resolved", base_ego=0.5, refresh_meta=False)
+            views.print_main_menu_dashboard(history)
+        out = buf.getvalue()
+        self.assertIn("Calibration Bias :", out)
+        self.assertIn("Luck Z-Score     :", out)
+        self.assertIn("Extremely Lucky", out)
+        self.assertIn("Reflection     :", out)
+
+    def test_epistemic_pulse_and_book_churn_metrics(self):
+        m_high_pulse = {
+            "outcomePrices": '["0.50", "0.50"]',
+            "bestBid": 0.49,
+            "bestAsk": 0.51,
+            "endDate": "2030-01-01T00:00:00Z",
+            "volumeNum": 100000.0,
+            "volume24hr": 40000.0,
+            "liquidity": 10000.0,
+        }
+        m_low_liq = {
+            "outcomePrices": '["0.90", "0.10"]',
+            "bestBid": 0.89,
+            "bestAsk": 0.91,
+            "endDate": "2030-01-01T00:00:00Z",
+            "volumeNum": 50000.0,
+            "volume24hr": 20000.0,
+            "liquidity": 0.0,
+        }
+        odds, _, _, vol, v24, vel, liq, eff, eii, cey, pulse, churn = analyse.extract_market_metrics(m_high_pulse)
+        self.assertAlmostEqual(eff, 1.0)
+        self.assertAlmostEqual(pulse, 40000.0)
+        self.assertAlmostEqual(pulse, eii * vel)
+        self.assertAlmostEqual(churn, 4.0)
+
+        _, _, _, _, _, _, _, eff2, _, _, pulse2, churn2 = analyse.extract_market_metrics(m_low_liq)
+        self.assertAlmostEqual(eff2, 4.0 * 0.9 * 0.1)
+        self.assertAlmostEqual(pulse2, eff2 * 20000.0)
+        self.assertEqual(churn2, 0.0)
+
+        market.enrich_market_scale_metrics(m_high_pulse)
+        self.assertAlmostEqual(m_high_pulse["pulse"], 40000.0)
+        self.assertAlmostEqual(m_high_pulse["churn"], 4.0)
+
+        rows = [
+            {"id": "a", "pulse": 100.0, "churn": 5.0},
+            {"id": "b", "pulse": 5000.0, "churn": 1.2},
+        ]
+        self.assertEqual([r["id"] for r in analyse.sort_markets(rows, "14", False)], ["b", "a"])
+        self.assertEqual([r["id"] for r in analyse.sort_markets(rows, "15", False)], ["a", "b"])
 
 
 if __name__ == "__main__":

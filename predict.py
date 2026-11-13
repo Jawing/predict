@@ -110,6 +110,7 @@ def main():
             print(" 9: Niche / Low Volume (Asymmetric Tail Bids)")
             print(" 10: Freshly Listed (Start Date)")
             print(" 11: Multi-Vector Aggregated (All Vectors Unified)")
+            print(" 12: Live Epistemic Pulse (Event-Diverse Eff * 24h Vol = EII * Vel)")
             vec_choice = input("> ").strip()
             vec_map = {
                 "1": "cey",
@@ -123,6 +124,7 @@ def main():
                 "9": "volume_asc",
                 "10": "startDate",
                 "11": "multi",
+                "12": "pulse",
             }
             discovery_order = vec_map.get(vec_choice, "cey")
 

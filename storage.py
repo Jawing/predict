@@ -202,6 +202,9 @@ def load_history(profile_id=None):
                     for k in ["MIN_EDGE", "MAX_DAYS", "MIN_DAYS", "EXTREME_ODDS"]:
                         if k in saved_st:
                             setattr(cfg, k, saved_st[k])
+                    if not os.getenv("CLOB_SIGNATURE_TYPE", "").strip():
+                        saved_sig = saved_st.get("CLOB_SIGNATURE_TYPE")
+                        cfg.CLOB_SIGNATURE_TYPE = int(saved_sig) if saved_sig in (0, 1, 2) else None
 
                 return data
         except json.JSONDecodeError as e:

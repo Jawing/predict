@@ -458,7 +458,7 @@ def event_matches_category(event, include_tags, exclude_tags):
 
 
 def enrich_market_scale_metrics(m, event=None, discovery_vector=None):
-    """Populates CEY, EII, Volume, efficiency, and discovery-vector metrics on a market dict."""
+    """Populates CEY, EII, Pulse, Churn, Volume, efficiency, and discovery-vector metrics on a market dict."""
     if not isinstance(m, dict):
         return m
     pm_bid, pm_ask, pm_mid = extract_prices(m)
@@ -467,16 +467,22 @@ def enrich_market_scale_metrics(m, event=None, discovery_vector=None):
     odds = pm_mid if (pm_mid is not None and 0.0 < pm_mid < 1.0) else 0.5
     eff = 4.0 * odds * (1.0 - odds)
     vol = float(m.get("volume", 0.0) or m.get("volumeNum", 0.0) or 0.0)
+    v24 = float(m.get("volume24hr", 0.0) or 0.0)
+    liq = float(m.get("liquidity", 0.0) or m.get("liquidityNum", 0.0) or 0.0)
     eii = eff * vol
     _, _, days_until = parse_market_date(m.get("endDate"))
     days = max(0.1, days_until) if days_until is not None else 30.0
     cey = eii / math.sqrt(days + 7.0)
+    pulse = eff * v24
+    churn = (v24 / liq) if liq > 0 else 0.0
 
     if pm_mid is not None:
         m["cached_bid"], m["cached_ask"], m["cached_mid"] = pm_bid, pm_ask, pm_mid
     m["eff"] = eff
     m["eii"] = eii
     m["cey"] = cey
+    m["pulse"] = pulse
+    m["churn"] = churn
     m["days_until"] = days
 
     if isinstance(event, dict):
@@ -508,7 +514,8 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
             for off in offsets:
                 query_plans.append((None, off))
 
-        is_epistemic_sort = str(discovery_order).lower() in ("cey", "eii")
+        order_low = str(discovery_order).lower()
+        is_epistemic_sort = order_low in ("cey", "eii", "pulse")
         if is_epistemic_sort:
             vectors = [
                 ("volume", "false"),        # Macro volume titans
@@ -567,6 +574,7 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                         seen_event_ids.add(eid)
                     all_scanned_events.append(ev)
 
+            sort_k = order_low if order_low in ("cey", "pulse") else "eii"
             ranked_event_markets = []
             for event in all_scanned_events:
                 matches, matched_name = event_matches_category(event, include_tags, exclude_tags)
@@ -595,11 +603,9 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                         valid_markets.append(m)
 
                 if valid_markets:
-                    sort_k = 'cey' if discovery_order == 'cey' else 'eii'
                     best_m = max(valid_markets, key=lambda x: x.get(sort_k, 0.0))
                     ranked_event_markets.append(best_m)
 
-            sort_k = 'cey' if discovery_order == 'cey' else 'eii'
             ranked_event_markets.sort(key=lambda x: x.get(sort_k, 0.0), reverse=True)
             print(f"[+] Multi-Vector Heuristic Complete: Evaluated {len(all_scanned_events)} unique events -> {len(ranked_event_markets)} event-diverse markets ranked by {discovery_order.upper()}.\n")
 

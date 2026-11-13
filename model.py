@@ -477,27 +477,33 @@ def calculate_allocation(lower_bound, upper_bound, pm_bid, pm_ask, fee_rate, ban
     return action, true_price, raw_kelly, eff_kelly, final_allocation, dynamic_ego, edge, lm
 
 
+def _parse_book_levels(levels, reverse=False):
+    """Normalizes CLOB bid/ask entries into sorted (price, size) tuples."""
+    parsed = []
+    for lvl in levels or []:
+        try:
+            if isinstance(lvl, (list, tuple)):
+                price, size = float(lvl[0]), float(lvl[1])
+            elif isinstance(lvl, dict):
+                price, size = float(lvl.get("price", 0)), float(lvl.get("size", 0))
+            else:
+                continue
+            if price > 0 and size > 0:
+                parsed.append((price, size))
+        except Exception:
+            continue
+    parsed.sort(key=lambda x: x[0], reverse=reverse)
+    return parsed
+
+
 def calculate_vwap(asks, target_usdc):
     """Walks the order book asks ascendingly to determine volume-weighted average price."""
     if not asks or target_usdc <= 0:
         return 0.0, 0.0
-    valid_asks = []
-    for ask in asks:
-        try:
-            if isinstance(ask, (list, tuple)):
-                price, size = float(ask[0]), float(ask[1])
-            elif isinstance(ask, dict):
-                price, size = float(ask.get('price', 0)), float(ask.get('size', 0))
-            else:
-                continue
-            if price > 0 and size > 0:
-                valid_asks.append((price, size))
-        except Exception:
-            continue
+    valid_asks = _parse_book_levels(asks, reverse=False)
     if not valid_asks:
         return 0.0, 0.0
 
-    valid_asks.sort(key=lambda x: x[0])
     total_shares = 0.0
     remaining_usdc = target_usdc
     total_spent = 0.0
@@ -528,23 +534,10 @@ def calculate_optimal_market_buy(asks, target_usdc, p_norm, fee_rate=0.0, min_ed
     """
     if not asks or target_usdc <= 0:
         return 0.0, 0.0, 0.0
-    valid_asks = []
-    for ask in asks:
-        try:
-            if isinstance(ask, (list, tuple)):
-                price, size = float(ask[0]), float(ask[1])
-            elif isinstance(ask, dict):
-                price, size = float(ask.get('price', 0)), float(ask.get('size', 0))
-            else:
-                continue
-            if price > 0 and size > 0:
-                valid_asks.append((price, size))
-        except Exception:
-            continue
+    valid_asks = _parse_book_levels(asks, reverse=False)
     if not valid_asks:
         return 0.0, 0.0, 0.0
 
-    valid_asks.sort(key=lambda x: x[0])
     cum_usd = 0.0
     cum_sh = 0.0
 
@@ -577,6 +570,65 @@ def calculate_optimal_market_buy(asks, target_usdc, p_norm, fee_rate=0.0, min_ed
         vwap_edge = p_norm - vwap_fee
 
     return round(cum_usd, 2), round(vwap, 4), round(vwap_edge, 4)
+
+
+def calculate_sell_vwap(bids, target_shares):
+    """Walks the order book bids descendingly to estimate sell VWAP and USDC proceeds."""
+    if not bids or target_shares <= 0:
+        return 0.0, 0.0, 0.0
+    valid_bids = _parse_book_levels(bids, reverse=True)
+    if not valid_bids:
+        return 0.0, 0.0, 0.0
+
+    remaining_shares = float(target_shares)
+    filled_shares = 0.0
+    total_proceeds = 0.0
+    for price, size in valid_bids:
+        take = min(size, remaining_shares)
+        filled_shares += take
+        total_proceeds += take * price
+        remaining_shares -= take
+        if remaining_shares <= 1e-9:
+            break
+    if filled_shares > 0:
+        return total_proceeds / filled_shares, filled_shares, total_proceeds
+    return 0.0, 0.0, 0.0
+
+
+def calculate_optimal_market_sell(bids, target_shares, min_price=0.0):
+    """
+    Walks orderbook bids descendingly up to target_shares, stopping below min_price.
+    Returns: (fill_shares, mean_vwap, est_proceeds_usd, worst_bid_taken)
+    """
+    if not bids or target_shares <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    valid_bids = _parse_book_levels(bids, reverse=True)
+    if not valid_bids:
+        return 0.0, 0.0, 0.0, 0.0
+
+    cum_sh = 0.0
+    cum_usd = 0.0
+    worst_px = valid_bids[0][0]
+    for p, s in valid_bids:
+        if min_price > 0 and p < min_price:
+            break
+        needed = float(target_shares) - cum_sh
+        if needed <= 1e-9:
+            break
+        take_sh = min(s, needed)
+        cum_sh += take_sh
+        cum_usd += take_sh * p
+        worst_px = p
+        if cum_sh >= target_shares - 1e-9:
+            break
+
+    if cum_sh > 0:
+        vwap = cum_usd / cum_sh
+    else:
+        vwap = valid_bids[0][0]
+        worst_px = valid_bids[0][0]
+
+    return round(cum_sh, 4), round(vwap, 4), round(cum_usd, 2), round(worst_px, 4)
 
 
 def restore_snapshot_to_prediction(p_target, prev_snap, base_ego=0.5):

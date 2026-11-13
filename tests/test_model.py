@@ -16,6 +16,8 @@ from model import (
     calculate_allocation,
     calculate_vwap,
     calculate_optimal_market_buy,
+    calculate_sell_vwap,
+    calculate_optimal_market_sell,
     restore_snapshot_to_prediction,
 )
 
@@ -207,6 +209,24 @@ class TestInputsAllocationAndOrderbook(unittest.TestCase):
         # If p_norm is below first level edge, nothing is filled
         fill_none, _, _ = calculate_optimal_market_buy(asks, target_usdc=65.0, p_norm=0.40, fee_rate=0.0, min_edge=0.02)
         self.assertEqual(fill_none, 0.0)
+
+    def test_calculate_sell_vwap_and_optimal_sell(self):
+        bids = [
+            {"price": "0.60", "size": "40"},   # $24
+            {"price": "0.50", "size": "100"},  # $50
+            {"price": "0.35", "size": "100"},
+        ]
+        vwap, filled, proceeds = calculate_sell_vwap(bids, 60.0)
+        # 40 @ 0.60 = $24; 20 @ 0.50 = $10 -> $34 / 60 sh
+        self.assertAlmostEqual(filled, 60.0)
+        self.assertAlmostEqual(proceeds, 34.0)
+        self.assertAlmostEqual(vwap, 34.0 / 60.0)
+
+        fill_sh, mean_vwap, est_usd, worst_px = calculate_optimal_market_sell(bids, target_shares=160.0, min_price=0.45)
+        self.assertAlmostEqual(fill_sh, 140.0)
+        self.assertAlmostEqual(est_usd, 74.0)
+        self.assertAlmostEqual(worst_px, 0.50)
+        self.assertAlmostEqual(mean_vwap, round(74.0 / 140.0, 4))
 
     def test_restore_snapshot_to_prediction(self):
         p = {"pu": 0.9, "pm": 0.7, "snapshots": []}

@@ -502,11 +502,22 @@ def toggle_ego_market_inclusion(history):
             sort_label = "Settled Date (Newest First)"
 
         w_mode = getattr(cfg, "EGO_WEIGHTING", "kelly").upper()
+        from views import calculate_prediction_stats, classify_luck_z
+        res_stats = calculate_prediction_stats(history, sub_mode="resolved", base_ego=curr_ego, refresh_meta=False)
 
         print("\n" + "=" * 114)
         print(f"--- EGO CALIBRATION MARKET SELECTOR [Sorted by {sort_label}] ---")
         active_cnt = sum(1 for x in all_settled if not x["excluded"])
         print(f"Current Base Ego: {curr_ego:.3f} ({w_mode} mode) | Active: {active_cnt} / {len(all_settled)} markets")
+        if res_stats and res_stats.get("res_count", 0) > 0:
+            lz = res_stats["res_luck_z"]
+            lzw = res_stats["res_luck_z_weighted"]
+            cb_u = res_stats["res_calib_bias_u"] * 100.0
+            print(
+                f"Resolved Context: Actual {res_stats['res_actual_win_rate']*100:.1f}% "
+                f"| Bias vs User: {cb_u:+.1f}% "
+                f"| Luck: {lz:+.2f} sigma [{classify_luck_z(lz)}] (Kelly-Wt: {lzw:+.2f} sigma)"
+            )
         print("=" * 114)
         print(f"{'#':<3} | {'Status':<10} | {'dEgo':<8} | {'Net Adv':<9} | {'Kelly':<7} | {'Type':<8} | {'Side':<6} | {'PnL':<10} | {'Question'}")
         print("-" * 114)
@@ -668,6 +679,13 @@ def settings_menu():
     if is_wallet:
         bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
         print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}  (off-platform funds added to live wallet total, default $0)")
+        from trade import get_clob_config
+        clob_conf = get_clob_config(profile_id=active_pid, detect_remote=False)
+        if clob_conf["has_private_key"]:
+            clob_conf = get_clob_config(profile_id=active_pid, detect_remote=True)
+            print(f" 6: Execution Mode = Direct CLOB ({clob_conf['signature_label']} | {clob_conf['signature_note']})")
+        else:
+            print(" 6: Execution Mode = Zero-Key Pre-Flight & Browser Confirm (no private key on disk)")
     else:
         print(f" 5: Paper Bankroll = ${cfg.BANKROLL:,.2f}  (sandbox capital)")
 
@@ -752,3 +770,35 @@ def settings_menu():
                     print(f"[+] Paper bankroll updated to ${new_val:,.2f}.")
                 except ValueError:
                     print("[!] Invalid value.")
+    elif s_choice == "6" and is_wallet:
+        from trade import get_clob_config
+        clob_conf = get_clob_config(profile_id=active_pid, detect_remote=False)
+        print("\n--- TRADE EXECUTION SETTINGS ---")
+        print(f"Active Wallet  : {active_pid}")
+        if not clob_conf["has_private_key"]:
+            print("Mode           : Zero-Key Pre-Flight & Browser Confirm (Safest - no private key on disk)")
+            print("Signing        : Confirmed directly in Polymarket browser UI.")
+            print("Direct CLOB    : Optional — set CLOB_PRIVATE_KEY in .env to enable automated CLI orders.")
+            return
+        clob_conf = get_clob_config(profile_id=active_pid, detect_remote=True)
+        print("Mode           : Direct CLOB Signing (hot key configured)")
+        print(f"Signature Type : {clob_conf['signature_type']} - {clob_conf['signature_label']} ({clob_conf['signature_note']})")
+        print(f"Funder Address : {clob_conf['funder'] or '(same as signer EOA)'}")
+        print("\nSelect Signature Type Override:")
+        print(" [a] Auto-detect from Polygon RPC (Recommended)")
+        print(" [0] EOA (Direct wallet holding funds)")
+        print(" [1] POLY_PROXY (Email / Magic proxy wallet)")
+        print(" [2] POLY_GNOSIS_SAFE (Browser / MetaMask proxy wallet)")
+        sig_in = input("> ").strip().lower()
+        if sig_in in ("a", "auto"):
+            cfg.CLOB_SIGNATURE_TYPE = None
+            history.setdefault("settings", {})["CLOB_SIGNATURE_TYPE"] = None
+            save_history(history, profile_id=active_pid)
+            print("[+] Signature type set to Auto-detect.")
+        elif sig_in in ("0", "1", "2"):
+            cfg.CLOB_SIGNATURE_TYPE = int(sig_in)
+            history.setdefault("settings", {})["CLOB_SIGNATURE_TYPE"] = int(sig_in)
+            save_history(history, profile_id=active_pid)
+            print(f"[+] Signature type overridden to {sig_in}.")
+        else:
+            print("[*] Signature type unchanged.")

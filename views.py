@@ -473,6 +473,64 @@ def classify_active_signal(is_held, dyn_action, eff_kelly, live_edge, min_edge_t
         return "BUY"
     return "WATCH"
 
+def classify_luck_z(z):
+    """Classifies a binomial Luck Z-score into a concise variance regime label."""
+    if z is None:
+        return "N/A"
+    if z >= 2.0:
+        return "Extremely Lucky"
+    if z >= 1.25:
+        return "Running Hot"
+    if z <= -2.0:
+        return "Extremely Unlucky"
+    if z <= -1.25:
+        return "Running Cold"
+    return "Normal Variance"
+
+
+def _compute_resolved_reflection(res_items):
+    """Computes resolved calibration bias (actual - expected) and unweighted/Kelly-weighted Luck Z-scores."""
+    if not res_items:
+        return {
+            "res_count": 0,
+            "res_actual_win_rate": None,
+            "res_exp_win_bal": None,
+            "res_exp_win_u": None,
+            "res_calib_bias_bal": None,
+            "res_calib_bias_u": None,
+            "res_luck_z": None,
+            "res_luck_z_weighted": None,
+        }
+    n = len(res_items)
+    actual_wins = sum(float(x["outcome"]) for x in res_items)
+    exp_wins_bal = sum(x["win_prob_bal"] for x in res_items)
+    exp_wins_u = sum(x["win_prob_u"] for x in res_items)
+    actual_rate = actual_wins / n
+    exp_rate_bal = exp_wins_bal / n
+    exp_rate_u = exp_wins_u / n
+
+    var_sum = sum(x["var_i"] for x in res_items)
+    luck_z = ((actual_wins - exp_wins_bal) / math.sqrt(var_sum)) if var_sum > 1e-9 else 0.0
+
+    k_sum = sum(x["kelly"] for x in res_items)
+    w_list = [x["kelly"] / k_sum for x in res_items] if k_sum > 0 else [1.0 / n] * n
+    w_actual = sum(w * float(x["outcome"]) for w, x in zip(w_list, res_items))
+    w_exp_bal = sum(w * x["win_prob_bal"] for w, x in zip(w_list, res_items))
+    w_var = sum((w ** 2) * x["var_i"] for w, x in zip(w_list, res_items))
+    luck_z_w = ((w_actual - w_exp_bal) / math.sqrt(w_var)) if w_var > 1e-9 else 0.0
+
+    return {
+        "res_count": n,
+        "res_actual_win_rate": actual_rate,
+        "res_exp_win_bal": exp_rate_bal,
+        "res_exp_win_u": exp_rate_u,
+        "res_calib_bias_bal": actual_rate - exp_rate_bal,
+        "res_calib_bias_u": actual_rate - exp_rate_u,
+        "res_luck_z": luck_z,
+        "res_luck_z_weighted": luck_z_w,
+    }
+
+
 def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh_meta=True):
     """Calculates weighted portfolio stats: balance percentage, effective N, expected win rate, variance."""
     # Auto-prune closed markets from skipped history in background
@@ -683,6 +741,13 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
     avg_days = sum(valid_days) / len(valid_days) if valid_days else None
     avg_apy = sum(valid_apys) / len(valid_apys) if valid_apys else None
 
+    res_items = [
+        x for x in items
+        if x.get("is_resolved") and x.get("outcome") is not None
+        and not (is_live_wallet_stats and x.get("source") != "wallet" and x.get("realized_pnl_raw") is None)
+    ]
+    reflection = _compute_resolved_reflection(res_items)
+
     return {
         "total_count": len(items),
         "active_count": len(sized_items),
@@ -713,6 +778,7 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
         "avg_daily_edge": avg_daily_edge,
         "avg_days": avg_days,
         "avg_apy": avg_apy,
+        **reflection,
         "items": items
     }
 
@@ -777,6 +843,20 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh
         print(f"Realized PnL     : ${stats['total_pnl']:+,.2f}{wl_str} | Avg Sizing: {avg_k*100:.2f}% Kelly")
 
     print(f"Expected Win Rate: {stats['exp_win_bal']*100:.2f}% Balanced (User: {stats['exp_win_u']*100:.2f}% | Market: {stats['exp_win_m']*100:.2f}%)")
+    if stats.get("res_count", 0) > 0:
+        cb_u = stats["res_calib_bias_u"] * 100.0
+        cb_b = stats["res_calib_bias_bal"] * 100.0
+        lz = stats["res_luck_z"]
+        lzw = stats["res_luck_z_weighted"]
+        print(
+            f"Calibration Bias : Actual {stats['res_actual_win_rate']*100:.1f}% "
+            f"| vs User ({stats['res_exp_win_u']*100:.1f}%): {cb_u:+.1f}% "
+            f"| vs Pooled ({stats['res_exp_win_bal']*100:.1f}%): {cb_b:+.1f}%"
+        )
+        print(
+            f"Luck Z-Score     : {lz:+.2f} sigma [{classify_luck_z(lz)}] "
+            f"| Kelly-Wt: {lzw:+.2f} sigma [{classify_luck_z(lzw)}]"
+        )
     if sub_mode == "resolved":
         print(f"Logistic Eff.    : Entry {stats['avg_eff_m']*100:.1f}% | Pooled (p_norm) {stats['avg_eff_norm']*100:.1f}% | Avg Entry Edge: {stats['avg_active_edge']*100:+.2f}%\n")
     else:
@@ -1017,6 +1097,7 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                 "opt_buy_edge": primary.get("opt_buy_edge"),
                 "entry_price": primary.get("entry_price") or primary.get("pm"),
                 "fee_rate": p_fee_rate,
+                "clobTokenIds": primary.get("clobTokenIds"),
                 "snapshots": snaps
             })
 
@@ -1332,8 +1413,16 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
     exp_hint = ", 'x' (collapse)" if expanded else ", 'x' (expand questions)"
     live_hint = ", 'l' (live refresh)" if sub_mode in ("predicted", "exited", "resolved", "all") else ""
     u_hint = ", 'u <#>' (undo update)" if sub_mode == "predicted" else ""
+    active_pid_bar = history.get("profile_id") or get_active_profile()
+    is_wallet_bar = bool(active_pid_bar and str(active_pid_bar).startswith("0x"))
+    if is_wallet_bar and sub_mode in ("predicted", "all"):
+        from trade import is_live_trading_ready
+        ord_hint = " / 'orders'" if is_live_trading_ready(profile_id=active_pid_bar) else ""
+        trade_hint = f", 'buy <#>' / 'sell <#>'{ord_hint}"
+    else:
+        trade_hint = ""
     range_str = f"({len(rows)})" if len(rows) == 1 else f"(1-{len(rows)})"
-    act = input(f"Select row # to {prompt_action} {range_str}{sort_hint}{exp_hint}{live_hint}, 'd <#>' (details){u_hint}{cal_hint} [Enter for Main Menu]: ").strip()
+    act = input(f"Select row # to {prompt_action} {range_str}{sort_hint}{exp_hint}{live_hint}, 'd <#>' (details){u_hint}{trade_hint}{cal_hint} [Enter for Main Menu]: ").strip()
     act_low = act.lower()
     if act_low in ("x", "expand", "exp"):
         return print_review_table(history, sub_mode, expanded=not expanded, sort_by=sort_by, refresh_meta=False)
@@ -1423,6 +1512,25 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
         else:
             print("[!] Usage: 'u <row#>' (e.g. 'u 2')")
         return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
+    elif act.lower() in ("orders", "open orders") and sub_mode in ("predicted", "all"):
+        _handle_open_orders_view(history)
+        return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
+    elif (act.lower().startswith("buy ") or act.lower().startswith("sell ")) and sub_mode in ("predicted", "all"):
+        parts = act.split()
+        cmd = parts[0].lower()
+        if len(parts) > 1 and parts[1].isdigit():
+            t_idx = int(parts[1]) - 1
+            if 0 <= t_idx < len(rows):
+                traded = _handle_live_trade_row(history, rows[t_idx], side=cmd.upper())
+                if traded:
+                    history = load_history()
+                return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=bool(traded))
+            else:
+                print(f"[!] Row number out of range {range_str}.")
+                return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
+        else:
+            print(f"[!] Usage: '{cmd} <row#>' (e.g. '{cmd} 1')")
+            return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
     elif act.lower() in ("cal", "ego", "e"):
         from manage import toggle_ego_market_inclusion
         toggle_ego_market_inclusion(history)
@@ -1441,6 +1549,230 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
         else:
             print(f"[!] Row number out of range {range_str}.")
             return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
+
+def _resolve_row_clob_token(history, row):
+    """Resolves the CLOB token ID for a review table row (fetching from Gamma if not cached)."""
+    from market import get_market_clob_tokens
+    m_id = str(row.get("Market ID") or "")
+    pos_side = row.get("Side", "Yes")
+    clob_ids = row.get("clobTokenIds")
+    if not clob_ids and m_id:
+        for bucket in ("predicted", "exited"):
+            preds = ensure_list(history.get(bucket, {}).get(m_id, []))
+            if preds and preds[0].get("clobTokenIds"):
+                clob_ids = preds[0].get("clobTokenIds")
+                break
+    if not clob_ids and m_id and not m_id.startswith("custom_"):
+        try:
+            r = cfg.api.get(f"{cfg.GAMMA_API}/markets?id={m_id}", timeout=5).json()
+            if isinstance(r, list) and r:
+                clob_ids = r[0].get("clobTokenIds")
+        except Exception:
+            pass
+    yes_tok, no_tok = get_market_clob_tokens({"clobTokenIds": clob_ids})
+    return (no_tok if pos_side == "No" else yes_tok), pos_side
+
+
+def _handle_open_orders_view(history):
+    """Displays resting CLOB limit orders and allows cancelling one or all."""
+    from trade import get_clob_config, fetch_open_orders, cancel_open_order, get_clob_client
+    active_pid = history.get("profile_id") or get_active_profile()
+    conf = get_clob_config(profile_id=active_pid, detect_remote=False)
+    if not conf["is_live_wallet"] or not conf["has_private_key"]:
+        print("[*] Zero-Key mode active (no CLOB_PRIVATE_KEY on disk). Manage open orders directly at https://polymarket.com/portfolio.")
+        input("Press Enter to return: ")
+        return
+    try:
+        client = get_clob_client(profile_id=active_pid)
+        orders = fetch_open_orders(profile_id=active_pid, client=client)
+    except Exception as e:
+        print(f"[!] Could not fetch open orders: {e}")
+        input("Press Enter to return: ")
+        return
+
+    if not orders:
+        print("\n[*] No open CLOB orders found.")
+        input("Press Enter to return: ")
+        return
+
+    print("\n--- OPEN CLOB ORDERS ---")
+    for i, o in enumerate(orders, 1):
+        oid = o.get("id") or o.get("orderID") or "?"
+        side = o.get("side", "?")
+        px = float(o.get("price", 0) or 0)
+        sz = float(o.get("original_size") or o.get("size") or 0)
+        matched = float(o.get("size_matched") or 0)
+        print(f"  [{i}] {side:<4} {sz:g} sh @ {px*100:.1f}% (filled: {matched:g}) | ID: {oid}")
+
+    c_in = input("\nCancel order # (e.g. '1'), 'all' to cancel all, or Enter to go back: ").strip().lower()
+    if c_in == "all":
+        try:
+            client.cancel_all()
+            print("[+] Cancelled all open orders.")
+        except Exception as e:
+            print(f"[!] Cancel all failed: {e}")
+    elif c_in.isdigit():
+        idx = int(c_in) - 1
+        if 0 <= idx < len(orders):
+            oid = orders[idx].get("id") or orders[idx].get("orderID")
+            try:
+                cancel_open_order(oid, profile_id=active_pid, client=client)
+                print(f"[+] Cancelled order {oid}.")
+            except Exception as e:
+                print(f"[!] Cancel failed: {e}")
+
+
+def _handle_live_trade_row(history, row, side="SELL"):
+    """Interactive BUY/SELL pre-flight (zero-key browser ticket or direct CLOB execution)."""
+    from trade import (
+        get_clob_config,
+        fetch_orderbook,
+        preview_buy_order,
+        preview_sell_order,
+        execute_order,
+        format_browser_ticket,
+        prompt_browser_confirm_and_sync,
+        sync_wallet_after_trade,
+    )
+
+    active_pid = history.get("profile_id") or get_active_profile()
+    conf = get_clob_config(profile_id=active_pid, detect_remote=False)
+    if not conf["is_live_wallet"]:
+        print("[!] Pre-flight trading requires a 0x wallet profile (switch via Option 4).")
+        input("Press Enter to continue: ")
+        return False
+
+    if row.get("Mode") != "active":
+        print("[!] Only active markets can be traded.")
+        input("Press Enter to continue: ")
+        return False
+
+    token_id, pos_side = _resolve_row_clob_token(history, row)
+    if not token_id:
+        print("[!] Could not resolve CLOB token ID for this market.")
+        input("Press Enter to continue: ")
+        return False
+
+    try:
+        book = fetch_orderbook(token_id)
+    except Exception as e:
+        print(f"[!] Failed to fetch live CLOB book: {e}")
+        input("Press Enter to continue: ")
+        return False
+
+    q_disp = row.get("raw_question") or row.get("Question")
+    bid_s = f"{book['best_bid']*100:.1f}%" if book["best_bid"] else "N/A"
+    ask_s = f"{book['best_ask']*100:.1f}%" if book["best_ask"] else "N/A"
+    mode_lbl = "LIVE" if conf["has_private_key"] else "PRE-FLIGHT"
+    print(f"\n--- {mode_lbl} {side} [{pos_side}] ---")
+    print(f"Market    : {q_disp}")
+    print(f"Live Book : Bid {bid_s} | Ask {ask_s} | Tick {book['tick_size']} | Min Size {book['min_order_size']:g} sh")
+    if conf["has_private_key"]:
+        conf_full = get_clob_config(profile_id=active_pid, detect_remote=True)
+        print(f"Auth      : {conf_full['signature_label']} ({conf_full['signature_note']})")
+    else:
+        print("Mode      : Zero-Key (Pre-Flight & Browser Confirm)")
+
+    if side == "SELL":
+        held_sh = float(row.get("Shares", 0.0) or 0.0)
+        if held_sh <= 0:
+            print("[!] You have 0 tracked shares to sell in this row.")
+            input("Press Enter to continue: ")
+            return False
+        sh_raw = input(f"Shares to sell [Enter for ALL {held_sh:,.2f} sh, or % like '50%']: ").strip()
+        if not sh_raw:
+            trade_amt = held_sh
+        elif sh_raw.endswith("%"):
+            try:
+                pct = max(0.0, min(100.0, float(sh_raw[:-1].strip())))
+                trade_amt = round(held_sh * (pct / 100.0), 2)
+            except ValueError:
+                print("[!] Invalid percentage.")
+                return False
+        else:
+            try:
+                trade_amt = max(0.0, min(held_sh, float(sh_raw)))
+            except ValueError:
+                print("[!] Invalid share amount.")
+                return False
+    else:
+        ws = history.get("wallet_summary", {})
+        cash = float(ws.get("cash", cfg.BANKROLL) or 0.0) if isinstance(ws, dict) else float(cfg.BANKROLL)
+        bankroll = float(ws.get("bankroll", cfg.BANKROLL) or cfg.BANKROLL) if isinstance(ws, dict) else float(cfg.BANKROLL)
+        held_f = float(row.get("HeldFrac", 0.0) or 0.0)
+        tgt_k = float(row.get("Kelly", 0.0) or 0.0)
+        opt_usd = row.get("opt_buy_usd")
+        rec_usd = float(opt_usd) if opt_usd is not None else max(0.0, (tgt_k - held_f) * bankroll)
+        rec_usd = min(rec_usd, cash) if cash > 0 else rec_usd
+        usd_raw = input(f"USDC to spend (Cash: ${cash:,.2f}) [Enter for ${rec_usd:,.2f}]: ").strip().replace("$", "")
+        try:
+            trade_amt = float(usd_raw) if usd_raw else rec_usd
+        except ValueError:
+            print("[!] Invalid dollar amount.")
+            return False
+
+    ot_in = input(f"Order Type: [1] Market {side.title()} (FAK immediate) [Enter]  [2] Limit {side.title()} (GTC resting): ").strip()
+    if ot_in == "2":
+        def_px = (row.get("Target") or book["best_ask"] or book["best_bid"] or 0.5) if side == "SELL" else (book["best_bid"] or book["best_ask"] or 0.5)
+        px_in = input(f"Limit price % (e.g. '{def_px*100:.0f}' for {def_px*100:.0f}%) [Enter for {def_px*100:.1f}%]: ").strip().replace("%", "")
+        try:
+            lim_px = (float(px_in) / 100.0) if px_in else float(def_px)
+        except ValueError:
+            print("[!] Invalid price.")
+            return False
+        if side == "SELL":
+            preview = preview_sell_order(token_id, trade_amt, order_type="GTC", limit_price=lim_px, profile_id=active_pid)
+        else:
+            preview = preview_buy_order(token_id, trade_amt, order_type="GTC", limit_price=lim_px, profile_id=active_pid)
+    elif side == "SELL":
+        preview = preview_sell_order(token_id, trade_amt, order_type="FAK", profile_id=active_pid)
+    else:
+        preview = preview_buy_order(
+            token_id,
+            trade_amt,
+            p_norm=row.get("Target"),
+            fee_rate=float(row.get("fee_rate", 0.0) or 0.0),
+            min_edge=float(getattr(cfg, "MIN_EDGE", 0.0) or 0.0),
+            order_type="FAK",
+            profile_id=active_pid,
+        )
+
+    if not preview.get("ok"):
+        print(f"[!] Order rejected in preflight: {preview.get('reason')}")
+        input("Press Enter to continue: ")
+        return False
+
+    if not conf["has_private_key"]:
+        ev_url = row.get("Web Link", "")
+        print("\n" + format_browser_ticket(preview, question=q_disp, outcome=pos_side, event_url=ev_url))
+        return prompt_browser_confirm_and_sync([ev_url], active_pid, history)
+
+    print("\n--- ORDER SUMMARY ---")
+    if side == "SELL":
+        print(f"Action    : SELL {preview['shares']:,.2f} {pos_side} shares ({preview['order_type']})")
+        print(f"Price     : Est VWAP {preview['est_vwap']*100:.1f}% | Floor/Limit {preview['price_cap']*100:.1f}%")
+        print(f"Proceeds  : ~${preview['est_proceeds']:,.2f} USDC")
+    else:
+        print(f"Action    : BUY ${preview['amount_usdc']:,.2f} of {pos_side} (~{preview['est_shares']:,.2f} sh, {preview['order_type']})")
+        print(f"Price     : Est VWAP {preview['est_vwap']*100:.1f}% | Cap/Limit {preview['price_cap']*100:.1f}%")
+
+    conf_str = input("Type 'CONFIRM' to submit live order: ").strip()
+    if conf_str != "CONFIRM":
+        print("[*] Live order cancelled.")
+        input("Press Enter to continue: ")
+        return False
+
+    res = execute_order(preview, profile_id=active_pid)
+    if res.get("ok"):
+        print(f"[+] Order submitted: {res.get('status')} (ID: {res.get('order_id') or 'N/A'})")
+        sync_wallet_after_trade(active_pid, history)
+        input("Press Enter to continue: ")
+        return True
+    else:
+        print(f"[!] Order failed: {res.get('error')}")
+        input("Press Enter to continue: ")
+        return False
+
 
 def _handle_targeted_predict(rows, preselected_idx=None):
     """Launches targeted prediction on a specific table row."""
@@ -1593,10 +1925,17 @@ def print_main_menu_dashboard(history):
     hdr_pad = max(0, (box_w - hdr_visible_len - 4) // 2)
     hdr_line = " " * hdr_pad + f"[ {hdr_tag} ]"
 
+    res_stats = calculate_prediction_stats(history, sub_mode="resolved", base_ego=base_ego, refresh_meta=False)
+
     print("\n" + "=" * box_w)
     print(hdr_line)
     print("-" * box_w)
     print(cap_line)
     print(f"  Live Exposure  : {active_eff_kelly*100:.1f}% Eff-Kelly (${active_eff_kelly*live_bankroll:,.2f}) | Avg Edge: {avg_edge*100:+.2f}% | Signals: {sig_summary}")
     print(f"  Track Record   : {wins}W - {losses}L{win_pct_str} | Realized PnL: {pnl_str} | Base Ego: {base_ego:.3f}")
+    if res_stats and res_stats.get("res_count", 0) > 0:
+        lz = res_stats["res_luck_z"]
+        lzw = res_stats["res_luck_z_weighted"]
+        cb_u = res_stats["res_calib_bias_u"] * 100.0
+        print(f"  Reflection     : Bias vs User: {cb_u:+.1f}% | Luck: {lz:+.2f}s [{classify_luck_z(lz)}] (Wt: {lzw:+.2f}s)")
     print("=" * box_w)
