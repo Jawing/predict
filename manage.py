@@ -14,7 +14,10 @@ and interactive settings/filters configuration.
 import os
 from datetime import datetime, timezone, timedelta
 import config as cfg
-from utils import ensure_list, get_history_counts, parse_market_date
+from utils import (
+    ensure_list, get_history_counts, parse_market_date,
+    get_effective_bankroll, calculate_resolved_pnl,
+)
 from storage import load_history, save_history, get_active_profile, get_profile_path
 from wallet import update_resolutions
 from model import calculate_base_ego, calculate_trade_ego_metrics, restore_snapshot_to_prediction
@@ -635,26 +638,13 @@ def manual_resolve(history):
         print("[!] Resolve cancelled.")
         return history
 
+    active_b = get_effective_bankroll(history, cfg.BANKROLL)
     history.setdefault("resolved", {}).setdefault(sel, [])
     for p in ensure_list(preds):
         p["outcome"] = outcome
-        if p.get("realized_pnl") is None or float(p.get("realized_pnl", 0.0) or 0.0) == 0.0:
-            cb = float(p.get("cost_basis", 0.0) or 0.0)
-            sh = float(p.get("shares", 0.0) or 0.0)
-            ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
-            active_b = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
-            k_eval = float(p.get("entry_kelly") or p.get("kelly", 0.0) or 0.0)
-            if cb == 0.0 and k_eval > 0:
-                cb = k_eval * active_b
-                if sh == 0.0 and p.get("pm", 0.0):
-                    sh = cb / float(p["pm"])
-            if sh > 0 or cb > 0:
-                if outcome == 1.0:
-                    p["realized_pnl"] = round(sh * 1.0 - cb, 2)
-                elif outcome == 0.0:
-                    p["realized_pnl"] = round(-cb, 2)
-                elif outcome == 0.5:
-                    p["realized_pnl"] = round(sh * 0.5 - cb, 2)
+        new_pnl = calculate_resolved_pnl(p, outcome, bankroll=active_b)
+        if new_pnl is not None:
+            p["realized_pnl"] = new_pnl
         history["resolved"][sel].append(p)
 
     history[bucket_name].pop(sel, None)

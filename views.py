@@ -412,6 +412,67 @@ def _format_source_tag(pred, history_alias=None):
         return f"0x..{w_tag[-4:]}"
     return src.upper()
 
+
+def merge_market_tranches(preds):
+    """Merges multiple tranches for a single market into a non-mutating display record."""
+    preds_list = ensure_list(preds)
+    if not preds_list:
+        return None
+    if len(preds_list) == 1:
+        return preds_list[0]
+
+    wallet_items = [p for p in preds_list if p.get("source") == "wallet"]
+    local_items = [p for p in preds_list if p.get("source") != "wallet"]
+    if wallet_items:
+        primary = dict(wallet_items[0])
+        for other_w in wallet_items[1:]:
+            primary["shares"] = round(float(primary.get("shares", 0.0) or 0.0) + float(other_w.get("shares", 0.0) or 0.0), 4)
+            primary["cost_basis"] = round(float(primary.get("cost_basis", 0.0) or 0.0) + float(other_w.get("cost_basis", 0.0) or 0.0), 4)
+        pool = wallet_items + local_items
+        latest_p = sorted(pool, key=lambda x: str(x.get("last_pu_date") or x.get("date", "")), reverse=True)[0]
+        for k in ("pu", "dynamic_ego", "date", "edge", "kelly", "opt_buy_usd", "opt_buy_vwap", "opt_buy_edge", "snapshots", "last_pu_ts", "last_pu_date"):
+            if k in latest_p:
+                primary[k] = latest_p[k]
+        return primary
+    return sorted(local_items, key=lambda x: str(x.get("last_pu_date") or x.get("date", "")), reverse=True)[0]
+
+
+def iter_unified_active_entries(history, include_exited=True):
+    """Yields deduplicated (market_id, merged_primary_entry) across predicted and optionally exited."""
+    seen_mids = set()
+    for m_id, val in history.get("predicted", {}).items():
+        merged = merge_market_tranches(val)
+        if merged is not None:
+            seen_mids.add(m_id)
+            yield m_id, merged
+    if include_exited:
+        for m_id, val in history.get("exited", {}).items():
+            if m_id in seen_mids:
+                continue
+            merged = merge_market_tranches(val)
+            if merged is not None:
+                seen_mids.add(m_id)
+                yield m_id, merged
+
+
+def classify_active_signal(is_held, dyn_action, eff_kelly, live_edge, min_edge_th=None, opt_buy_usd=None, vwap_edge=None):
+    """Canonical signal classification shared by dashboard, stats, and review table."""
+    if min_edge_th is None:
+        min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.01))
+    effective_min_edge = max(float(min_edge_th), 0.01)
+
+    if is_held:
+        sig = dyn_action.get("signal_code", "HOLD")
+        if sig == "ADD" and opt_buy_usd == 0.0:
+            return "HOLD"
+        return sig
+
+    if float(eff_kelly) > 0.005 and float(live_edge) >= effective_min_edge:
+        if opt_buy_usd == 0.0 or (vwap_edge is not None and (vwap_edge <= 0 or vwap_edge < effective_min_edge)):
+            return "WATCH"
+        return "BUY"
+    return "WATCH"
+
 def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh_meta=True):
     """Calculates weighted portfolio stats: balance percentage, effective N, expected win rate, variance."""
     # Auto-prune closed markets from skipped history in background
@@ -425,17 +486,12 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
     seen_mids = set()
     preds_list = []
     if sub_mode in ["predicted", "predicted_skipped", "all"]:
-        for mid, m_preds in history.get("predicted", {}).items():
+        for mid, merged_p in iter_unified_active_entries(
+            history, include_exited=(sub_mode in ["predicted", "predicted_skipped"])
+        ):
             seen_mids.add(mid)
-            for p in ensure_list(m_preds):
-                preds_list.append((p, "active"))
-    if sub_mode in ["predicted", "predicted_skipped"]:
-        for mid, m_ex in history.get("exited", {}).items():
-            if mid not in seen_mids:
-                seen_mids.add(mid)
-                for p in ensure_list(m_ex):
-                    preds_list.append((p, "active"))
-    elif sub_mode in ["exited", "all"]:
+            preds_list.append((merged_p, "active"))
+    if sub_mode in ["exited", "all"]:
         for mid, m_ex in history.get("exited", {}).items():
             if sub_mode == "all" and mid in seen_mids:
                 continue
@@ -499,12 +555,22 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
                 eff_k_stat = dyn_i["f_star_eff"]
                 kelly = eff_k_stat
             else:
+                dyn_i = {}
                 eff_k_stat = lm["eff_kelly"]
+            active_sig_i = classify_active_signal(
+                is_held_i,
+                dyn_i,
+                eff_k_stat,
+                p_edge,
+                opt_buy_usd=p.get("opt_buy_usd"),
+                vwap_edge=p.get("vwap_edge"),
+            )
         else:
             kelly = calculate_trade_weight({**p, "exclude_from_ego": False}, bankroll=active_bankroll)
             lm = calculate_logistic_metrics(pu, pm, ego, held_kelly=kelly, cur_pm=cur_pm, fee_rate=f_rate)
             p_edge = float(lm["active_edge"])
             eff_k_stat = lm["eff_kelly"]
+            active_sig_i = None
 
         end_d = p.get("endDate") or p.get("end_date")
         _, sec_left, d_until = parse_market_date(end_d)
@@ -549,6 +615,10 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
             "source": p.get("source", "local"),
             "is_resolved": is_res,
             "outcome": float(outcome) if (is_res and outcome is not None) else None,
+            "is_held": is_held_i if state == "active" else False,
+            "held_val": lv_i if (state == "active" and is_held_i) else 0.0,
+            "held_frac": h_k_i if (state == "active" and is_held_i) else 0.0,
+            "active_sig": active_sig_i if state == "active" else None,
             "daily_edge": d_edge,
             "days_until": d_until,
             "apy": p.get("apy")
@@ -586,6 +656,21 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
     sum_w_sq = sum(w ** 2 for w in weights)
     effective_n = (1.0 / sum_w_sq) if sum_w_sq > 0 else 0.0
 
+    held_items = [x for x in items if x.get("is_held") and x.get("held_val", 0) > 0]
+    total_held_val = sum(x["held_val"] for x in held_items)
+    if total_held_val > 0 and held_items:
+        weights_held = [x["held_val"] / total_held_val for x in held_items]
+        sum_w_held_sq = sum(w ** 2 for w in weights_held)
+        effective_n_held = (1.0 / sum_w_held_sq) if sum_w_held_sq > 0 else 0.0
+        held_bal_pct = (effective_n_held / len(held_items) * 100.0) if len(held_items) > 0 else 0.0
+    else:
+        effective_n_held = 0.0
+        held_bal_pct = 0.0
+
+    held_count = len(held_items)
+    buy_count = sum(1 for x in items if (not x.get("is_held")) and x.get("active_sig") == "BUY")
+    watch_count = len(items) - held_count - buy_count
+
     valid_days = [x["days_until"] for x in items if x.get("days_until") is not None]
     valid_apys = []
     for x in items:
@@ -619,6 +704,12 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
         "norm_variance": norm_variance,
         "norm_std_dev": norm_std_dev,
         "effective_n": effective_n,
+        "held_count": held_count,
+        "total_held_val": total_held_val,
+        "effective_n_held": effective_n_held,
+        "held_bal_pct": held_bal_pct,
+        "buy_count": buy_count,
+        "watch_count": watch_count,
         "avg_daily_edge": avg_daily_edge,
         "avg_days": avg_days,
         "avg_apy": avg_apy,
@@ -636,8 +727,16 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh
     sized_note = f" ({stats['active_count']} sized)" if stats['active_count'] != stats['total_count'] else ""
 
     print(f"--- PORTFOLIO & PREDICTION STATS [{status_lbl.upper()}] ---")
-    print(f"Predictions      : {stats['total_count']} {status_lbl}{sized_note} ({stats['local_count']} LOCAL, {stats['wallet_count']} WALLET)")
-    print(f"Effective N      : {stats['effective_n']:.2f} / {n_denom} equal-sized bets ({bal_pct:.1f}% size-balanced)")
+    if sub_mode == "predicted":
+        src_note = f" ({stats['local_count']} LOCAL, {stats['wallet_count']} WALLET)"
+        print(f"Predictions      : {stats['total_count']} active ({stats['held_count']} held, {stats['buy_count']} buy, {stats['watch_count']} watch){src_note}")
+        if stats['held_count'] > 0:
+            print(f"Effective N      : Held: {stats['effective_n_held']:.2f} / {stats['held_count']} equal-sized bets ({stats['held_bal_pct']:.1f}% size-balanced)")
+        else:
+            print(f"Effective N      : -")
+    else:
+        print(f"Predictions      : {stats['total_count']} {status_lbl}{sized_note} ({stats['local_count']} LOCAL, {stats['wallet_count']} WALLET)")
+        print(f"Effective N      : {stats['effective_n']:.2f} / {n_denom} equal-sized bets ({bal_pct:.1f}% size-balanced)")
     active_pid = history.get("profile_id") or get_active_profile()
     is_wallet = bool(active_pid and active_pid.startswith("0x"))
     w_sum = history.get("wallet_summary")
@@ -741,38 +840,12 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
 
     # 1. Active / Predicted Rows (Unifying Open Positions, Watched Predictions & Exited Unresolved Markets)
     if sub_mode in ["predicted", "predicted_skipped", "all"]:
-        profile_id = get_active_profile()
+        profile_id = history.get("profile_id") or get_active_profile()
         is_live_wallet_profile = bool(profile_id and str(profile_id).startswith("0x"))
 
-        unified_active = {}
-        for m_id, val in history.get("predicted", {}).items():
-            unified_active[m_id] = ensure_list(val)
-        if sub_mode in ["predicted", "predicted_skipped"]:
-            for m_id, val in history.get("exited", {}).items():
-                if m_id not in unified_active:
-                    unified_active[m_id] = ensure_list(val)
-
-        for market_id, value in unified_active.items():
-            preds = ensure_list(value)
-            if not preds:
-                continue
-
-            primary = preds[0]
-            if len(preds) > 1:
-                wallet_items = [p for p in preds if p.get("source") == "wallet"]
-                local_items = [p for p in preds if p.get("source") != "wallet"]
-                if wallet_items:
-                    primary = wallet_items[0]
-                    for other_w in wallet_items[1:]:
-                        primary["shares"] = round(float(primary.get("shares", 0.0) or 0.0) + float(other_w.get("shares", 0.0) or 0.0), 4)
-                        primary["cost_basis"] = round(float(primary.get("cost_basis", 0.0) or 0.0) + float(other_w.get("cost_basis", 0.0) or 0.0), 4)
-                    pool = wallet_items + local_items
-                    latest_p = sorted(pool, key=lambda x: str(x.get("last_pu_date") or x.get("date", "")), reverse=True)[0]
-                    for k in ("pu", "dynamic_ego", "date", "edge", "kelly", "opt_buy_usd", "opt_buy_vwap", "opt_buy_edge", "snapshots", "last_pu_ts", "last_pu_date"):
-                        if k in latest_p:
-                            primary[k] = latest_p[k]
-                elif local_items:
-                    primary = sorted(local_items, key=lambda x: str(x.get("last_pu_date") or x.get("date", "")), reverse=True)[0]
+        for market_id, primary in iter_unified_active_entries(
+            history, include_exited=(sub_mode in ["predicted", "predicted_skipped"])
+        ):
 
             p_side = primary.get("position", "Yes")
             p_pu = float(primary.get("pu", 0.5))
@@ -851,26 +924,28 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                     regime_str = dyn_action["action_label"]
             else:
                 min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.01))
+                effective_min_edge = max(min_edge_th, 0.01)
                 vwap_edge = primary.get("vwap_edge")
                 opt_usd = primary.get("opt_buy_usd")
                 opt_vwap = primary.get("opt_buy_vwap")
-                if active_edge >= min_edge_th:
+                sig_unheld = classify_active_signal(
+                    False, dyn_action, p_lm["eff_kelly"], active_edge,
+                    min_edge_th=min_edge_th, opt_buy_usd=opt_usd, vwap_edge=vwap_edge,
+                )
+                if sig_unheld == "BUY":
                     buy_usd = p_lm["eff_kelly"] * live_bankroll if live_bankroll > 0 else 0.0
-                    if opt_usd is not None and opt_usd > 0:
-                        if opt_usd < buy_usd * 0.95:
-                            regime_str = f"EXEC BUY ${opt_usd:,.0f} (Mean {opt_vwap*100:.1f}%)"
-                        else:
-                            regime_str = f"EXEC BUY ${buy_usd:,.0f} ({p_lm['eff_kelly']*100:.1f}%)"
-                    elif opt_usd == 0.0 or (vwap_edge is not None and vwap_edge <= 0):
-                        regime_str = "WATCH (Ask exceeds hurdle)"
-                    elif vwap_edge is not None and vwap_edge < min_edge_th:
-                        regime_str = f"WATCH (Depth Edge < {min_edge_th*100:.1f}%)"
+                    if opt_usd is not None and opt_usd > 0 and opt_usd < buy_usd * 0.95:
+                        regime_str = f"EXEC BUY ${opt_usd:,.0f} (Mean {opt_vwap*100:.1f}%)"
                     else:
                         regime_str = f"EXEC BUY ${buy_usd:,.0f} ({p_lm['eff_kelly']*100:.1f}%)"
-                elif active_edge > 0:
-                    regime_str = f"WATCH (Thin Edge: {active_edge*100:+.1f}%)"
-                else:
+                elif active_edge <= 0:
                     regime_str = f"WATCH (No Edge: {active_edge*100:+.1f}%)"
+                elif opt_usd == 0.0 or (vwap_edge is not None and vwap_edge <= 0):
+                    regime_str = "WATCH (Ask exceeds hurdle)"
+                elif vwap_edge is not None and vwap_edge < effective_min_edge:
+                    regime_str = f"WATCH (Depth Edge < {effective_min_edge*100:.1f}%)"
+                else:
+                    regime_str = f"WATCH (Thin Edge: {active_edge*100:+.1f}%)"
 
             q_title = primary.get("question", "unknown")
             compact_q = format_compact_question(q_title, 34)
@@ -1435,62 +1510,55 @@ def print_main_menu_dashboard(history):
     active_eff_kelly = 0.0
     active_edge_w = 0.0
     active_signals = {}
-    for bucket_name in ("predicted", "exited"):
-        for preds in history.get(bucket_name, {}).values():
-            for p in ensure_list(preds):
-                k = max(0.0, float(p.get("entry_kelly") or p.get("effective_kelly", 0.0) or p.get("kelly", 0.0) or 0.0))
-                is_w = (p.get("source") == "wallet")
-                cur_p = float(p.get("cur_pm") if p.get("cur_pm") is not None else p.get("pm", 0.5))
-                if is_wallet and not is_w:
-                    live_val, held_mtm_k = 0.0, 0.0
-                else:
-                    live_val, held_mtm_k, _ = calculate_position_holding(p, cur_p, live_bankroll)
+    for _, p in iter_unified_active_entries(history, include_exited=True):
+        k = max(0.0, float(p.get("entry_kelly") or p.get("effective_kelly", 0.0) or p.get("kelly", 0.0) or 0.0))
+        is_w = (p.get("source") == "wallet")
+        cur_p = float(p.get("cur_pm") if p.get("cur_pm") is not None else p.get("pm", 0.5))
+        if is_wallet and not is_w:
+            live_val, held_mtm_k = 0.0, 0.0
+        else:
+            live_val, held_mtm_k, _ = calculate_position_holding(p, cur_p, live_bankroll)
 
-                pos_side = p.get("position", "Yes")
-                pu_dash = float(p.get("pu", 0.5))
-                ego_dash = compute_dynamic_ego(base_ego, float(p.get("u_spread", 0.0) or 0.0))
-                spread_val = float(p.get("spread", 0.01) or 0.01)
-                half_sp = max(0.0005, spread_val / 2.0)
-                f_rate = float(p.get("fee_rate", 0.0) or 0.0)
-                is_held_dash = (held_mtm_k > 0 or live_val > 0)
-                eval_px_dash = p.get("cur_pm") if is_held_dash else (float(p.get("bestAsk") or p.get("cur_pm") or p.get("pm", 0.5)))
-                lm = calculate_logistic_metrics(
-                    pu_dash, p.get("pm"), ego_dash,
-                    held_kelly=None, cur_pm=eval_px_dash,
-                    fee_rate=(0.0 if is_held_dash else f_rate)
-                )
+        pu_dash = float(p.get("pu", 0.5))
+        ego_dash = compute_dynamic_ego(base_ego, float(p.get("u_spread", 0.0) or 0.0))
+        spread_val = float(p.get("spread", 0.01) or 0.01)
+        half_sp = max(0.0005, spread_val / 2.0)
+        f_rate = float(p.get("fee_rate", 0.0) or 0.0)
+        is_held_dash = (held_mtm_k > 0 or live_val > 0)
+        eval_px_dash = p.get("cur_pm") if is_held_dash else (float(p.get("bestAsk") or p.get("cur_pm") or p.get("pm", 0.5)))
+        lm = calculate_logistic_metrics(
+            pu_dash, p.get("pm"), ego_dash,
+            held_kelly=None, cur_pm=eval_px_dash,
+            fee_rate=(0.0 if is_held_dash else f_rate)
+        )
 
-                dyn_action = calculate_dynamic_kelly_action(
-                    win_prob_bal=lm["win_prob_bal"],
-                    cur_p=cur_p,
-                    held_frac=held_mtm_k,
-                    bankroll=live_bankroll,
-                    fee_rate=f_rate,
-                    half_spread=half_sp,
-                    entry_kelly=max(lm["eff_kelly"], k),
-                    best_bid=p.get("bestBid"),
-                    best_ask=p.get("bestAsk")
-                )
+        dyn_action = calculate_dynamic_kelly_action(
+            win_prob_bal=lm["win_prob_bal"],
+            cur_p=cur_p,
+            held_frac=held_mtm_k,
+            bankroll=live_bankroll,
+            fee_rate=f_rate,
+            half_spread=half_sp,
+            entry_kelly=max(lm["eff_kelly"], k),
+            best_bid=p.get("bestBid"),
+            best_ask=p.get("bestAsk")
+        )
 
-                eff_k = dyn_action["f_star_eff"] if is_held_dash else lm["eff_kelly"]
-                delta_k = max(0.0, eff_k - held_mtm_k) if held_mtm_k > 0 else eff_k
-                act_edge = float(lm["live_active_edge"])
+        eff_k = dyn_action["f_star_eff"] if is_held_dash else lm["eff_kelly"]
+        act_edge = float(lm["live_active_edge"])
 
-                active_eff_kelly += eff_k
-                active_edge_w += eff_k * act_edge
+        active_eff_kelly += eff_k
+        active_edge_w += eff_k * act_edge
 
-                min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.01))
-                opt_buy_usd = p.get("opt_buy_usd")
-                if held_mtm_k > 0 or live_val > 0:
-                    if dyn_action["signal_code"] == "ADD" and opt_buy_usd == 0.0:
-                        sig = "HOLD"
-                    else:
-                        sig = dyn_action["signal_code"]
-                elif act_edge >= min_edge_th and (opt_buy_usd is None or opt_buy_usd > 0):
-                    sig = "BUY"
-                else:
-                    sig = "WATCH"
-                active_signals[sig] = active_signals.get(sig, 0) + 1
+        sig = classify_active_signal(
+            is_held_dash,
+            dyn_action,
+            eff_k,
+            act_edge,
+            opt_buy_usd=p.get("opt_buy_usd"),
+            vwap_edge=p.get("vwap_edge"),
+        )
+        active_signals[sig] = active_signals.get(sig, 0) + 1
 
     avg_edge = (active_edge_w / active_eff_kelly) if active_eff_kelly > 0 else 0.0
     sig_summary = " ".join(f"{s}:{cnt}" for s, cnt in sorted(active_signals.items())) if active_signals else "-"

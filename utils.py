@@ -3,6 +3,82 @@ import json
 import math
 import re
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class WalletSummary(TypedDict, total=False):
+    cash: float
+    portfolio: float
+    bankroll_add: float
+    bankroll: float
+    updated_at: str
+
+
+class SnapshotRecord(TypedDict, total=False):
+    ts: int
+    date: str
+    pu: float
+    pm: float
+    entry_price: float
+    kelly: float
+    entry_kelly: float
+    raw_kelly: float
+    edge: float
+    apy: Optional[float]
+    dynamic_ego: float
+    action: str
+    source: str
+
+
+class PredictionRecord(TypedDict, total=False):
+    question: str
+    slug: str
+    date: str
+    pu: float
+    pm: float
+    cur_pm: float
+    tranche_pm: float
+    entry_price: float
+    avg_price: float
+    exit_price: Optional[float]
+    dynamic_ego: float
+    kelly: float
+    entry_kelly: float
+    raw_kelly: float
+    cost_basis: float
+    entry_cost: float
+    total_size: float
+    entry_bankroll: float
+    shares: float
+    current_value: float
+    realized_pnl: Optional[float]
+    edge: float
+    apy: Optional[float]
+    outcome: Optional[float]
+    conditionId: str
+    position: str
+    outcomeIndex: int
+    source: str
+    wallet: str
+    exited: bool
+    is_watch: bool
+    action: str
+    endDate: Optional[str]
+    last_synced_ts: int
+    snapshots: List[SnapshotRecord]
+
+
+class HistoryStore(TypedDict, total=False):
+    profile_id: str
+    wallet_address: Optional[str]
+    alias: str
+    bankroll_add: float
+    wallet_summary: WalletSummary
+    predicted: Dict[str, Any]
+    exited: Dict[str, Any]
+    resolved: Dict[str, Any]
+    skipped: Dict[str, Any]
+    settings: Dict[str, Any]
 
 
 def ensure_list(val):
@@ -172,3 +248,123 @@ def calculate_position_holding(pred, cur_pm=None, bankroll=100.0):
 
     held_mtm_k = (live_val / bankroll) if bankroll > 0 else k
     return live_val, held_mtm_k, sh
+
+
+def get_effective_bankroll(history, default_bankroll=100.0):
+    """Returns active bankroll from history['wallet_summary'] or fallback default."""
+    if isinstance(history, dict):
+        ws = history.get("wallet_summary")
+        if isinstance(ws, dict):
+            br = ws.get("bankroll")
+            if br is not None and float(br or 0.0) > 0:
+                return float(br)
+    return float(default_bankroll)
+
+
+def calculate_implied_exit_price(avg_price, realized_pnl, total_size, fallback_price=None):
+    """Computes implied exit price from realized PnL and total size, clamped to (0.0001, 0.9999)."""
+    if total_size is not None and float(total_size) > 0:
+        px = round(float(avg_price) + (float(realized_pnl) / float(total_size)), 4)
+        return max(0.0001, min(0.9999, px))
+    return fallback_price
+
+
+def calculate_resolved_pnl(
+    entry,
+    outcome,
+    bankroll=100.0,
+    *,
+    allow_kelly_fallback=True,
+    use_entry_cost_fallback=False,
+    fallback_api_pnl=None,
+    preserve_exited=True,
+):
+    """Computes realized PnL for a resolved prediction entry.
+
+    Returns:
+        Optional[float]: Realized PnL in USDC, or None if watch-only / unsized.
+    """
+    if not isinstance(entry, dict) or outcome is None:
+        return None
+
+    if preserve_exited and entry.get("exited") and entry.get("realized_pnl") is not None:
+        return entry.get("realized_pnl")
+
+    if entry.get("is_watch") or entry.get("action") == "WATCH":
+        return None
+
+    cb = float(entry.get("cost_basis", 0.0) or 0.0)
+    if use_entry_cost_fallback and cb == 0.0:
+        cb = float(entry.get("entry_cost", 0.0) or 0.0)
+    sh = float(entry.get("shares", 0.0) or 0.0)
+
+    if allow_kelly_fallback and cb == 0.0:
+        k_eval = float(entry.get("entry_kelly") or entry.get("kelly", 0.0) or 0.0)
+        if k_eval > 0:
+            cb = k_eval * float(bankroll)
+            pm_val = float(entry.get("pm", 0.0) or 0.0)
+            if sh == 0.0 and pm_val > 0:
+                sh = cb / pm_val
+
+    if sh > 0 or cb > 0:
+        out_f = float(outcome)
+        if out_f == 1.0:
+            return round(sh * 1.0 - cb, 2)
+        if out_f == 0.0:
+            return round(-cb, 2)
+        if out_f == 0.5:
+            return round(sh * 0.5 - cb, 2)
+
+    if fallback_api_pnl is not None and float(fallback_api_pnl) != 0.0 and entry.get("source") == "wallet":
+        return float(fallback_api_pnl)
+    return entry.get("realized_pnl")
+
+
+def apply_closed_exit_fields(
+    entry,
+    *,
+    avg_price=None,
+    total_size=None,
+    realized_pnl=None,
+    cur_price=None,
+    exit_price=None,
+    exit_date=None,
+    bankroll=None,
+    mark_exited=False,
+):
+    """Normalizes entry_cost, size, entry prices, exit price, and date on a closed/exited record."""
+    if not isinstance(entry, dict):
+        return
+
+    if cur_price is not None:
+        entry["cur_pm"] = cur_price
+    if realized_pnl is not None:
+        entry["realized_pnl"] = realized_pnl
+
+    tb = float(total_size or 0.0)
+    ap = float(avg_price or 0.0)
+    if tb > 0 and ap > 0:
+        entry["entry_cost"] = round(tb * ap, 4)
+        entry["total_size"] = tb
+        entry["avg_price"] = ap
+        entry["entry_price"] = ap
+        snaps = entry.get("snapshots", [])
+        if len(snaps) <= 1:
+            entry["pm"] = ap
+            if snaps:
+                snaps[0]["pm"] = ap
+                snaps[0]["entry_price"] = ap
+    elif not entry.get("entry_cost") and float(entry.get("cost_basis", 0.0) or 0.0) > 0:
+        entry["entry_cost"] = float(entry.get("cost_basis", 0.0))
+
+    if bankroll is not None:
+        entry["entry_bankroll"] = float(entry.get("entry_bankroll") or bankroll)
+
+    if mark_exited:
+        entry["exited"] = True
+        entry["cost_basis"] = 0.0
+
+    if exit_price is not None:
+        entry["exit_price"] = exit_price
+    if exit_date:
+        entry["date"] = exit_date

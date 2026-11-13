@@ -49,8 +49,8 @@ def main():
         from views import auto_prune_closed_markets
         h_init = load_history()
         auto_prune_closed_markets(h_init)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] Startup prune warning: {e}")
 
     while True:
         history = load_history()

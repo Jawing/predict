@@ -204,8 +204,14 @@ def load_history(profile_id=None):
                             setattr(cfg, k, saved_st[k])
 
                 return data
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            import shutil, time as _time
+            backup_path = f"{target_path}.corrupt.{int(_time.time())}"
+            try:
+                shutil.copy2(target_path, backup_path)
+                print(f"[!] Corrupt profile JSON in {target_path} ({e}). Backed up to {backup_path}.")
+            except OSError as copy_err:
+                print(f"[!] Corrupt profile JSON in {target_path} ({e}); backup failed: {copy_err}.")
 
     # Profile does not exist yet: create skeleton
     is_wallet = profile_id.startswith("0x")

@@ -15,8 +15,8 @@ LOGISTIC_HALF_HIGH = (2.0 + math.sqrt(2.0)) / 4.0   # ~85.36%: Half-Maximum Slop
 
 def compute_dynamic_ego(base_ego, u_spread, m_spread=0.0):
     """Calculates conviction-weighted ego based on user uncertainty spread."""
-    u_spread = max(0.0, min(1.0, float(u_spread or 0.0)))
-    base_ego = max(0.01, min(0.99, float(base_ego or 0.5)))
+    u_spread = max(0.0, min(1.0, 0.0 if u_spread is None else float(u_spread)))
+    base_ego = max(0.01, min(0.99, 0.5 if base_ego is None else float(base_ego)))
     u_conviction = base_ego * (1.0 - u_spread)
     m_conviction = 1.0 - base_ego
     if (u_conviction + m_conviction) > 0:
