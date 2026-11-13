@@ -1,6 +1,8 @@
 """Unit tests for live CLOB order preview, signature detection, and execution."""
+import copy
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -83,6 +85,21 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
         "min_order_size": "5",
         "neg_risk": False,
     }
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self._orig_dir = cfg.HISTORY_DIR
+        self._orig_active = cfg.ACTIVE_PROFILE_FILE
+        self._orig_wallet = cfg.POLYGON_WALLET
+        cfg.HISTORY_DIR = self.tmp_dir.name
+        cfg.ACTIVE_PROFILE_FILE = os.path.join(self.tmp_dir.name, "active_profile.txt")
+        cfg.POLYGON_WALLET = ""
+
+    def tearDown(self):
+        cfg.HISTORY_DIR = self._orig_dir
+        cfg.ACTIVE_PROFILE_FILE = self._orig_active
+        cfg.POLYGON_WALLET = self._orig_wallet
+        self.tmp_dir.cleanup()
 
     def test_round_price_to_tick(self):
         self.assertAlmostEqual(trade.round_price_to_tick(0.454, "0.01", mode="up"), 0.46)
@@ -211,12 +228,14 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
              patch.object(trade.api, "get", return_value=_FakeResponse(200, self.SAMPLE_BOOK)), \
              patch("trade.execute_order", return_value={"ok": True, "order_id": "ord_9", "status": "matched"}) as mock_exec, \
              patch("wallet.import_polymarket_positions", return_value=history), \
-             patch("session.save_history"), \
+             patch("storage.save_history") as mock_save, \
              patch("builtins.input", return_value="CONFIRM"):
             ok = session._execute_live_buy_candidates(candidates, history)
             self.assertTrue(ok)
             mock_exec.assert_called_once()
             self.assertEqual(mock_exec.call_args[0][0]["token_id"], "tok_no")
+            self.assertEqual(history["profile_id"], wallet)
+            mock_save.assert_called_once()
 
     def test_views_live_sell_and_buy_row(self):
         import views
@@ -239,7 +258,7 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
              patch.object(trade.api, "get", return_value=_FakeResponse(200, self.SAMPLE_BOOK)), \
              patch("trade.execute_order", return_value={"ok": True, "order_id": "ord_sell", "status": "matched"}) as mock_exec, \
              patch("wallet.import_polymarket_positions", return_value=history), \
-             patch("views.save_history"), \
+             patch("storage.save_history") as mock_save, \
              patch("builtins.input", side_effect=["50%", "1", "CONFIRM", ""]):
             ok = views._handle_live_trade_row(history, row, side="SELL")
             self.assertTrue(ok)
@@ -247,6 +266,8 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
             self.assertEqual(prev["side"], "SELL")
             self.assertEqual(prev["token_id"], "tok_yes")
             self.assertEqual(prev["shares"], 25.0)
+            self.assertEqual(history["profile_id"], wallet)
+            mock_save.assert_called_once()
 
     def test_zero_key_browser_preflight_session_and_views(self):
         import session
@@ -265,18 +286,20 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
             "clobTokenIds": '["tok_yes", "tok_no"]',
             "payload": {},
         }]
+        history_sess = copy.deepcopy(history)
         with patch.object(cfg, "CLOB_PRIVATE_KEY", ""), \
              patch.object(trade.api, "get", return_value=_FakeResponse(200, self.SAMPLE_BOOK)), \
              patch("trade.open_polymarket_url", return_value=True) as mock_open, \
              patch("trade.execute_order") as mock_exec, \
-             patch("wallet.import_polymarket_positions", return_value=history) as mock_sync, \
-             patch("session.save_history"), \
+             patch("wallet.import_polymarket_positions", return_value=history_sess) as mock_sync, \
+             patch("storage.save_history"), \
              patch("builtins.input", side_effect=["o", ""]):
-            ok = session._execute_live_buy_candidates(candidates, history)
+            ok = session._execute_live_buy_candidates(candidates, history_sess)
             self.assertTrue(ok)
             mock_exec.assert_not_called()
             mock_open.assert_called_once_with("https://polymarket.com/event/event-z")
             mock_sync.assert_called_once()
+            self.assertEqual(history_sess["profile_id"], wallet)
 
         row = {
             "Mode": "active",
@@ -291,18 +314,32 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
             "fee_rate": 0.0,
             "clobTokenIds": '["tok_yes", "tok_no"]',
         }
+        history_view = copy.deepcopy(history)
         with patch.object(cfg, "CLOB_PRIVATE_KEY", ""), \
              patch.object(trade.api, "get", return_value=_FakeResponse(200, self.SAMPLE_BOOK)), \
              patch("trade.open_polymarket_url", return_value=True) as mock_open, \
              patch("trade.execute_order") as mock_exec, \
-             patch("wallet.import_polymarket_positions", return_value=history) as mock_sync, \
-             patch("views.save_history"), \
+             patch("wallet.import_polymarket_positions", return_value=history_view) as mock_sync, \
+             patch("storage.save_history") as mock_save, \
              patch("builtins.input", side_effect=["", "2", "72", "o", ""]):
-            traded = views._handle_live_trade_row(history, row, side="SELL")
+            traded = views._handle_live_trade_row(history_view, row, side="SELL")
             self.assertTrue(traded)
             mock_exec.assert_not_called()
             mock_open.assert_called_once_with("https://polymarket.com/event/event-z")
             mock_sync.assert_called_once()
+            self.assertEqual(history_view["profile_id"], wallet)
+            mock_save.assert_called_once_with(history_view, profile_id=wallet)
+
+    def test_sync_wallet_after_trade_preserves_in_place_dict_and_isolates_dir(self):
+        wallet = "0x1234567890abcdef1234567890abcdef12345678"
+        history = {"profile_id": wallet, "predicted": {"m1": [{"pu": 0.7}]}}
+        with patch("wallet.import_polymarket_positions", return_value=history):
+            ok = trade.sync_wallet_after_trade(wallet, history)
+        self.assertTrue(ok)
+        self.assertEqual(history["profile_id"], wallet)
+        self.assertIn("m1", history["predicted"])
+        expected_path = os.path.join(self.tmp_dir.name, f"history_{wallet}.json")
+        self.assertTrue(os.path.exists(expected_path))
 
     def test_format_browser_ticket(self):
         t_buy = trade.format_browser_ticket(

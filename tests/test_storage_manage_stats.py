@@ -67,6 +67,40 @@ class TestStorageProfileAndCorruptionRecovery(unittest.TestCase):
         with open(backups[0], "r", encoding="utf-8") as bf:
             self.assertEqual(bf.read(), "{broken json!!!")
 
+    def test_atomic_save_and_rolling_backups(self):
+        pid = "backup_prof"
+        storage.set_active_profile(pid)
+        h = {
+            "predicted": {"m1": [{"pu": 0.6}]},
+            "exited": {},
+            "resolved": {},
+            "skipped": {},
+        }
+        storage.save_history(h, profile_id=pid, max_backups=2)
+        h["predicted"]["m1"][0]["pu"] = 0.65
+        storage.save_history(h, profile_id=pid, max_backups=2)  # backs up 0.60 -> 1 backup
+        storage.save_history(h, profile_id=pid, max_backups=2)  # backs up 0.65 -> 2 backups
+        storage.save_history(h, profile_id=pid, max_backups=2)  # unchanged 0.65 -> deduplicated (still 2)
+        backup_dir = os.path.join(self.tmp_dir.name, storage.BACKUP_DIR_NAME)
+        self.assertEqual(len(os.listdir(backup_dir)), 2)
+
+        # Two more distinct saves prune old backups down to max_backups=2
+        for new_pu in (0.75, 0.80):
+            h["predicted"]["m1"][0]["pu"] = new_pu
+            storage.save_history(h, profile_id=pid, max_backups=2)
+        backups = sorted(os.listdir(backup_dir))
+        self.assertEqual(len(backups), 2)
+
+        # Latest backup preserves previous state (pu=0.75) while active file has pu=0.80
+        with open(os.path.join(backup_dir, backups[-1]), "r", encoding="utf-8") as bf:
+            self.assertEqual(json.load(bf)["predicted"]["m1"][0]["pu"], 0.75)
+
+        loaded = storage.load_history(pid)
+        self.assertEqual(loaded["predicted"]["m1"][0]["pu"], 0.80)
+        self.assertFalse(any(f.endswith(".tmp") for f in os.listdir(self.tmp_dir.name)))
+        with self.assertRaises(TypeError):
+            storage.save_history(["not", "a", "dict"], profile_id=pid)
+
 
 class TestManageManualResolve(unittest.TestCase):
     @patch("manage.save_history")

@@ -499,8 +499,9 @@ def sync_wallet_after_trade(active_pid, history):
 
         print("[*] Re-syncing live wallet balances & positions...")
         updated = import_polymarket_positions(active_pid, history, auto_sync=True)
-        history.clear()
-        history.update(updated)
+        if isinstance(updated, dict) and updated is not history:
+            history.clear()
+            history.update(updated)
         save_history(history, profile_id=active_pid)
         return True
     except Exception as e:

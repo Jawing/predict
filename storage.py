@@ -2,8 +2,15 @@
 import json
 import os
 import re
+import shutil
+import tempfile
+from datetime import datetime
 import config as cfg
 from utils import ensure_list, stringify_overflow, get_history_counts
+
+
+BACKUP_DIR_NAME = "backups"
+MAX_BACKUPS_PER_PROFILE = 20
 
 
 def sanitize_profile_id(name):
@@ -235,16 +242,76 @@ def load_history(profile_id=None):
     return data
 
 
-def save_history(history, profile_id=None):
-    """Saves prediction history to profile file, automatically sanitizing overflow floats."""
+def _backup_profile_file(target_path, profile_id, max_backups=MAX_BACKUPS_PER_PROFILE):
+    """Saves a deduplicated timestamped backup in <HISTORY_DIR>/backups before overwriting."""
+    if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
+        return None
+    backup_dir = os.path.join(cfg.HISTORY_DIR, BACKUP_DIR_NAME)
+    os.makedirs(backup_dir, exist_ok=True)
+    prefix = f"history_{profile_id}."
+    existing = sorted(
+        f for f in os.listdir(backup_dir)
+        if f.startswith(prefix) and f.endswith(".json")
+    )
+    with open(target_path, "rb") as rf:
+        current_bytes = rf.read()
+    if existing:
+        try:
+            with open(os.path.join(backup_dir, existing[-1]), "rb") as lf:
+                if lf.read() == current_bytes:
+                    return os.path.join(backup_dir, existing[-1])
+        except OSError:
+            pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = os.path.join(backup_dir, f"{prefix}{stamp}.json")
+    shutil.copy2(target_path, backup_path)
+    existing.append(os.path.basename(backup_path))
+    if max_backups and len(existing) > max_backups:
+        for old_name in existing[:-max_backups]:
+            try:
+                os.remove(os.path.join(backup_dir, old_name))
+            except OSError:
+                pass
+    return backup_path
+
+
+def save_history(history, profile_id=None, max_backups=MAX_BACKUPS_PER_PROFILE):
+    """Atomically saves history JSON with a deduplicated rolling backup."""
+    if not isinstance(history, dict):
+        raise TypeError("history must be a dict")
     if not profile_id:
         profile_id = get_active_profile()
 
     os.makedirs(cfg.HISTORY_DIR, exist_ok=True)
     target_path = get_profile_path(profile_id)
     clean_data = stringify_overflow(history)
-    with open(target_path, "w", encoding="utf-8") as f:
-        json.dump(clean_data, f, indent=4)
+
+    if os.path.exists(target_path):
+        _backup_profile_file(target_path, sanitize_profile_id(profile_id), max_backups=max_backups)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cfg.HISTORY_DIR,
+            prefix=f".history_{sanitize_profile_id(profile_id)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(clean_data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def list_profiles():
