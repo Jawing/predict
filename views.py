@@ -1663,13 +1663,21 @@ def _handle_live_trade_row(history, row, side="SELL"):
     q_disp = row.get("raw_question") or row.get("Question")
     bid_s = f"{book['best_bid']*100:.1f}%" if book["best_bid"] else "N/A"
     ask_s = f"{book['best_ask']*100:.1f}%" if book["best_ask"] else "N/A"
-    mode_lbl = "LIVE" if conf["has_private_key"] else "PRE-FLIGHT"
+    use_clob_exec = bool(conf["has_private_key"] or conf.get("execution_mode") == "metamask")
+    if conf["has_private_key"]:
+        mode_lbl = "LIVE"
+    elif conf.get("execution_mode") == "metamask":
+        mode_lbl = "METAMASK"
+    else:
+        mode_lbl = "PRE-FLIGHT"
     print(f"\n--- {mode_lbl} {side} [{pos_side}] ---")
     print(f"Market    : {q_disp}")
-    print(f"Live Book : Bid {bid_s} | Ask {ask_s} | Tick {book['tick_size']} | Min Size {book['min_order_size']:g} sh")
-    if conf["has_private_key"]:
+    print(f"Live Book : Bid {bid_s} | Ask {ask_s} | Tick {book['tick_size']} | Min Mkt $1 | Min Limit {book['min_order_size']:g} sh")
+    if use_clob_exec:
         conf_full = get_clob_config(profile_id=active_pid, detect_remote=True)
         print(f"Auth      : {conf_full['signature_label']} ({conf_full['signature_note']})")
+        if not conf["has_private_key"]:
+            print(f"Signing   : MetaMask Extension (Browser: {conf_full['signing_browser']})")
     else:
         print("Mode      : Zero-Key (Pre-Flight & Browser Confirm)")
 
@@ -1742,7 +1750,7 @@ def _handle_live_trade_row(history, row, side="SELL"):
         input("Press Enter to continue: ")
         return False
 
-    if not conf["has_private_key"]:
+    if not use_clob_exec:
         ev_url = row.get("Web Link", "")
         print("\n" + format_browser_ticket(preview, question=q_disp, outcome=pos_side, event_url=ev_url))
         return prompt_browser_confirm_and_sync([ev_url], active_pid, history)
@@ -1756,13 +1764,18 @@ def _handle_live_trade_row(history, row, side="SELL"):
         print(f"Action    : BUY ${preview['amount_usdc']:,.2f} of {pos_side} (~{preview['est_shares']:,.2f} sh, {preview['order_type']})")
         print(f"Price     : Est VWAP {preview['est_vwap']*100:.1f}% | Cap/Limit {preview['price_cap']*100:.1f}%")
 
-    conf_str = input("Type 'CONFIRM' to submit live order: ").strip()
+    prompt_verb = "submit live order" if conf["has_private_key"] else "sign in MetaMask & submit order"
+    conf_str = input(f"Type 'CONFIRM' to {prompt_verb}: ").strip()
     if conf_str != "CONFIRM":
         print("[*] Live order cancelled.")
         input("Press Enter to continue: ")
         return False
 
-    res = execute_order(preview, profile_id=active_pid)
+    res = execute_order(
+        preview,
+        profile_id=active_pid,
+        summary={"question": q_disp, "outcome": pos_side},
+    )
     if res.get("ok"):
         print(f"[+] Order submitted: {res.get('status')} (ID: {res.get('order_id') or 'N/A'})")
         sync_wallet_after_trade(active_pid, history)

@@ -203,15 +203,23 @@ def load_history(profile_id=None):
                     if saved_br and float(saved_br) > 0:
                         cfg.BANKROLL = float(saved_br)
 
-                # Restore profile settings if saved
+                # Restore profile settings if saved (env vars take precedence)
                 saved_st = data.get("settings")
                 if isinstance(saved_st, dict):
                     for k in ["MIN_EDGE", "MAX_DAYS", "MIN_DAYS", "EXTREME_ODDS"]:
                         if k in saved_st:
                             setattr(cfg, k, saved_st[k])
-                    if not os.getenv("CLOB_SIGNATURE_TYPE", "").strip():
-                        saved_sig = saved_st.get("CLOB_SIGNATURE_TYPE")
-                        cfg.CLOB_SIGNATURE_TYPE = int(saved_sig) if saved_sig in (0, 1, 2) else None
+                st_dict = saved_st if isinstance(saved_st, dict) else {}
+                if not os.getenv("CLOB_SIGNATURE_TYPE", "").strip():
+                    saved_sig = st_dict.get("CLOB_SIGNATURE_TYPE")
+                    cfg.CLOB_SIGNATURE_TYPE = int(saved_sig) if saved_sig in (0, 1, 2) else None
+                if not os.getenv("EXECUTION_MODE", "").strip():
+                    saved_mode = str(st_dict.get("EXECUTION_MODE") or "browser").strip().lower()
+                    cfg.EXECUTION_MODE = saved_mode if saved_mode in ("browser", "metamask", "clob") else "browser"
+                if not os.getenv("METAMASK_SIGNER", "").strip():
+                    cfg.METAMASK_SIGNER = str(st_dict.get("METAMASK_SIGNER") or "").strip()
+                if not os.getenv("SIGNING_BROWSER", "").strip():
+                    cfg.SIGNING_BROWSER = str(st_dict.get("SIGNING_BROWSER") or "").strip()
 
                 return data
         except json.JSONDecodeError as e:

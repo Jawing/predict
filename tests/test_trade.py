@@ -1,14 +1,21 @@
 """Unit tests for live CLOB order preview, signature detection, and execution."""
+import base64
 import copy
+import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import config as cfg
+import metamask_signer
 import trade
 
 
@@ -16,6 +23,7 @@ class _FakeResponse:
     def __init__(self, status_code, payload):
         self.status_code = status_code
         self._payload = payload
+        self.content = json.dumps(payload).encode("utf-8") if payload is not None else b""
 
     def json(self):
         return self._payload
@@ -127,10 +135,21 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
             self.assertEqual(prev["price_cap"], 0.45)
             self.assertAlmostEqual(prev["est_shares"], 100.0)
 
+            # $1 Market buy (FAK) succeeds even when est_shares < min_order_size (5 sh)
+            high_book = {"asks": [{"price": "0.71", "size": "100"}], "bids": [{"price": "0.70", "size": "100"}], "tick_size": "0.01", "min_order_size": "5"}
+            with patch.object(trade.api, "get", return_value=_FakeResponse(200, high_book)):
+                prev_one = trade.preview_buy_order("tok_yes", 1.0, order_type="FAK", profile_id=wallet)
+                self.assertTrue(prev_one["ok"])
+                self.assertAlmostEqual(prev_one["est_shares"], 1.41)
+
+                prev_sub_dollar = trade.preview_buy_order("tok_yes", 0.50, order_type="FAK", profile_id=wallet)
+                self.assertFalse(prev_sub_dollar["ok"])
+                self.assertIn("$1.00 minimum", prev_sub_dollar["reason"])
+
             # GTC too small (< 5 shares) fails
             prev_small = trade.preview_buy_order("tok_yes", 1.0, order_type="GTC", limit_price=0.50, profile_id=wallet)
             self.assertFalse(prev_small["ok"])
-            self.assertIn("below market minimum", prev_small["reason"])
+            self.assertIn("below market limit minimum", prev_small["reason"])
 
     def test_preview_sell_fak_and_gtc(self):
         wallet = "0x1234567890abcdef1234567890abcdef12345678"
@@ -150,6 +169,13 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
             prev_floor = trade.preview_sell_order("tok_yes", 10.129, order_type="FAK", profile_id=wallet)
             self.assertTrue(prev_floor["ok"])
             self.assertEqual(prev_floor["shares"], 10.12)
+
+            # Small market sell (FAK < 5 sh) succeeds; small resting limit sell (GTC < 5 sh) fails
+            prev_small_fak_sell = trade.preview_sell_order("tok_yes", 2.0, order_type="FAK", profile_id=wallet)
+            self.assertTrue(prev_small_fak_sell["ok"])
+            prev_small_gtc_sell = trade.preview_sell_order("tok_yes", 2.0, order_type="GTC", limit_price=0.50, profile_id=wallet)
+            self.assertFalse(prev_small_gtc_sell["ok"])
+            self.assertIn("below market limit minimum", prev_small_gtc_sell["reason"])
 
             # Max single-order cap blocks oversized buys when signing key is configured
             with patch.object(cfg, "CLOB_PRIVATE_KEY", "0xdeadbeef"), \
@@ -360,6 +386,262 @@ class TestOrderPreviewAndExecution(unittest.TestCase):
         self.assertIn("SELL NO  (Limit Order)", t_sell)
         self.assertIn("30.00 shares", t_sell)
         self.assertIn("72.0c", t_sell)
+
+
+class TestMetaMaskBridgeAndBrowser(unittest.TestCase):
+    TEST_PRIV_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+
+    def setUp(self):
+        metamask_signer._SESSION_L2_CREDS.clear()
+
+    def _sample_preview_and_conf(self, signer_addr):
+        preview = {
+            "ok": True,
+            "side": "BUY",
+            "token_id": "10987654321098765432109876543210987654321098765432109876543210987654321098765",
+            "amount_usdc": 25.0,
+            "est_shares": 50.0,
+            "est_vwap": 0.50,
+            "price_cap": 0.50,
+            "tick_size": "0.01",
+            "neg_risk": False,
+            "order_type": "FAK",
+        }
+        conf = {
+            "host": "https://clob.polymarket.com",
+            "chain_id": 137,
+            "funder": signer_addr,
+            "signature_type": 0,
+            "has_private_key": False,
+            "execution_mode": "metamask",
+            "metamask_signer": signer_addr,
+            "signing_browser": "default",
+        }
+        return preview, conf
+
+    def _http_post_json(self, base_url, path, payload):
+        req = Request(
+            f"{base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+
+    def test_metamask_eip712_order_matches_py_order_utils(self):
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+        from py_order_utils.builders import OrderBuilder
+        from py_order_utils.model import BUY as UTILS_BUY, OrderData
+        from py_order_utils.signer import Signer as UtilsSigner
+        from py_clob_client.config import get_contract_config
+
+        acct = Account.from_key(self.TEST_PRIV_KEY)
+        preview, conf = self._sample_preview_and_conf(acct.address)
+
+        with patch.object(metamask_signer.api, "get", return_value=_FakeResponse(200, {"base_fee": 0})):
+            typed_data, order_dict = metamask_signer.build_order_typed_data(preview, conf, acct.address)
+
+        # Signer must be verifiable against the exact MetaMask eth_signTypedData_v4 JSON payload
+        signed_mm = Account.sign_typed_data(self.TEST_PRIV_KEY, full_message=typed_data)
+        signable = encode_typed_data(full_message=typed_data)
+        self.assertEqual(Account.recover_message(signable, signature=signed_mm.signature), acct.address)
+
+        # Sign the exact same OrderData fields using py_order_utils.OrderBuilder and verify identical signature
+        contracts = get_contract_config(137, neg_risk=False)
+        builder = OrderBuilder(
+            contracts.exchange,
+            137,
+            UtilsSigner(key=self.TEST_PRIV_KEY),
+            salt_generator=lambda: int(order_dict["salt"]),
+        )
+        data = OrderData(
+            maker=order_dict["maker"],
+            taker=order_dict["taker"],
+            tokenId=str(order_dict["tokenId"]),
+            makerAmount=str(order_dict["makerAmount"]),
+            takerAmount=str(order_dict["takerAmount"]),
+            side=UTILS_BUY,
+            feeRateBps=str(order_dict["feeRateBps"]),
+            nonce=str(order_dict["nonce"]),
+            signer=order_dict["signer"],
+            expiration=str(order_dict["expiration"]),
+            signatureType=order_dict["signatureType"],
+        )
+        signed_utils = builder.build_signed_order(data)
+
+        sig_mm_hex = signed_mm.signature.hex()
+        if not sig_mm_hex.startswith("0x"):
+            sig_mm_hex = "0x" + sig_mm_hex
+        self.assertEqual(sig_mm_hex, signed_utils.signature)
+
+    def test_metamask_bridge_end_to_end_l1_auth_and_l2_order(self):
+        from eth_account import Account
+
+        acct = Account.from_key(self.TEST_PRIV_KEY)
+        preview, conf = self._sample_preview_and_conf(acct.address)
+        server, url, done_event, state = metamask_signer.create_metamask_bridge_server(
+            preview, conf, summary={"question": "Test market?", "outcome": "Yes"}
+        )
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+        try:
+            parsed = urlparse(url)
+            base_url = f"http://127.0.0.1:{parsed.port}"
+            token = parse_qs(parsed.query)["token"][0]
+
+            with self.assertRaises(HTTPError) as ctx_404:
+                urlopen(f"{base_url}/", timeout=5)
+            self.assertEqual(ctx_404.exception.code, 404)
+            ctx_404.exception.close()
+
+            with urlopen(url, timeout=5) as r_html:
+                self.assertEqual(r_html.status, 200)
+                self.assertIn(b"Polymarket MetaMask Signer", r_html.read())
+
+            with self.assertRaises(HTTPError) as ctx_403:
+                self._http_post_json(base_url, "/prepare-auth", {"token": "wrong", "signer": acct.address})
+            self.assertEqual(ctx_403.exception.code, 403)
+            ctx_403.exception.close()
+
+            api_secret = base64.b64encode(b"s" * 32).decode("ascii")
+            captured_post = {}
+
+            def _fake_get(req_url, **kwargs):
+                if "/fee-rate" in req_url:
+                    return _FakeResponse(200, {"base_fee": 0})
+                if "/auth/derive-api-key" in req_url:
+                    return _FakeResponse(200, {"apiKey": "k-test", "secret": api_secret, "passphrase": "p-test"})
+                return _FakeResponse(404, {})
+
+            def _fake_post(req_url, headers=None, data=None, **kwargs):
+                captured_post["url"] = req_url
+                captured_post["headers"] = dict(headers or {})
+                captured_post["body"] = json.loads(data)
+                return _FakeResponse(200, {"success": True, "orderID": "mm-ord-1", "status": "matched"})
+
+            def _fake_request(method, req_url, **kwargs):
+                return _fake_get(req_url, **kwargs)
+
+            with patch.object(metamask_signer.api, "get", side_effect=_fake_get), \
+                 patch.object(metamask_signer.api, "request", side_effect=_fake_request), \
+                 patch.object(metamask_signer.api, "post", side_effect=_fake_post):
+                st, auth_prep = self._http_post_json(base_url, "/prepare-auth", {"token": token, "signer": acct.address})
+                self.assertEqual(st, 200)
+                self.assertTrue(auth_prep["need_auth"])
+
+                auth_sig = Account.sign_typed_data(self.TEST_PRIV_KEY, full_message=auth_prep["typed_data"]).signature.hex()
+                if not auth_sig.startswith("0x"):
+                    auth_sig = "0x" + auth_sig
+                st, auth_sub = self._http_post_json(
+                    base_url,
+                    "/submit-auth",
+                    {
+                        "token": token,
+                        "signer": acct.address,
+                        "signature": auth_sig,
+                        "timestamp": auth_prep["timestamp"],
+                        "nonce": auth_prep["nonce"],
+                    },
+                )
+                self.assertEqual(st, 200)
+                self.assertTrue(auth_sub["ok"])
+
+                st, ord_prep = self._http_post_json(base_url, "/prepare-order", {"token": token, "signer": acct.address})
+                self.assertEqual(st, 200)
+                ord_sig = Account.sign_typed_data(self.TEST_PRIV_KEY, full_message=ord_prep["typed_data"]).signature.hex()
+                if not ord_sig.startswith("0x"):
+                    ord_sig = "0x" + ord_sig
+
+                st, ord_sub = self._http_post_json(
+                    base_url,
+                    "/submit-order",
+                    {"token": token, "signer": acct.address, "signature": ord_sig, "order_dict": ord_prep["order_dict"]},
+                )
+                self.assertEqual(st, 200)
+                self.assertTrue(ord_sub["ok"])
+                self.assertEqual(ord_sub["order_id"], "mm-ord-1")
+
+            self.assertTrue(done_event.is_set())
+            self.assertTrue(state["result"]["ok"])
+            self.assertIn("POLY_API_KEY", captured_post["headers"])
+            self.assertIn("POLY_SIGNATURE", captured_post["headers"])
+            self.assertEqual(captured_post["body"]["order"]["signature"], ord_sig)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Verify /cancel closes flow cleanly too
+        server2, url2, done2, state2 = metamask_signer.create_metamask_bridge_server(preview, conf)
+        t2 = threading.Thread(target=server2.serve_forever, daemon=True)
+        t2.start()
+        try:
+            p2 = urlparse(url2)
+            base2 = f"http://127.0.0.1:{p2.port}"
+            tok2 = parse_qs(p2.query)["token"][0]
+            st, res_c = self._http_post_json(base2, "/cancel", {"token": tok2})
+            self.assertEqual(st, 200)
+            self.assertTrue(res_c["ok"])
+            self.assertTrue(done2.is_set())
+            self.assertEqual(state2["result"]["status"], "cancelled")
+        finally:
+            server2.shutdown()
+            server2.server_close()
+
+    def test_execute_order_routes_to_metamask_mode(self):
+        preview, conf = self._sample_preview_and_conf("0x1111111111111111111111111111111111111111")
+        with patch("trade.get_clob_config", return_value=conf), \
+             patch("metamask_signer.sign_and_submit_with_metamask", return_value={"ok": True, "order_id": "mm-99", "status": "live"}) as mock_mm:
+            res = trade.execute_order(preview, profile_id=conf["funder"], summary={"question": "Q", "outcome": "Yes"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["order_id"], "mm-99")
+        mock_mm.assert_called_once()
+
+    def test_open_polymarket_url_resolves_signing_browser_and_local_bridge(self):
+        self.assertFalse(trade.open_polymarket_url("http://example.com/phish"))
+        with patch("trade.os.path.exists", side_effect=lambda p: p.endswith("zen.exe")), \
+             patch("trade.subprocess.Popen") as mock_popen:
+            ok = trade.open_polymarket_url("http://127.0.0.1:54321/?token=abc", browser_pref="zen")
+        self.assertTrue(ok)
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        self.assertTrue(args[0].endswith("zen.exe"))
+        self.assertEqual(args[1], "http://127.0.0.1:54321/?token=abc")
+
+    def test_configure_trade_execution_saves_metamask_settings(self):
+        import manage
+        import storage
+
+        wallet = "0x1111111111111111111111111111111111111111"
+        signer = "0x2222222222222222222222222222222222222222"
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(cfg, "HISTORY_DIR", tmp), \
+                 patch.object(cfg, "ACTIVE_PROFILE_FILE", os.path.join(tmp, "active.txt")), \
+                 patch.object(cfg, "EXECUTION_MODE", "browser"), \
+                 patch.object(cfg, "METAMASK_SIGNER", ""), \
+                 patch.object(cfg, "SIGNING_BROWSER", "default"), \
+                 patch.object(cfg, "CLOB_SIGNATURE_TYPE", None), \
+                 patch.dict(os.environ, {}, clear=False):
+                for k in ("EXECUTION_MODE", "METAMASK_SIGNER", "SIGNING_BROWSER", "CLOB_SIGNATURE_TYPE"):
+                    os.environ.pop(k, None)
+                history = {"profile_id": wallet, "settings": {}}
+                storage.save_history(history, profile_id=wallet)
+                inputs = ["1", "metamask", "2", signer, "3", "zen", "4", "2", ""]
+                with patch("trade.detect_wallet_signature_type", return_value=(2, "detected")), \
+                     patch("builtins.input", side_effect=inputs):
+                    manage._configure_trade_execution(history, wallet)
+                self.assertEqual(history["settings"]["EXECUTION_MODE"], "metamask")
+                self.assertEqual(history["settings"]["METAMASK_SIGNER"], signer)
+                self.assertEqual(history["settings"]["SIGNING_BROWSER"], "zen")
+                self.assertEqual(history["settings"]["CLOB_SIGNATURE_TYPE"], 2)
+
+                loaded = storage.load_history(wallet)
+                self.assertEqual(cfg.EXECUTION_MODE, "metamask")
+                self.assertEqual(cfg.METAMASK_SIGNER, signer)
+                self.assertEqual(cfg.SIGNING_BROWSER, "zen")
+                self.assertEqual(cfg.CLOB_SIGNATURE_TYPE, 2)
+                self.assertEqual(loaded["settings"]["SIGNING_BROWSER"], "zen")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,9 @@ CLOB_SIGNATURE_TYPE = int(_sig_raw) if _sig_raw in ("0", "1", "2") else None
 CLOB_FUNDER = os.getenv("CLOB_FUNDER", "")
 _max_ord_raw = os.getenv("CLOB_MAX_ORDER_USD", "").strip()
 CLOB_MAX_ORDER_USD = float(_max_ord_raw) if _max_ord_raw else 250.0  # Safety cap per live order ($)
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "browser").strip().lower() or "browser"  # browser | metamask | clob
+METAMASK_SIGNER = os.getenv("METAMASK_SIGNER", "").strip()
+SIGNING_BROWSER = os.getenv("SIGNING_BROWSER", "").strip()
 
 # --- FILTERING PARAMETERS ---
 MIN_EDGE = 0.00      # Minimum mathematical edge required (e.g., 0.01 = 1%)

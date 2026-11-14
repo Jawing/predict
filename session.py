@@ -1147,12 +1147,20 @@ def _execute_live_buy_candidates(sel_candidates, history):
             prev = {"ok": False, "reason": str(e)}
         previews.append({"candidate": c, "preview": prev})
 
-    mode_hdr = "LIVE CLOB ORDER PREVIEW (FAK Market Orders)" if conf["has_private_key"] else "ZERO-KEY PRE-FLIGHT TICKETS (Confirm in Browser)"
+    use_clob_exec = bool(conf["has_private_key"] or conf.get("execution_mode") == "metamask")
+    if conf["has_private_key"]:
+        mode_hdr = "LIVE CLOB ORDER PREVIEW (FAK Market Orders)"
+    elif conf.get("execution_mode") == "metamask":
+        mode_hdr = "METAMASK CLOB ORDER PREVIEW (FAK Market Orders)"
+    else:
+        mode_hdr = "ZERO-KEY PRE-FLIGHT TICKETS (Confirm in Browser)"
     print(f"\n--- {mode_hdr} ---")
     print(f"Wallet   : {active_pid}")
-    if conf["has_private_key"]:
+    if use_clob_exec:
         conf_full = get_clob_config(profile_id=active_pid, detect_remote=True)
         print(f"Auth     : {conf_full['signature_label']} ({conf_full['signature_note']})")
+        if not conf["has_private_key"]:
+            print(f"Signing  : MetaMask Browser Extension (Browser: {conf_full['signing_browser']})")
     else:
         print("Mode     : Zero-Key (no private key on disk)")
 
@@ -1170,7 +1178,7 @@ def _execute_live_buy_candidates(sel_candidates, history):
                 f"  [{idx}] BUY {c['side']:<3} | ${p['amount_usdc']:,.2f} (~{p['est_shares']:,.1f} sh @ {p['est_vwap']*100:.1f}% VWAP, "
                 f"max {p['price_cap']*100:.1f}c) | {q_short}"
             )
-            if not conf["has_private_key"] and ev_url:
+            if not use_clob_exec and ev_url:
                 print(f"      URL: {ev_url}")
         else:
             print(f"  [{idx}] SKIP ({p.get('reason', 'invalid')}) | {q_short}")
@@ -1179,11 +1187,12 @@ def _execute_live_buy_candidates(sel_candidates, history):
         print("[!] No valid orders to prepare.")
         return False
 
-    if not conf["has_private_key"]:
+    if not use_clob_exec:
         return prompt_browser_confirm_and_sync([it.get("url") for it in valid_items], active_pid, history)
 
     tot_live = sum(it["preview"]["amount_usdc"] for it in valid_items)
-    confirm = input(f"\nType 'CONFIRM' to submit {len(valid_items)} live order(s) totaling ${tot_live:,.2f}: ").strip()
+    action_desc = "submit" if conf["has_private_key"] else "sign in MetaMask & submit"
+    confirm = input(f"\nType 'CONFIRM' to {action_desc} {len(valid_items)} live order(s) totaling ${tot_live:,.2f}: ").strip()
     if confirm != "CONFIRM":
         print("[*] Live order execution cancelled (candidates remain saved locally).")
         return False
@@ -1191,7 +1200,11 @@ def _execute_live_buy_candidates(sel_candidates, history):
     succeeded = 0
     for item in valid_items:
         c = item["candidate"]
-        res = execute_order(item["preview"], profile_id=active_pid)
+        res = execute_order(
+            item["preview"],
+            profile_id=active_pid,
+            summary={"question": c["question"], "outcome": c["side"]},
+        )
         if res.get("ok"):
             succeeded += 1
             print(f"  [+] {c['question'][:40]} -> {res.get('status')} (Order ID: {res.get('order_id') or 'N/A'})")
@@ -1273,8 +1286,13 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
         if tot_sel_alloc > current_bankroll + 1.0:
             print(f"[!] Warning    : Selected allocation exceeds bankroll by ${tot_sel_alloc - current_bankroll:,.2f}")
 
-        from trade import is_live_trading_ready
-        live_label = "Commit & Live Buy" if is_live_trading_ready(profile_id=active_pid) else "Commit & Pre-Flight"
+        from trade import get_clob_config, is_live_trading_ready
+        if is_live_trading_ready(profile_id=active_pid):
+            live_label = "Commit & Live Buy"
+        elif get_clob_config(profile_id=active_pid, detect_remote=False).get("execution_mode") == "metamask":
+            live_label = "Commit & MetaMask Buy"
+        else:
+            live_label = "Commit & Pre-Flight"
         live_opt = f"  [x] {live_label}" if is_live_wallet else ""
         act_prompt = f"\nActions: [Enter] Commit Selected{live_opt}  [1-{len(session_candidates)}] Toggle  [a] Select All  [q] Discard All\n> "
         choice = input(act_prompt).strip().lower()

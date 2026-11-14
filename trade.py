@@ -1,5 +1,8 @@
-"""Live Polymarket CLOB order preview, signing, and execution via py-clob-client."""
+"""Live Polymarket CLOB order preview, signing, and execution via py-clob-client or MetaMask."""
 import math
+import os
+import shutil
+import subprocess
 import webbrowser
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 import config as cfg
@@ -71,7 +74,7 @@ def detect_wallet_signature_type(wallet_address):
 
 
 def get_clob_config(profile_id=None, detect_remote=True):
-    """Resolves active wallet, private key, signature_type, and funder settings."""
+    """Resolves active wallet, private key, execution mode, signature_type, and funder settings."""
     pid = str(profile_id or get_active_profile() or "").strip()
     is_live_wallet = pid.startswith("0x") and len(pid) >= 10
     priv_key = str(getattr(cfg, "CLOB_PRIVATE_KEY", "") or "").strip()
@@ -90,6 +93,16 @@ def get_clob_config(profile_id=None, detect_remote=True):
     funder_override = str(getattr(cfg, "CLOB_FUNDER", "") or "").strip()
     funder = funder_override if funder_override else (pid if (is_live_wallet and sig_type in (1, 2)) else None)
 
+    raw_mode = str(getattr(cfg, "EXECUTION_MODE", "browser") or "browser").strip().lower()
+    if raw_mode not in ("browser", "metamask", "clob"):
+        raw_mode = "browser"
+    if priv_key:
+        exec_mode = "clob"
+    elif raw_mode == "clob":
+        exec_mode = "browser"
+    else:
+        exec_mode = raw_mode
+
     return {
         "profile_id": pid,
         "is_live_wallet": is_live_wallet,
@@ -97,6 +110,9 @@ def get_clob_config(profile_id=None, detect_remote=True):
         "chain_id": int(getattr(cfg, "CLOB_CHAIN_ID", 137)),
         "private_key": priv_key,
         "has_private_key": bool(priv_key),
+        "execution_mode": exec_mode,
+        "metamask_signer": str(getattr(cfg, "METAMASK_SIGNER", "") or "").strip(),
+        "signing_browser": str(getattr(cfg, "SIGNING_BROWSER", "") or "").strip(),
         "api_key": str(getattr(cfg, "CLOB_API_KEY", "") or "").strip(),
         "api_secret": str(getattr(cfg, "CLOB_API_SECRET", "") or "").strip(),
         "api_passphrase": str(getattr(cfg, "CLOB_API_PASSPHRASE", "") or "").strip(),
@@ -217,6 +233,7 @@ def _build_base_preview(book, side, order_type, profile_id):
         "profile_id": conf["profile_id"],
         "is_live_wallet": conf["is_live_wallet"],
         "has_private_key": conf["has_private_key"],
+        "execution_mode": conf["execution_mode"],
     }
 
 
@@ -255,7 +272,8 @@ def preview_buy_order(
         return prev
 
     max_order_usd = float(getattr(cfg, "CLOB_MAX_ORDER_USD", 0.0) or 0.0)
-    if prev["has_private_key"] and max_order_usd > 0 and prev["amount_usdc"] > max_order_usd:
+    clob_capped = prev["has_private_key"] or prev.get("execution_mode") == "metamask"
+    if clob_capped and max_order_usd > 0 and prev["amount_usdc"] > max_order_usd:
         prev["ok"] = False
         prev["reason"] = f"Buy amount ${prev['amount_usdc']:,.2f} exceeds CLOB_MAX_ORDER_USD (${max_order_usd:,.2f})."
         return prev
@@ -272,7 +290,12 @@ def preview_buy_order(
         prev["est_shares"] = shares
         if shares < min_shares:
             prev["ok"] = False
-            prev["reason"] = f"Order size {shares:.2f} shares is below market minimum ({min_shares:g} shares)."
+            prev["reason"] = f"Order size {shares:.2f} shares is below market limit minimum ({min_shares:g} shares)."
+        return prev
+
+    if prev["amount_usdc"] < 1.0:
+        prev["ok"] = False
+        prev["reason"] = f"Market buy amount ${prev['amount_usdc']:.2f} is below Polymarket's $1.00 minimum."
         return prev
 
     asks = book["asks"]
@@ -309,9 +332,9 @@ def preview_buy_order(
     est_shares = round(prev["amount_usdc"] / max(prev["est_vwap"], 1e-4), 2)
     prev["price_cap"] = cap_px
     prev["est_shares"] = est_shares
-    if est_shares < min_shares:
+    if prev["amount_usdc"] < 1.0:
         prev["ok"] = False
-        prev["reason"] = f"Estimated size {est_shares:.2f} shares is below market minimum ({min_shares:g} shares)."
+        prev["reason"] = f"Executable amount ${prev['amount_usdc']:.2f} is below Polymarket's $1.00 market minimum."
     return prev
 
 
@@ -338,15 +361,19 @@ def preview_sell_order(
         prev["reason"] = "Active profile is a Paper Sandbox; live orders require a 0x wallet profile."
         return prev
 
-    min_shares = book["min_order_size"]
-    if req_shares < min_shares:
+    if req_shares <= 0:
         prev["ok"] = False
-        prev["reason"] = f"Sell size {req_shares:.2f} shares is below market minimum ({min_shares:g} shares)."
+        prev["reason"] = "Sell share amount must be greater than 0."
         return prev
 
+    min_shares = book["min_order_size"]
     tick_size = book["tick_size"]
 
     if ot == "GTC":
+        if req_shares < min_shares:
+            prev["ok"] = False
+            prev["reason"] = f"Sell limit size {req_shares:.2f} shares is below market limit minimum ({min_shares:g} shares)."
+            return prev
         raw_px = float(limit_price) if (limit_price is not None and limit_price > 0) else (book["best_ask"] or book["best_bid"] or 0.5)
         px = round_price_to_tick(raw_px, tick_size, mode="nearest")
         prev["price_cap"] = px
@@ -361,9 +388,9 @@ def preview_sell_order(
         return prev
 
     fill_sh, vwap, proceeds, worst_bid = calculate_optimal_market_sell(bids, req_shares, min_price=float(min_price or 0.0))
-    if fill_sh < min_shares:
+    if fill_sh <= 0:
         prev["ok"] = False
-        prev["reason"] = f"Available bid depth ({fill_sh:.2f} sh) above floor is below minimum ({min_shares:g} sh)."
+        prev["reason"] = "No bid liquidity available above floor price."
         return prev
 
     floor_px = round_price_to_tick(max(float(min_price or 0.0), worst_bid), tick_size, mode="down")
@@ -374,13 +401,36 @@ def preview_sell_order(
     return prev
 
 
-def execute_order(preview, profile_id=None, client=None):
-    """Signs and posts a validated order preview via py-clob-client."""
+def normalize_clob_response(resp, http_status=200):
+    """Normalizes a Polymarket CLOB order response dict into a uniform result shape."""
+    if isinstance(resp, dict):
+        err = resp.get("errorMsg") or resp.get("error") or (f"HTTP {http_status}" if http_status >= 400 else "")
+        success = bool(resp.get("success", http_status < 400)) and not err
+        return {
+            "ok": success,
+            "order_id": resp.get("orderID") or resp.get("id") or "",
+            "status": resp.get("status") or ("matched" if success else "rejected"),
+            "taking_amount": resp.get("takingAmount"),
+            "making_amount": resp.get("makingAmount"),
+            "error": err,
+            "raw": resp,
+        }
+    return {"ok": http_status < 400, "order_id": "", "status": "submitted", "error": "", "raw": resp}
+
+
+def execute_order(preview, profile_id=None, client=None, summary=None):
+    """Signs and posts a validated order preview via py-clob-client or MetaMask bridge."""
     if not isinstance(preview, dict) or not preview.get("ok"):
         return {
             "ok": False,
             "error": (preview or {}).get("reason", "Invalid order preview"),
         }
+
+    if client is None:
+        conf = get_clob_config(profile_id=profile_id, detect_remote=True)
+        if not conf["has_private_key"] and conf["execution_mode"] == "metamask":
+            from metamask_signer import sign_and_submit_with_metamask
+            return sign_and_submit_with_metamask(preview, conf, summary=summary)
 
     from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY, SELL
@@ -417,19 +467,7 @@ def execute_order(preview, profile_id=None, client=None):
             signed = clob.create_market_order(args, options=options)
             resp = clob.post_order(signed, ot_enum)
 
-        if isinstance(resp, dict):
-            err = resp.get("errorMsg") or resp.get("error") or ""
-            success = bool(resp.get("success", True)) and not err
-            return {
-                "ok": success,
-                "order_id": resp.get("orderID") or resp.get("id") or "",
-                "status": resp.get("status") or ("matched" if success else "rejected"),
-                "taking_amount": resp.get("takingAmount"),
-                "making_amount": resp.get("makingAmount"),
-                "error": err,
-                "raw": resp,
-            }
-        return {"ok": True, "order_id": "", "status": "submitted", "error": "", "raw": resp}
+        return normalize_clob_response(resp)
     except Exception as e:
         return {"ok": False, "order_id": "", "status": "error", "error": str(e), "raw": None}
 
@@ -481,12 +519,43 @@ def format_browser_ticket(preview, question="", outcome="Yes", event_url=""):
     return "\n".join(lines)
 
 
-def open_polymarket_url(url):
-    """Opens a Polymarket event URL in the default browser."""
-    if not url or not str(url).startswith("https://"):
+_BROWSER_PATHS = {
+    "zen": [r"C:\Program Files\Zen Browser\zen.exe", r"C:\Program Files (x86)\Zen Browser\zen.exe"],
+    "firefox": [r"C:\Program Files\Mozilla Firefox\firefox.exe", r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"],
+    "chrome": [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"],
+    "edge": [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"],
+}
+
+
+def _resolve_browser_executable(browser_pref):
+    """Resolves a friendly browser name ('zen', 'firefox', 'chrome', 'edge') or path to an executable."""
+    pref = str(browser_pref or "").strip().strip('"')
+    if not pref or pref.lower() in ("default", "system"):
+        return None
+    if os.path.isfile(pref):
+        return pref
+    for cand in _BROWSER_PATHS.get(pref.lower(), []):
+        if os.path.isfile(cand):
+            return cand
+    return shutil.which(pref)
+
+
+def open_polymarket_url(url, browser_pref=None):
+    """Opens a Polymarket HTTPS URL or localhost signer URL in the configured browser."""
+    u = str(url or "")
+    allowed = u.startswith("https://") or u.startswith("http://127.0.0.1:") or u.startswith("http://localhost:")
+    if not u or not allowed:
         return False
+    pref = browser_pref if browser_pref is not None else getattr(cfg, "SIGNING_BROWSER", "")
+    exe = _resolve_browser_executable(pref)
+    if exe:
+        try:
+            subprocess.Popen([exe, u])
+            return True
+        except Exception:
+            pass
     try:
-        return bool(webbrowser.open(str(url)))
+        return bool(webbrowser.open(u))
     except Exception:
         return False
 

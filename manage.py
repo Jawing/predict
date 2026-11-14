@@ -664,6 +664,86 @@ def manual_resolve(history):
     return history
 
 
+def _save_exec_setting(history, active_pid, key, value):
+    setattr(cfg, key, value)
+    history.setdefault("settings", {})[key] = value
+    save_history(history, profile_id=active_pid)
+
+
+def _configure_trade_execution(history, active_pid):
+    """Configures trade execution mode, MetaMask signer/browser, and CLOB signature type."""
+    from trade import get_clob_config
+
+    while True:
+        clob_conf = get_clob_config(profile_id=active_pid, detect_remote=True)
+        mode = clob_conf["execution_mode"]
+        print("\n--- TRADE EXECUTION & METAMASK SETTINGS ---")
+        print(f"Active Wallet   : {active_pid}  (switch funder wallet via Main Menu -> Option 4)")
+        print(f"Execution Mode  : {mode}")
+        print(f"MetaMask Signer : {clob_conf['metamask_signer'] or '(any connected MetaMask account)'}")
+        print(f"Signing Browser : {clob_conf['signing_browser']}")
+        print(f"Signature Type  : {clob_conf['signature_type']} - {clob_conf['signature_label']} ({clob_conf['signature_note']})")
+        print(f"Funder Address  : {clob_conf['funder'] or '(same as signer EOA)'}")
+
+        print("\nSelect setting to update [Enter to return]:")
+        print(" 1: Execution Mode  (metamask | browser | clob)")
+        print(" 2: MetaMask Signer EOA Address (0x... or clear)")
+        print(" 3: Signing Browser (default | zen | firefox | chrome | edge | .exe path)")
+        print(" 4: CLOB Signature Type (auto | 0=EOA | 1=POLY_PROXY | 2=GNOSIS_SAFE)")
+        sub = input("> ").strip()
+        if not sub:
+            return
+
+        if sub == "1":
+            print(" [1] metamask - Sign EIP-712 orders via MetaMask browser extension (Zero-Key)")
+            print(" [2] browser  - Pre-flight & open polymarket.com market tab (Zero-Key)")
+            print(" [3] clob     - Direct hot-key CLOB signing (requires CLOB_PRIVATE_KEY in .env)")
+            m_in = input("> ").strip().lower()
+            mode_map = {"1": "metamask", "metamask": "metamask", "2": "browser", "browser": "browser", "3": "clob", "clob": "clob"}
+            chosen = mode_map.get(m_in)
+            if not chosen:
+                print("[*] Execution mode unchanged.")
+                continue
+            if chosen == "clob" and not clob_conf["has_private_key"]:
+                print("[!] CLOB_PRIVATE_KEY is not set in .env; direct CLOB mode will not be active until set.")
+            _save_exec_setting(history, active_pid, "EXECUTION_MODE", chosen)
+            print(f"[+] Execution mode set to '{chosen}'.")
+        elif sub == "2":
+            addr_in = input("Enter MetaMask EOA address (0x..., or 'clear' for any connected account): ").strip()
+            if not addr_in:
+                print("[*] MetaMask signer unchanged.")
+            elif addr_in.lower() in ("clear", "auto", "none"):
+                _save_exec_setting(history, active_pid, "METAMASK_SIGNER", "")
+                print("[+] MetaMask signer requirement cleared (any connected MetaMask EOA allowed).")
+            elif addr_in.startswith("0x") and len(addr_in) == 42 and all(c in "0123456789abcdefABCDEF" for c in addr_in[2:]):
+                _save_exec_setting(history, active_pid, "METAMASK_SIGNER", addr_in)
+                print(f"[+] MetaMask signer EOA set to {addr_in}.")
+            else:
+                print("[!] Invalid 0x address - setting unchanged.")
+        elif sub == "3":
+            b_in = input("Browser ('default', 'zen', 'firefox', 'chrome', 'edge', or path to browser .exe): ").strip().strip('"')
+            if not b_in:
+                print("[*] Signing browser unchanged.")
+                continue
+            norm = b_in.lower() if b_in.lower() in ("default", "zen", "firefox", "chrome", "edge") else b_in
+            _save_exec_setting(history, active_pid, "SIGNING_BROWSER", norm)
+            print(f"[+] Signing browser set to '{norm}'.")
+        elif sub == "4":
+            print(" [a] Auto-detect from Polygon RPC (Recommended)")
+            print(" [0] EOA (Direct wallet holding funds)")
+            print(" [1] POLY_PROXY (Email / Magic proxy wallet)")
+            print(" [2] POLY_GNOSIS_SAFE (Browser / MetaMask proxy wallet)")
+            sig_in = input("> ").strip().lower()
+            if sig_in in ("a", "auto"):
+                _save_exec_setting(history, active_pid, "CLOB_SIGNATURE_TYPE", None)
+                print("[+] Signature type set to Auto-detect.")
+            elif sig_in in ("0", "1", "2"):
+                _save_exec_setting(history, active_pid, "CLOB_SIGNATURE_TYPE", int(sig_in))
+                print(f"[+] Signature type overridden to {sig_in}.")
+            else:
+                print("[*] Signature type unchanged.")
+
+
 def settings_menu():
     """Interactive settings and thresholds configurator."""
     active_pid = get_active_profile()
@@ -684,6 +764,9 @@ def settings_menu():
         if clob_conf["has_private_key"]:
             clob_conf = get_clob_config(profile_id=active_pid, detect_remote=True)
             print(f" 6: Execution Mode = Direct CLOB ({clob_conf['signature_label']} | {clob_conf['signature_note']})")
+        elif clob_conf["execution_mode"] == "metamask":
+            signer_s = clob_conf["metamask_signer"][:10] + "..." if clob_conf["metamask_signer"] else "auto-connect"
+            print(f" 6: Execution Mode = MetaMask Browser Signing (Browser: {clob_conf['signing_browser']} | Signer: {signer_s})")
         else:
             print(" 6: Execution Mode = Zero-Key Pre-Flight & Browser Confirm (no private key on disk)")
     else:
@@ -771,34 +854,4 @@ def settings_menu():
                 except ValueError:
                     print("[!] Invalid value.")
     elif s_choice == "6" and is_wallet:
-        from trade import get_clob_config
-        clob_conf = get_clob_config(profile_id=active_pid, detect_remote=False)
-        print("\n--- TRADE EXECUTION SETTINGS ---")
-        print(f"Active Wallet  : {active_pid}")
-        if not clob_conf["has_private_key"]:
-            print("Mode           : Zero-Key Pre-Flight & Browser Confirm (Safest - no private key on disk)")
-            print("Signing        : Confirmed directly in Polymarket browser UI.")
-            print("Direct CLOB    : Optional — set CLOB_PRIVATE_KEY in .env to enable automated CLI orders.")
-            return
-        clob_conf = get_clob_config(profile_id=active_pid, detect_remote=True)
-        print("Mode           : Direct CLOB Signing (hot key configured)")
-        print(f"Signature Type : {clob_conf['signature_type']} - {clob_conf['signature_label']} ({clob_conf['signature_note']})")
-        print(f"Funder Address : {clob_conf['funder'] or '(same as signer EOA)'}")
-        print("\nSelect Signature Type Override:")
-        print(" [a] Auto-detect from Polygon RPC (Recommended)")
-        print(" [0] EOA (Direct wallet holding funds)")
-        print(" [1] POLY_PROXY (Email / Magic proxy wallet)")
-        print(" [2] POLY_GNOSIS_SAFE (Browser / MetaMask proxy wallet)")
-        sig_in = input("> ").strip().lower()
-        if sig_in in ("a", "auto"):
-            cfg.CLOB_SIGNATURE_TYPE = None
-            history.setdefault("settings", {})["CLOB_SIGNATURE_TYPE"] = None
-            save_history(history, profile_id=active_pid)
-            print("[+] Signature type set to Auto-detect.")
-        elif sig_in in ("0", "1", "2"):
-            cfg.CLOB_SIGNATURE_TYPE = int(sig_in)
-            history.setdefault("settings", {})["CLOB_SIGNATURE_TYPE"] = int(sig_in)
-            save_history(history, profile_id=active_pid)
-            print(f"[+] Signature type overridden to {sig_in}.")
-        else:
-            print("[*] Signature type unchanged.")
+        _configure_trade_execution(history, active_pid)
