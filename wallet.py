@@ -58,7 +58,19 @@ def fetch_v2_positions(wallet_address, status_filter):
                     cur_p = float(p.get("current_price") if p.get("current_price") is not None else p.get("curPrice", avg_p) or avg_p)
                     init_val = float(p.get("total_cost_usdc") if p.get("total_cost_usdc") is not None else p.get("initialValue", sz * avg_p) or (sz * avg_p))
                     cur_val = float(p.get("current_value") if p.get("current_value") is not None else p.get("currentValue", sz * cur_p) or (sz * cur_p))
+                    is_redeemable = bool(p.get("redeemable")) or str(p.get("status", "")).upper() == "REDEEMABLE"
                     r_pnl = float(p.get("realized_pnl") if p.get("realized_pnl") is not None else p.get("realizedPnl", 0.0) or 0.0)
+                    if status_filter == "OPEN" and is_redeemable:
+                        # Unredeemed OPEN redeemable positions report only partial-sell/fee realized_pnl;
+                        # total_pnl equals the settled post-fee PnL matching CLOSED after redemption.
+                        if p.get("total_pnl") is not None:
+                            r_pnl = float(p.get("total_pnl") or 0.0)
+                        elif p.get("totalPnl") is not None:
+                            r_pnl = float(p.get("totalPnl") or 0.0)
+                        elif p.get("unrealized_pnl") is not None:
+                            r_pnl = r_pnl + float(p.get("unrealized_pnl") or 0.0)
+                        elif p.get("cashPnl") is not None:
+                            r_pnl = float(p.get("cashPnl") or 0.0)
                     pos_list.append({
                         "conditionId": c_id,
                         "outcome": p.get("outcome", "Yes"),
@@ -70,7 +82,7 @@ def fetch_v2_positions(wallet_address, status_filter):
                         "initialValue": init_val,
                         "currentValue": cur_val,
                         "realizedPnl": r_pnl,
-                        "redeemable": bool(p.get("redeemable")),
+                        "redeemable": is_redeemable,
                         "title": p.get("title") or p.get("question"),
                         "slug": p.get("slug"),
                         "endDate": p.get("end_date") or p.get("endDate"),
@@ -169,11 +181,46 @@ def index_history_by_condition(history):
     return _index_bucket("resolved"), _index_bucket("exited"), _index_bucket("predicted")
 
 
-def reconcile_resolved_match(entries, pos_realized_pnl, bankroll):
-    """Backfills missing realized_pnl on already-resolved records matched by conditionId."""
+def _allocate_wallet_pnl(wallet_entries, total_pnl):
+    """Distributes total_pnl proportionally across one or more resolved wallet tranches."""
+    if not wallet_entries or total_pnl is None:
+        return
+    target = round(float(total_pnl), 4)
+    if len(wallet_entries) == 1:
+        wallet_entries[0]["realized_pnl"] = target
+        return
+
+    weights = [float(e.get("entry_cost") or e.get("cost_basis") or 0.0) for e in wallet_entries]
+    if sum(weights) <= 0:
+        weights = [abs(float(e.get("realized_pnl") or 0.0)) for e in wallet_entries]
+    tot_w = sum(weights)
+    shares = [(w / tot_w) if tot_w > 0 else (1.0 / len(wallet_entries)) for w in weights]
+
+    running = 0.0
+    for idx_e, entry in enumerate(wallet_entries):
+        if idx_e == len(wallet_entries) - 1:
+            entry["realized_pnl"] = round(target - running, 4)
+        else:
+            part = round(target * shares[idx_e], 4)
+            entry["realized_pnl"] = part
+            running += part
+
+
+def reconcile_resolved_match(entries, pos_realized_pnl, bankroll, outcome_str=None):
+    """Backfills missing PnL and aligns wallet resolved records with authoritative Polymarket PnL."""
+    filtered = [
+        (m_id, r) for m_id, r in entries
+        if outcome_str is None or r.get("position", outcome_str) == outcome_str
+    ]
     updated = 0
-    for _, r in entries:
-        if r.get("realized_pnl") is None and not r.get("is_watch"):
+    wallet_entries = []
+    for _, r in filtered:
+        if r.get("is_watch"):
+            updated += 1
+            continue
+        if r.get("source") == "wallet":
+            wallet_entries.append(r)
+        elif r.get("realized_pnl") is None:
             new_pnl = calculate_resolved_pnl(
                 r,
                 r.get("outcome"),
@@ -185,6 +232,26 @@ def reconcile_resolved_match(entries, pos_realized_pnl, bankroll):
             if new_pnl is not None:
                 r["realized_pnl"] = new_pnl
         updated += 1
+
+    if wallet_entries:
+        if pos_realized_pnl is not None:
+            has_missing = any(r.get("realized_pnl") is None for r in wallet_entries)
+            cur_sum = sum(float(r.get("realized_pnl") or 0.0) for r in wallet_entries)
+            if has_missing or abs(cur_sum - float(pos_realized_pnl)) > 0.05:
+                _allocate_wallet_pnl(wallet_entries, pos_realized_pnl)
+        else:
+            for r in wallet_entries:
+                if r.get("realized_pnl") is None:
+                    new_pnl = calculate_resolved_pnl(
+                        r,
+                        r.get("outcome"),
+                        bankroll=bankroll,
+                        allow_kelly_fallback=False,
+                        fallback_api_pnl=pos_realized_pnl,
+                        preserve_exited=False,
+                    )
+                    if new_pnl is not None:
+                        r["realized_pnl"] = new_pnl
     return updated
 
 
@@ -488,9 +555,9 @@ def _transition_matched_market(
             p["outcome"] = outcome_val
             p["position"] = pos_outcome_str
             p["outcomeIndex"] = pos_outcome_idx
-            p["realized_pnl"] = realized_pnl
             p["source"] = "wallet"
         if to_resolve:
+            _allocate_wallet_pnl(to_resolve, realized_pnl)
             history["resolved"][target_key] = ensure_list(history["resolved"].get(target_key, [])) + to_resolve
     elif is_exited_open_pos:
         cur_preds = ensure_list(history["predicted"].get(target_key, []))
@@ -956,7 +1023,9 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         latest_trade_ts = max((t["ts"] for t in cond_trades), default=int(pos.get("timestamp") or 0))
 
         if c_id_lower in resolved_by_cond:
-            updated_existing += reconcile_resolved_match(resolved_by_cond[c_id_lower], realized_pnl, total_bankroll)
+            updated_existing += reconcile_resolved_match(
+                resolved_by_cond[c_id_lower], realized_pnl, total_bankroll, outcome_str=pos_outcome_str
+            )
             continue
 
         if is_from_closed and c_id_lower in exited_by_cond:

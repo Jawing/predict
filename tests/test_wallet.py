@@ -33,6 +33,23 @@ class TestWalletPureHelpers(unittest.TestCase):
         self.assertEqual(entries[1][1]["realized_pnl"], -99.0)
         self.assertIsNone(entries[2][1]["realized_pnl"])
 
+    def test_reconcile_resolved_match_updates_stale_wallet_pnl_and_preserves_matching_tranches(self):
+        # Single stale wallet entry -> reconciled to Polymarket settled PnL
+        stale = [("m1", {"source": "wallet", "position": "No", "outcome": 0.0, "realized_pnl": -17.7512})]
+        wallet.reconcile_resolved_match(stale, pos_realized_pnl=-784.0272, bankroll=100.0, outcome_str="No")
+        self.assertEqual(stale[0][1]["realized_pnl"], -784.0272)
+
+        # Multi-tranche wallet entries whose sum matches API total_pnl within $0.05 -> untouched
+        tranches = [
+            ("m2", {"source": "wallet", "position": "Yes", "realized_pnl": 11.5}),
+            ("m2", {"source": "wallet", "position": "Yes", "realized_pnl": -2.92}),
+            ("m2", {"source": "wallet", "position": "No", "realized_pnl": -5.0}),
+        ]
+        wallet.reconcile_resolved_match(tranches, pos_realized_pnl=8.5823, bankroll=100.0, outcome_str="Yes")
+        self.assertEqual(tranches[0][1]["realized_pnl"], 11.5)
+        self.assertEqual(tranches[1][1]["realized_pnl"], -2.92)
+        self.assertEqual(tranches[2][1]["realized_pnl"], -5.0)
+
     def test_reconcile_exited_match_updates_exit_fields(self):
         entry = {"pm": 0.5, "snapshots": [{"pm": 0.5, "entry_price": 0.5}]}
         pos = {"totalBought": 100.0, "last_event_at": 1700000000}
@@ -364,6 +381,46 @@ class TestImportPolymarketPositionsEndToEnd(unittest.TestCase):
         trades = wallet.fetch_wallet_trades("0x1234")
         self.assertEqual(len(positions), 1)
         self.assertIn("0xc1", trades)
+
+    @patch.object(wallet, "api")
+    def test_fetch_v2_positions_uses_total_pnl_only_for_open_redeemable(self, mock_api):
+        pos_resp = MagicMock()
+        pos_resp.json.return_value = {
+            "data": [
+                {
+                    "condition_id": "0xRED",
+                    "outcome": "No",
+                    "current_size": 1560.1691,
+                    "avg_price": 0.4911,
+                    "current_price": 0.0,
+                    "realized_pnl": -17.7512,
+                    "unrealized_pnl": -766.276,
+                    "total_pnl": -784.0272,
+                    "redeemable": True,
+                    "status": "REDEEMABLE",
+                },
+                {
+                    "condition_id": "0xLIVE",
+                    "outcome": "Yes",
+                    "current_size": 100.0,
+                    "avg_price": 0.50,
+                    "current_price": 0.70,
+                    "realized_pnl": 5.0,
+                    "unrealized_pnl": 20.0,
+                    "total_pnl": 25.0,
+                    "redeemable": False,
+                    "status": "OPEN",
+                },
+            ],
+            "pagination": {"has_more": False},
+        }
+        mock_api.get.return_value = pos_resp
+
+        positions = wallet.fetch_v2_positions("0x1234", "OPEN")
+        self.assertAlmostEqual(positions[0]["realizedPnl"], -784.0272)
+        self.assertTrue(positions[0]["redeemable"])
+        self.assertAlmostEqual(positions[1]["realizedPnl"], 5.0)
+        self.assertFalse(positions[1]["redeemable"])
 
 
 if __name__ == "__main__":
