@@ -44,11 +44,11 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
     position's coordinate frame. When raw_yes_space=True (used during initial side selection in
     calculate_allocation), is_yes = (pu >= pm) selects whether YES or NO has positive edge.
     """
-    eps = 0.01
-    pu = float(pu if pu is not None else 0.5)
-    pm = float(pm if pm is not None else 0.5)
+    eps = 1e-4
+    pu = max(0.0, min(1.0, float(pu if pu is not None else 0.5)))
+    pm = max(0.0, min(1.0, float(pm if pm is not None else 0.5)))
     ego = float(ego if ego is not None else 0.5)
-    eval_pm = float(cur_pm if cur_pm is not None else pm)
+    eval_pm = max(0.0, min(1.0, float(cur_pm if cur_pm is not None else pm)))
 
     if abs(pu - pm) < 1e-9:
         pu_norm = pm
@@ -59,6 +59,8 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
         logit_pm = math.log(pm_clip / (1.0 - pm_clip))
         logit_norm = (ego * logit_pu) + ((1.0 - ego) * logit_pm)
         pu_norm = 1.0 / (1.0 + math.exp(-logit_norm))
+        lo_p, hi_p = min(pu, pm), max(pu, pm)
+        pu_norm = max(lo_p, min(hi_p, pu_norm))
 
     is_yes = (pu >= pm) if raw_yes_space else True
     win_prob_bal = pu_norm if is_yes else (1.0 - pu_norm)
@@ -181,33 +183,38 @@ def calculate_dynamic_kelly_action(win_prob_bal, cur_p, held_frac, bankroll, fee
     else:
         f_star_add = 0.0
 
-    # Anchored holding reference: respects the entry/thesis Kelly allocation
-    entry_ref = max(f_star_hold, float(entry_kelly or 0.0))
-    double_f_hold = 2.0 * entry_ref
-    add_frac = f_star_add - held_frac
-    # Effective actionable Kelly across the two-boundary no-trade zone:
-    # - Below f*_add: target is f*_add (scales up to Ask+fee boundary)
-    # - Inside [f*_add, f*_hold]: target is held_frac (sunk entry fee/spread holds current size without phantom exposure)
-    # - Above f*_hold: target is f*_hold (decayed live hold conviction as price approaches target)
-    if f_star_add <= f_star_hold:
-        f_star_eff = min(f_star_hold, max(f_star_add, held_frac))
-    else:
-        f_star_eff = f_star_add
-
-    # 3. Action Decision
+    # 3. Executable Exit Boundary f*_bid (evaluated after crossing bid spread and paying exit fees)
     p_bid = max(0.001, float(best_bid) if (best_bid is not None and float(best_bid) > 0) else (cur_p - half_sp))
-    if dist_to_tgt <= 0.0:
-        # Target reached or exceeded at current price
+    sell_proceeds = max(0.001, p_bid - (fee_rate * p_bid * (1.0 - p_bid)))
+    edge_bid = p_norm - sell_proceeds
+    if edge_bid > 0.0 and sell_proceeds < 1.0:
+        raw_k_bid = edge_bid / (1.0 - sell_proceeds)
+        eff_scale_bid = calculate_efficiency_scale(4.0 * p_bid * (1.0 - p_bid), gamma)
+        f_star_bid = eff_scale_bid * raw_k_bid
+    else:
+        f_star_bid = 0.0
+
+    # Anchor trim hysteresis on executable f*_bid so wide bid spreads never force -EV liquidation
+    double_f_hold = 2.0 * f_star_hold
+    double_f_bid = 2.0 * f_star_bid
+    add_frac = f_star_add - held_frac
+    dist_bid = p_norm - sell_proceeds
+
+    # 4. Action Decision (bid/ask spread symmetry)
+    if dist_bid <= 0.0:
+        # Executable bid proceeds reached or exceeded target
         action_type = "SELL"
         signal_code = "SELL"
-        action_label = f"SELL: OVER-TGT ({dist_to_tgt*100:+.1f}%)"
+        action_label = f"SELL: OVER-TGT ({dist_bid*100:+.1f}%)"
         delta_usd = held_frac * bankroll
-    elif (p_norm - p_bid) <= 0.005 or f_star_hold < 0.005:
-        # Exit Runway / Finish Line: Executable Bid is within 0.5c of target, or remaining optimal holding < 0.5% bankroll
+        f_star_eff = 0.0
+    elif dist_bid <= 0.005 or (f_star_hold < 0.005 and f_star_bid < 0.005):
+        # Exit Runway / Finish Line: Executable Bid is within 0.5c of target, or optimal stake even at Bid < 0.5%
         action_type = "TAKE_PROFIT"
         signal_code = "EXIT"
-        action_label = f"TAKE PROFIT (+{dist_to_tgt*100:.1f}%)"
+        action_label = f"TAKE PROFIT (+{dist_bid*100:.1f}%)"
         delta_usd = held_frac * bankroll
+        f_star_eff = 0.0
     elif add_frac >= add_hurdle:
         # Genuinely under-allocated: even at the Ask price (after paying spread), Kelly dictates adding >= hurdle
         action_type = "ADD"
@@ -215,20 +222,31 @@ def calculate_dynamic_kelly_action(win_prob_bal, cur_p, held_frac, bankroll, fee
         add_usd = add_frac * bankroll
         action_label = f"ADD +${add_usd:,.0f} (+{add_frac*100:.1f}%)"
         delta_usd = add_usd
-    elif held_frac > double_f_hold:
-        # Position has grown beyond twice the authorized entry/holding conviction: trim excess back down
-        trim_frac = held_frac - entry_ref
+        f_star_eff = f_star_add
+    elif held_frac > double_f_bid:
+        # Position exceeds 2x optimal Kelly even at the executable Bid: trim excess back to f*_bid
+        trim_frac = held_frac - f_star_bid
         trim_usd = trim_frac * bankroll
         action_type = "TRIM"
         signal_code = "TRIM"
         action_label = f"TRIM -${trim_usd:,.0f} (-{trim_frac*100:.1f}%)"
         delta_usd = trim_usd
+        f_star_eff = f_star_bid
+    elif dist_to_tgt <= 0.0 or f_star_hold < 0.005:
+        # Midpoint cleared target while Bid remains > 0.5c below target: rest passive limit sell at fair value
+        action_type = "LIMIT_SELL"
+        signal_code = "LIMIT"
+        action_label = f"LIMIT SELL @ {p_norm*100:.1f}%"
+        delta_usd = held_frac * bankroll
+        f_star_eff = 0.0
     else:
-        # Conviction Holding: let winning positions run to target without premature spread-dragging micro-trims
+        # Conviction Holding: inside no-trade band [f*_add, 2*f*_bid] without spread-dragging churn
         action_type = "HOLD"
         signal_code = "HOLD"
         action_label = f"HOLD (+{dist_to_tgt*100:.1f}% to exit)"
         delta_usd = 0.0
+        upper_bound_k = max(f_star_hold, f_star_bid)
+        f_star_eff = min(upper_bound_k, max(f_star_add, held_frac)) if f_star_add <= upper_bound_k else f_star_add
 
     return {
         "action_type": action_type,
@@ -236,8 +254,10 @@ def calculate_dynamic_kelly_action(win_prob_bal, cur_p, held_frac, bankroll, fee
         "action_label": action_label,
         "f_star_hold": f_star_hold,
         "f_star_add": f_star_add,
+        "f_star_bid": f_star_bid,
         "f_star_eff": f_star_eff,
         "double_f_hold": double_f_hold,
+        "double_f_bid": double_f_bid,
         "held_frac": held_frac,
         "delta_usd": delta_usd,
         "edge_hold": edge_hold,
@@ -246,19 +266,54 @@ def calculate_dynamic_kelly_action(win_prob_bal, cur_p, held_frac, bankroll, fee
     }
 
 
-def compute_trajectory_brier(data, outcome):
-    """
-    Computes Brier scores across multi-snapshot update history weighted by each snapshot's Kelly conviction,
-    deduplicating consecutive snapshots where user belief pu did not change.
-    If no snapshots or single snapshot, evaluates direct contemporaneous values.
-    """
+def binary_log_loss(p, y, eps=1e-4):
+    """Computes binary cross-entropy -(y*ln(p) + (1-y)*ln(1-p)) clipped at eps."""
+    p_c = max(eps, min(1.0 - eps, float(p)))
+    y_c = max(0.0, min(1.0, float(y)))
+    loss = 0.0
+    if y_c > 0.0:
+        loss -= y_c * math.log(p_c)
+    if y_c < 1.0:
+        loss -= (1.0 - y_c) * math.log(1.0 - p_c)
+    return loss
+
+
+def _snapshot_time_weights(valid_snaps, data):
+    """Computes duration weights dt_i over held intervals, invariant to micro-update frequency."""
+    ts_list = [ts_s for _, _, _, ts_s in valid_snaps]
+    if len(valid_snaps) <= 1 or any(t is None or t <= 0 for t in ts_list) or ts_list[-1] <= ts_list[0]:
+        return [1.0] * len(valid_snaps)
+
+    last_ts = ts_list[-1]
+    end_candidates = []
+    for key in ("resolved_ts", "exit_ts", "last_synced_ts"):
+        val = data.get(key)
+        if val is not None:
+            try:
+                t_val = float(val)
+                if t_val > last_ts:
+                    end_candidates.append(t_val)
+            except (ValueError, TypeError):
+                continue
+
+    t_end = max(end_candidates) if end_candidates else (last_ts + max(1.0, last_ts - ts_list[-2]))
+    weights = [max(0.0, ts_list[i + 1] - ts_list[i]) for i in range(len(ts_list) - 1)]
+    weights.append(max(0.0, t_end - last_ts))
+    if sum(weights) <= 0.0:
+        return [1.0] * len(valid_snaps)
+    return weights
+
+
+def _compute_trajectory_score(data, outcome, score_fn, weighting=None):
+    """Scores multi-snapshot update history time-weighted ('uniform') or Kelly-weighted ('kelly')."""
     outcome = float(outcome)
     snapshots = data.get("snapshots")
     if not isinstance(snapshots, list) or len(snapshots) <= 1:
         pu = float(data.get("pu", 0.5) if data.get("pu") is not None else 0.5)
         pm = float(data.get("pm", 0.5) if data.get("pm") is not None else 0.5)
-        return (pu - outcome) ** 2, (pm - outcome) ** 2
+        return score_fn(pu, outcome), score_fn(pm, outcome)
 
+    mode = str((weighting if weighting is not None else getattr(cfg, "EGO_WEIGHTING", "kelly")) or "kelly").lower()
     valid_snaps = []
     for s in snapshots:
         if isinstance(s, dict) and "pu" in s and "pm" in s:
@@ -266,26 +321,78 @@ def compute_trajectory_brier(data, outcome):
                 pu_s = float(s["pu"])
                 pm_s = float(s["pm"])
                 k_s = max(0.001, float(s.get("kelly") or s.get("entry_kelly") or 0.001))
+                ts_raw = s.get("ts")
+                ts_s = float(ts_raw) if ts_raw is not None else 0.0
                 if valid_snaps and abs(valid_snaps[-1][0] - pu_s) < 1e-6:
                     continue
-                valid_snaps.append((pu_s, pm_s, k_s))
+                valid_snaps.append((pu_s, pm_s, k_s, ts_s))
             except (ValueError, TypeError):
                 continue
 
     if not valid_snaps:
         pu = float(data.get("pu", 0.5) if data.get("pu") is not None else 0.5)
         pm = float(data.get("pm", 0.5) if data.get("pm") is not None else 0.5)
-        return (pu - outcome) ** 2, (pm - outcome) ** 2
+        return score_fn(pu, outcome), score_fn(pm, outcome)
 
-    tot_k = sum(k_s for _, _, k_s in valid_snaps)
-    bs_u = sum(k_s * ((pu_s - outcome) ** 2) for pu_s, _, k_s in valid_snaps) / tot_k
-    bs_m = sum(k_s * ((pm_s - outcome) ** 2) for _, pm_s, k_s in valid_snaps) / tot_k
-    return bs_u, bs_m
+    if mode == "uniform":
+        weights = _snapshot_time_weights(valid_snaps, data)
+    else:
+        weights = [k_s for _, _, k_s, _ in valid_snaps]
+
+    tot_w = sum(weights)
+    s_u = sum(w * score_fn(pu_s, outcome) for (pu_s, _, _, _), w in zip(valid_snaps, weights)) / tot_w
+    s_m = sum(w * score_fn(pm_s, outcome) for (_, pm_s, _, _), w in zip(valid_snaps, weights)) / tot_w
+    return s_u, s_m
 
 
-def calculate_trade_weight(data, bankroll=100.0, is_live_wallet=False):
-    """Calculates trade calibration weight bounded by min(k_model, k_executed)."""
-    if data.get("exclude_from_ego") or data.get("is_watch") or data.get("action") == "WATCH":
+def compute_trajectory_brier(data, outcome, weighting=None):
+    """Computes Brier scores across multi-snapshot update history (time-weighted or Kelly-weighted)."""
+    return _compute_trajectory_score(data, outcome, lambda p, y: (p - y) ** 2, weighting=weighting)
+
+
+def compute_trajectory_logloss(data, outcome, eps=1e-4, weighting=None):
+    """Computes binary log-loss across multi-snapshot update history (time-weighted or Kelly-weighted)."""
+    return _compute_trajectory_score(data, outcome, lambda p, y: binary_log_loss(p, y, eps=eps), weighting=weighting)
+
+
+def is_unforecasted_wallet_trade(data):
+    """Returns True when a wallet-synced trade never received an independent blind pu forecast."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("unforecasted"):
+        return True
+    if data.get("source") != "wallet":
+        return False
+    snapshots = data.get("snapshots")
+    if isinstance(snapshots, list) and snapshots:
+        has_valid_snap = False
+        for s in snapshots:
+            if isinstance(s, dict) and "pu" in s and "pm" in s:
+                try:
+                    if abs(float(s["pu"]) - float(s["pm"])) >= 1e-6:
+                        return False
+                    has_valid_snap = True
+                except (ValueError, TypeError):
+                    continue
+        if has_valid_snap:
+            return True
+    pu_raw = data.get("pu")
+    pm_raw = data.get("pm")
+    if pu_raw is None:
+        return True
+    if pm_raw is None:
+        return False
+    return abs(float(pu_raw) - float(pm_raw)) < 1e-6
+
+
+def calculate_trade_weight(data, bankroll=100.0, is_live_wallet=False, weighting=None):
+    """Calculates trade calibration weight ('kelly' bounded by min(k_model, k_executed), or 'uniform')."""
+    if data.get("exclude_from_ego") or (data.get("exclude_from_ego") is None and is_unforecasted_wallet_trade(data)):
+        return 0.0
+    mode = str(weighting or "kelly").lower()
+    if mode == "uniform":
+        return 1.0
+    if data.get("is_watch") or data.get("action") == "WATCH":
         return 0.0
     if data.get("actual_kelly") is not None and float(data.get("actual_kelly")) > 0:
         return float(data.get("actual_kelly"))
@@ -311,34 +418,32 @@ def calculate_trade_weight(data, bankroll=100.0, is_live_wallet=False):
     return max(0.001, min(1.0, abs(pnl) / eb))
 
 
-def calculate_trade_ego_metrics(data, cat="resolved", bankroll=100.0, is_live_wallet=False):
-    """Calculates individual trade Brier contributions: weight, bs_u, bs_m, ego_drag, and net_adv."""
+def calculate_trade_ego_metrics(data, cat="resolved", bankroll=100.0, is_live_wallet=False, weighting=None):
+    """Calculates individual trade log-loss calibration contributions: weight, bs_u, bs_m, ego_drag, and net_adv."""
     bankroll = bankroll if bankroll > 0 else 100.0
-    weight = calculate_trade_weight(data, bankroll=bankroll, is_live_wallet=is_live_wallet)
-            
+    if weighting is None:
+        weighting = getattr(cfg, "EGO_WEIGHTING", "kelly")
+    weight = 0.0 if is_unforecasted_wallet_trade(data) else calculate_trade_weight(
+        data, bankroll=bankroll, is_live_wallet=is_live_wallet, weighting=weighting
+    )
+
     pm = float(data.get("pm", 0.5) or 0.5)
-    pu_raw = data.get("pu")
-    
+
     if cat == "resolved":
         outcome = float(data.get("outcome", 0.0) or 0.0)
-        bs_u, bs_m = compute_trajectory_brier(data, outcome)
+        ll_u, ll_m = compute_trajectory_logloss(data, outcome, weighting=weighting)
     else:  # exited
         exit_price = data.get("exit_price") if data.get("exit_price") is not None else data.get("cur_pm")
-        exit_outcome = float(exit_price if exit_price is not None else pm)
-        is_uncal = (pu_raw is None or abs(float(pu_raw) - pm) < 1e-6)
-        r_pnl = float(data.get("realized_pnl") if data.get("realized_pnl") is not None else data.get("pnl", 0.0) or 0.0)
-        if is_uncal and r_pnl < 0:
-            bs_u = (pm - exit_outcome) ** 2
-            bs_m = 0.0
-        else:
-            bs_u, bs_m = compute_trajectory_brier(data, exit_outcome)
+        exit_outcome = max(0.0, min(1.0, float(exit_price if exit_price is not None else pm)))
+        # Cross-entropy against q = exit_outcome automatically decomposes into H(q) + D_KL(q || p)
+        ll_u, ll_m = compute_trajectory_logloss(data, exit_outcome, weighting=weighting)
 
-    ego_drag = weight * (bs_u - bs_m)
+    ego_drag = weight * (ll_u - ll_m)
     net_adv = -ego_drag
     return {
         "weight": weight,
-        "bs_u": bs_u,
-        "bs_m": bs_m,
+        "bs_u": ll_u,
+        "bs_m": ll_m,
         "ego_drag": ego_drag,
         "net_adv": net_adv,
     }
@@ -346,8 +451,8 @@ def calculate_trade_ego_metrics(data, cat="resolved", bankroll=100.0, is_live_wa
 
 def calculate_base_ego(history, verbose=True):
     """
-    Calculates historical Brier score calibration across resolved and exited positions,
-    weighted by authorized Kelly capital allocation.
+    Calculates historical log-loss calibration across resolved and exited positions,
+    weighted by cfg.EGO_WEIGHTING ('kelly' or 'uniform').
     Supports skipping markets tagged with data.get("exclude_from_ego") == True.
     """
     resolved = history.get("resolved", {})
@@ -355,49 +460,50 @@ def calculate_base_ego(history, verbose=True):
     if not resolved and not exited:
         return 0.50
 
-    bs_u_total, bs_m_total = 0.0, 0.0
+    ll_u_total, ll_m_total = 0.0, 0.0
     total_weight = 0.0
     ws = history.get("wallet_summary", {}) if isinstance(history, dict) else {}
     bankroll = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
     if bankroll <= 0:
         bankroll = 100.0
     is_live_w = bool(isinstance(history, dict) and str(history.get("profile_id") or history.get("wallet_address") or "").startswith("0x"))
+    w_mode = str(getattr(cfg, "EGO_WEIGHTING", "kelly") or "kelly").lower()
 
     # 1. Terminal Resolutions (y in {0.0, 0.5, 1.0})
     for market_preds in resolved.values():
         for data in ensure_list(market_preds):
-            m = calculate_trade_ego_metrics(data, cat="resolved", bankroll=bankroll, is_live_wallet=is_live_w)
+            m = calculate_trade_ego_metrics(data, cat="resolved", bankroll=bankroll, is_live_wallet=is_live_w, weighting=w_mode)
             if m["weight"] <= 0.0:
                 continue
-            bs_u_total += m["weight"] * m["bs_u"]
-            bs_m_total += m["weight"] * m["bs_m"]
+            ll_u_total += m["weight"] * m["bs_u"]
+            ll_m_total += m["weight"] * m["bs_m"]
             total_weight += m["weight"]
 
-    # 2. Exited Positions (Synthetic Repricing Resolution against exit price)
+    # 2. Exited Positions (Expected cross-entropy against exit probability q)
     for market_preds in exited.values():
         for data in ensure_list(market_preds):
             exit_price = data.get("exit_price") if data.get("exit_price") is not None else data.get("cur_pm")
             if exit_price is None:
                 continue
-            m = calculate_trade_ego_metrics(data, cat="exited", bankroll=bankroll, is_live_wallet=is_live_w)
+            m = calculate_trade_ego_metrics(data, cat="exited", bankroll=bankroll, is_live_wallet=is_live_w, weighting=w_mode)
             if m["weight"] <= 0.0:
                 continue
-            bs_u_total += m["weight"] * m["bs_u"]
-            bs_m_total += m["weight"] * m["bs_m"]
+            ll_u_total += m["weight"] * m["bs_u"]
+            ll_m_total += m["weight"] * m["bs_m"]
             total_weight += m["weight"]
 
     if total_weight == 0:
         return 0.50
 
-    bs_u_total /= total_weight
-    bs_m_total /= total_weight
+    ll_u_total /= total_weight
+    ll_m_total /= total_weight
 
     if verbose:
-        print(f"[*] Base Ego [KELLY] - User Brier: {bs_u_total:.4f} | Market Brier: {bs_m_total:.4f}")
+        print(f"[*] Base Ego [{w_mode.upper()}] - User Log-Loss: {ll_u_total:.4f} | Market Log-Loss: {ll_m_total:.4f}")
 
-    if bs_u_total == 0 and bs_m_total == 0:
+    if ll_u_total == 0 and ll_m_total == 0:
         return 0.50
-    return bs_m_total / (bs_u_total + bs_m_total)
+    return ll_m_total / (ll_u_total + ll_m_total)
 
 
 def calculate_annualized_yield(edge, true_price, days_until):

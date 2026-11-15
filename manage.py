@@ -1,10 +1,3 @@
-import sys
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 """manage.py - History data management and manual resolution utilities.
 
 Allows selective deletion of markets, category clears, manual resolution overrides,
@@ -18,9 +11,20 @@ from utils import (
     ensure_list, get_history_counts, parse_market_date,
     get_effective_bankroll, calculate_resolved_pnl,
 )
-from storage import load_history, save_history, get_active_profile, get_profile_path
+from storage import (
+    load_history,
+    save_history,
+    get_active_profile,
+    get_profile_path,
+    create_backup,
+    list_backups,
+    restore_backup,
+)
 from wallet import update_resolutions
-from model import calculate_base_ego, calculate_trade_ego_metrics, restore_snapshot_to_prediction
+from model import (
+    calculate_base_ego, calculate_trade_ego_metrics, calculate_trade_weight,
+    is_unforecasted_wallet_trade, restore_snapshot_to_prediction,
+)
 
 
 def delete_specific_markets(history):
@@ -164,7 +168,14 @@ def delete_specific_markets(history):
         print("[!] Operation cancelled.")
         return
 
-    for (cat, m_id, item), op_type, target_idx in to_delete:
+    # Sort indices descending within each (cat, m_id, op_type) so popping
+    # multiple tranches or snapshots from the same list never shifts earlier indices.
+    op_priority = {"snapshot": 0, "tranche": 1, "market": 2}
+    sorted_deletions = sorted(
+        to_delete,
+        key=lambda entry: (op_priority.get(entry[1], 99), -(entry[2] if entry[2] is not None else -1)),
+    )
+    for (cat, m_id, item), op_type, target_idx in sorted_deletions:
         if cat in history and m_id in history[cat]:
             cat_dict = history[cat]
             if op_type == "market":
@@ -198,15 +209,14 @@ def clear_specific_category(history):
     """Empties all entries from a selected history category."""
     counts = get_history_counts(history)
     print("\nSelect Category to Clear:")
-    print(f" 1: Active Predictions ({counts['active_markets']} mkts, {counts['active']} predictions)")
-    print(f" 2: Exited Positions ({counts['exited_markets']} mkts, {counts['exited']} predictions)")
-    print(f" 3: Resolved Markets ({counts['resolved_markets']} mkts, {counts['resolved']} predictions)")
+    print(f" 1: Active Predictions ({counts['active_markets']})")
+    print(f" 2: Exited Positions ({counts['exited_markets']})")
+    print(f" 3: Resolved Markets ({counts['resolved_markets']})")
     print(f" 4: Skipped Markets ({counts['skipped']})")
-    print(" 5: Cancel")
 
     cat_sel = input("> ").strip()
     cat_map = {"1": "predicted", "2": "exited", "3": "resolved", "4": "skipped"}
-    if cat_sel not in cat_map:
+    if cat_sel.lower() == "p" or cat_sel not in cat_map:
         print("[!] Cancelled.")
         return
 
@@ -351,56 +361,104 @@ def prune_closed_skipped_markets(history, verbose=True):
 
 def handle_delete_data():
     """Menu interface for full reset, selective deletion, clearing category, or manual resolution."""
-    history = load_history()
-    counts = get_history_counts(history)
-    total_markets = counts["total_markets"]
+    while True:
+        history = load_history()
+        counts = get_history_counts(history)
+        total_markets = counts["total_markets"]
 
-    print("\n--- DATA MANAGEMENT ---")
-    print(" 1: Delete all data (Full profile reset)")
-    print(f" 2: Selectively delete specific markets ({total_markets} in history)")
-    print(" 3: Clear specific category (Active, Exited, Resolved, or Skipped)")
-    print(" 4: Manually Resolve / Override a Specific Market")
-    print(" 5: Select / Toggle Markets Included in Ego Calibration")
-    print(" 0: Back to Tools Menu")
+        print("\n--- DATA MANAGEMENT ---")
+        print(" 1: Delete all data")
+        print(f" 2: Selectively delete markets ({total_markets})")
+        print(" 3: Clear category")
+        print(" 4: Manual resolve")
+        print(" 5: Ego calibration selector")
+        print(" 6: Backup history & settings")
+        print(" 7: Restore from backup")
 
-    sub_choice = input("> ").strip()
+        sub_choice = input("> ").strip()
 
-    if sub_choice == "1":
-        active_pid = get_active_profile()
-        confirm = input(f"WARNING: Type 'CONFIRM' to reset all data for profile '{active_pid}': ").strip()
-        if confirm == "CONFIRM":
-            p_path = get_profile_path(active_pid)
-            if os.path.exists(p_path):
-                os.remove(p_path)
-            if os.path.exists(cfg.HISTORY_FILE):
-                os.remove(cfg.HISTORY_FILE)
-            load_history(active_pid)
-            print(f"[+] All data for profile '{active_pid}' reset.")
+        if not sub_choice or sub_choice.lower() == "p":
+            return
+
+        if sub_choice == "1":
+            active_pid = get_active_profile()
+            confirm = input(f"WARNING: Type 'CONFIRM' to reset all data for profile '{active_pid}': ").strip()
+            if confirm == "CONFIRM":
+                p_path = get_profile_path(active_pid)
+                if os.path.exists(p_path):
+                    os.remove(p_path)
+                if os.path.exists(cfg.HISTORY_FILE):
+                    os.remove(cfg.HISTORY_FILE)
+                load_history(active_pid)
+                print(f"[+] All data for profile '{active_pid}' reset.")
+            else:
+                print("[!] Data deletion cancelled.")
+
+        elif sub_choice == "2":
+            if total_markets == 0:
+                print("[!] History is empty. No data to delete.")
+                continue
+            delete_specific_markets(history)
+
+        elif sub_choice == "3":
+            if total_markets == 0:
+                print("[!] History is empty. No data to delete.")
+                continue
+            clear_specific_category(history)
+
+        elif sub_choice == "4":
+            manual_resolve(history)
+
+        elif sub_choice == "5":
+            toggle_ego_market_inclusion(history)
+
+        elif sub_choice == "6":
+            try:
+                b_path = create_backup()
+                size_kb = os.path.getsize(b_path) / 1024.0
+                print(f"[+] Backup saved to '{b_path}' ({size_kb:.1f} KB).")
+            except Exception as e:
+                print(f"[!] Backup failed: {e}")
+
+        elif sub_choice == "7":
+            backups = list_backups()
+            if not backups:
+                print("[!] No .zip backups found. Enter a .zip file path:")
+                custom_path = input("> ").strip()
+                if not custom_path or custom_path.lower() == "p":
+                    print("[!] Restore cancelled.")
+                    continue
+                chosen_path = custom_path
+            else:
+                print("\nAvailable Backups (newest first):")
+                for i, b in enumerate(backups, 1):
+                    size_kb = b["size_bytes"] / 1024.0
+                    p_cnt = len(b.get("profiles") or [])
+                    ts = b.get("created_at") or "-"
+                    print(f" {i}: {b['filename']}  ({size_kb:.1f} KB, {p_cnt} profile(s), {ts})")
+                sel = input("> ").strip()
+                if not sel or sel.lower() == "p":
+                    print("[!] Restore cancelled.")
+                    continue
+                if sel.isdigit() and 1 <= int(sel) <= len(backups):
+                    chosen_path = backups[int(sel) - 1]["path"]
+                else:
+                    chosen_path = sel
+
+            confirm = input(f"Restore from '{chosen_path}'? (y/n): ").strip().lower()
+            if confirm != "y":
+                print("[!] Restore cancelled.")
+                continue
+            try:
+                res = restore_backup(chosen_path, create_safety_backup=True)
+                if res.get("safety_backup"):
+                    print(f"[*] Safety backup saved to '{res['safety_backup']}'.")
+                print(f"[+] Restored {len(res['restored_profiles'])} profile(s). Active profile: {res['active_profile']}")
+            except Exception as e:
+                print(f"[!] Restore failed: {e}")
+
         else:
-            print("[!] Data deletion cancelled.")
-
-    elif sub_choice == "2":
-        if total_markets == 0:
-            print("[!] History is empty. No data to delete.")
-            return
-        delete_specific_markets(history)
-
-    elif sub_choice == "3":
-        if total_markets == 0:
-            print("[!] History is empty. No data to delete.")
-            return
-        clear_specific_category(history)
-
-    elif sub_choice == "4":
-        manual_resolve(history)
-
-    elif sub_choice == "5":
-        toggle_ego_market_inclusion(history)
-
-    elif sub_choice in ["0", ""]:
-        print("[!] Cancelled.")
-    else:
-        print("[!] Invalid selection.")
+            print("[!] Invalid selection.")
 
 
 def toggle_ego_market_inclusion(history):
@@ -420,12 +478,16 @@ def toggle_ego_market_inclusion(history):
                     q = p.get("question", m_id)
                     side = p.get("position", "-")
                     pnl = float(p.get("realized_pnl") if p.get("realized_pnl") is not None else p.get("pnl", 0.0) or 0.0)
-                    is_excl = bool(p.get("exclude_from_ego", False))
-                    
-                    # Unmask exclude_from_ego temporarily to get intrinsic metrics & weight
-                    p["exclude_from_ego"] = False
-                    m_ego = calculate_trade_ego_metrics(p, cat=cat, bankroll=live_bankroll, is_live_wallet=is_live_w)
-                    p["exclude_from_ego"] = is_excl
+                    is_unforecast = is_unforecasted_wallet_trade(p)
+                    is_excl = bool(p.get("exclude_from_ego", False)) or is_unforecast
+
+                    # Compute intrinsic calibration metrics without mutating the stored record
+                    m_ego = calculate_trade_ego_metrics(
+                        {**p, "exclude_from_ego": False}, cat=cat, bankroll=live_bankroll, is_live_wallet=is_live_w
+                    )
+                    kelly_frac = calculate_trade_weight(
+                        {**p, "exclude_from_ego": False}, bankroll=live_bankroll, is_live_wallet=is_live_w, weighting="kelly"
+                    )
 
                     # Concluded / settled date resolution (never in future)
                     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -452,9 +514,11 @@ def toggle_ego_market_inclusion(history):
                         "side": side,
                         "pnl": pnl,
                         "excluded": is_excl,
+                        "unforecasted": is_unforecast,
                         "ref": p,
                         "date": str(settled_date),
                         "weight": m_ego["weight"],
+                        "kelly": kelly_frac,
                         "bs_u": m_ego["bs_u"],
                         "bs_m": m_ego["bs_m"],
                         "ego_drag": m_ego["ego_drag"],
@@ -472,6 +536,9 @@ def toggle_ego_market_inclusion(history):
 
         # Exact counterfactual Delta Ego if toggled
         for it in all_settled:
+            if it["unforecasted"]:
+                it["delta_ego"] = 0.0
+                continue
             w = it["weight"]
             bs_u = it["bs_u"]
             bs_m = it["bs_m"]
@@ -485,6 +552,7 @@ def toggle_ego_market_inclusion(history):
             it["delta_ego"] = new_ego - curr_ego
 
         # Sort settled markets
+        w_mode = getattr(cfg, "EGO_WEIGHTING", "uniform").upper()
         if sort_mode == "ego_impact":
             all_settled.sort(key=lambda x: (0 if x["excluded"] else 1, x["delta_ego"]), reverse=True)
             sort_label = "Ego Impact / Delta Ego (Detractors First)"
@@ -493,7 +561,7 @@ def toggle_ego_market_inclusion(history):
             sort_label = "Net Advantage (Benefactors First)"
         elif sort_mode == "kelly":
             all_settled.sort(key=lambda x: float(x.get("weight", 0.0) or 0.0), reverse=True)
-            sort_label = "Kelly %"
+            sort_label = "Weight" if w_mode == "UNIFORM" else "Kelly %"
         elif sort_mode == "pnl":
             all_settled.sort(key=lambda x: x["pnl"], reverse=True)
             sort_label = "Realized PnL"
@@ -501,31 +569,49 @@ def toggle_ego_market_inclusion(history):
             all_settled.sort(key=lambda x: x["date"], reverse=True)
             sort_label = "Settled Date (Newest First)"
 
-        w_mode = getattr(cfg, "EGO_WEIGHTING", "kelly").upper()
+        from views import calculate_prediction_stats, classify_luck_z
+        res_stats = calculate_prediction_stats(history, sub_mode="resolved", base_ego=curr_ego, refresh_meta=False)
 
+        wt_col = "Weight" if w_mode == "UNIFORM" else "Kelly"
         print("\n" + "=" * 114)
         print(f"--- EGO CALIBRATION MARKET SELECTOR [Sorted by {sort_label}] ---")
         active_cnt = sum(1 for x in all_settled if not x["excluded"])
         print(f"Current Base Ego: {curr_ego:.3f} ({w_mode} mode) | Active: {active_cnt} / {len(all_settled)} markets")
+        if res_stats and res_stats.get("res_count", 0) > 0:
+            lz = res_stats["res_luck_z"]
+            lzw = res_stats["res_luck_z_weighted"]
+            cb_u = res_stats["res_calib_bias_u"] * 100.0
+            print(
+                f"Resolved Context: Actual {res_stats['res_actual_win_rate']*100:.1f}% "
+                f"| Bias vs User: {cb_u:+.1f}% "
+                f"| Luck: {lz:+.2f} sigma [{classify_luck_z(lz)}] (Kelly-Wt: {lzw:+.2f} sigma)"
+            )
         print("=" * 114)
-        print(f"{'#':<3} | {'Status':<10} | {'dEgo':<8} | {'Net Adv':<9} | {'Kelly':<7} | {'Type':<8} | {'Side':<6} | {'PnL':<10} | {'Question'}")
+        print(f"{'#':<3} | {'Status':<10} | {'dEgo':<8} | {'Net Adv':<9} | {wt_col:<7} | {'Type':<8} | {'Side':<6} | {'PnL':<10} | {'Question'}")
         print("-" * 114)
         for i, it in enumerate(all_settled, 1):
-            st = "[EXCLUDED]" if it["excluded"] else "[ACTIVE]"
-            k_val = float(it.get("weight", 0.0) or 0.0)
+            if it["unforecasted"]:
+                st = "[NO-PU]"
+            elif it["excluded"]:
+                st = "[EXCLUDED]"
+            else:
+                st = "[ACTIVE]"
+            w_val = float(it.get("weight", 0.0) or 0.0)
+            w_str = f"{w_val:>5.2f}x" if w_mode == "UNIFORM" else f"{w_val*100:>5.2f}%"
             adv_str = f"{it['net_adv']:>+8.4f}"
             dego_str = f"{it['delta_ego']:>+7.4f}"
-            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {k_val*100:>5.2f}% | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {it['question'][:36]}")
+            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {w_str:<7} | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {it['question'][:36]}")
 
-        sel = input(f"\nSelect row # to toggle, 'adj <#>' (edit Kelly), 'sort' (toggle view), 'reset', or Enter to finish: ").strip()
-        if not sel:
+        sel = input("\n> ").strip()
+        if not sel or sel.lower() == "p":
             break
         elif sel.lower() == "reset":
             for it in all_settled:
-                it["ref"]["exclude_from_ego"] = False
+                if not it["unforecasted"]:
+                    it["ref"]["exclude_from_ego"] = False
             save_history(history)
             new_ego = calculate_base_ego(history, verbose=False)
-            print(f"[+] All markets restored to Active in Base Ego. Updated Base Ego: {curr_ego:.3f} -> {new_ego:.3f}")
+            print(f"[+] All forecasted markets restored to Active in Base Ego. Updated Base Ego: {curr_ego:.3f} -> {new_ego:.3f}")
         elif sel.lower() in ("sort", "s"):
             next_sort = {
                 "ego_impact": "adv",
@@ -542,7 +628,7 @@ def toggle_ego_market_inclusion(history):
                 sort_mode = "ego_impact"
             elif sub_s in ("adv", "edge"):
                 sort_mode = "adv"
-            elif sub_s in ("kelly", "k"):
+            elif sub_s in ("kelly", "k", "weight", "w"):
                 sort_mode = "kelly"
             elif sub_s in ("pnl", "profit"):
                 sort_mode = "pnl"
@@ -555,7 +641,7 @@ def toggle_ego_market_inclusion(history):
                 idx = int(parts[1]) - 1
                 if 0 <= idx < len(all_settled):
                     target_item = all_settled[idx]
-                    curr_k = float(target_item.get("weight", 0.0) or 0.0)
+                    curr_k = float(target_item.get("kelly", 0.0) or 0.0)
                     new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.2f}%, e.g. 1.0 for 1%): ").strip()
                     try:
                         clean_k = new_k_raw.strip()
@@ -579,14 +665,17 @@ def toggle_ego_market_inclusion(history):
         elif sel.isdigit():
             idx = int(sel) - 1
             if 0 <= idx < len(all_settled):
-                curr = all_settled[idx]["ref"].get("exclude_from_ego", False)
-                all_settled[idx]["ref"]["exclude_from_ego"] = not curr
-                save_history(history)
-                new_st = "EXCLUDED from" if not curr else "INCLUDED in"
-                new_ego = calculate_base_ego(history, verbose=False)
-                delta = new_ego - curr_ego
-                print(f"[+] Market #{sel} is now {new_st} Base Ego calculation.")
-                print(f"[*] Base Ego updated: {curr_ego:.3f} -> {new_ego:.3f} ({delta:+.3f})")
+                if all_settled[idx]["unforecasted"]:
+                    print(f"[!] Market #{sel} has no blind pu forecast (wallet sync pu == pm) and stays excluded from Base Ego.")
+                else:
+                    curr = all_settled[idx]["ref"].get("exclude_from_ego", False)
+                    all_settled[idx]["ref"]["exclude_from_ego"] = not curr
+                    save_history(history)
+                    new_st = "EXCLUDED from" if not curr else "INCLUDED in"
+                    new_ego = calculate_base_ego(history, verbose=False)
+                    delta = new_ego - curr_ego
+                    print(f"[+] Market #{sel} is now {new_st} Base Ego calculation.")
+                    print(f"[*] Base Ego updated: {curr_ego:.3f} -> {new_ego:.3f} ({delta:+.3f})")
             else:
                 print("[!] Invalid row number.")
         else:
@@ -595,15 +684,14 @@ def toggle_ego_market_inclusion(history):
 def manual_resolve(history):
     """Audit resolutions automatically or prompt user to resolve a market manually."""
     print("\n--- RESOLVE MARKETS ---")
-    print(" 1: Auto-Audit Unresolved Markets via Polymarket API")
+    print(" 1: Auto-Audit Unresolved Markets")
     print(" 2: Manually Resolve a Specific Market")
-    print(" 3: Cancel")
     r_mode = input("> ").strip()
     if r_mode == "1":
         history = update_resolutions(history)
         save_history(history)
         return history
-    elif r_mode != "2":
+    elif not r_mode or r_mode.lower() == "p" or r_mode != "2":
         return history
 
     combined_open = {}
@@ -639,9 +727,12 @@ def manual_resolve(history):
         return history
 
     active_b = get_effective_bankroll(history, cfg.BANKROLL)
-    history.setdefault("resolved", {}).setdefault(sel, [])
+    res_bucket = history.setdefault("resolved", {})
+    res_bucket[sel] = ensure_list(res_bucket.get(sel, []))
+    resolved_ts = int(datetime.now(timezone.utc).timestamp())
     for p in ensure_list(preds):
         p["outcome"] = outcome
+        p.setdefault("resolved_ts", resolved_ts)
         new_pnl = calculate_resolved_pnl(p, outcome, bankroll=active_b)
         if new_pnl is not None:
             p["realized_pnl"] = new_pnl
@@ -660,19 +751,20 @@ def settings_menu():
     history = load_history(active_pid)
 
     print("\n--- SETTINGS / FILTERS ---")
-    print(f" 1: Min Edge       = {cfg.MIN_EDGE*100:.2f}%  (skip bets below this edge)")
-    print(f" 2: Max Days       = {cfg.MAX_DAYS}  (ignore markets beyond this horizon)")
-    print(f" 3: Min Days       = {cfg.MIN_DAYS}  (ignore markets resolving sooner than this)")
-    print(f" 4: Extreme Odds   = {cfg.EXTREME_ODDS*100:.2f}%  (tail-risk filter - skip near 0% or 100%)")
+    print(f" 1: Min Edge       = {cfg.MIN_EDGE*100:.2f}%")
+    print(f" 2: Max Days       = {cfg.MAX_DAYS}")
+    print(f" 3: Min Days       = {cfg.MIN_DAYS}")
+    print(f" 4: Extreme Odds   = {cfg.EXTREME_ODDS*100:.2f}%")
 
     if is_wallet:
         bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
-        print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}  (off-platform funds added to live wallet total, default $0)")
+        print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}")
     else:
-        print(f" 5: Paper Bankroll = ${cfg.BANKROLL:,.2f}  (sandbox capital)")
+        print(f" 5: Paper Bankroll = ${cfg.BANKROLL:,.2f}")
 
-    print("\nEnter setting number to edit [Enter to cancel]:")
     s_choice = input("> ").strip()
+    if not s_choice or s_choice.lower() == "p":
+        return
     if s_choice == "1":
         curr_pct = cfg.MIN_EDGE * 100.0
         new_raw = input(f"Enter new Min Edge in % (e.g. '1' for 1.0%, '1.5' for 1.5%, currently {curr_pct:.2f}%): ").strip()

@@ -27,20 +27,23 @@ def extract_market_metrics(m):
     _, seconds_left, days_until = parse_market_date(m.get('endDate'))
 
     # Standard Volumes & Orderbook Metrics
-    m_vol = float(m.get('volumeNum', 0))
-    m_24h = float(m.get('volume24hr', 0))
-    m_liq = float(m.get('liquidity', 0))
+    m_vol = float(m.get('volumeNum') or m.get('volume') or 0)
+    m_24h = float(m.get('volume24hr') or 0)
+    m_liq = float(m.get('liquidity') or m.get('liquidityNum') or 0)
 
     # Synthesized Metrics
     velocity = (m_24h / m_vol) if m_vol > 0 else 0.0
 
-    # Pure Epistemic Uncertainty (Efficiency), Epistemic Impact Index (EII), & Compounding Yield (CEY)
+    # Pure Epistemic Uncertainty (Efficiency), Epistemic Impact Index (EII), Compounding Yield (CEY),
+    # Live Epistemic Pulse (Eff * 24h Vol = EII * Velocity), & Book Churn (24h Vol / Liq)
     eff = 4.0 * odds * (1.0 - odds)
     eii = eff * m_vol
     days_left = max(0.1, days_until) if days_until is not None else (max(0.1, seconds_left / 86400.0) if seconds_left and seconds_left > 0 else 30.0)
     cey = eii / math.sqrt(days_left + 7.0)
+    pulse = eff * m_24h
+    churn = (m_24h / m_liq) if m_liq > 0 else 0.0
 
-    return odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq, eff, eii, cey
+    return odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq, eff, eii, cey, pulse, churn
 
 
 def safe_clean_str(text, max_len=23):
@@ -139,10 +142,10 @@ def fetch_global_overview(fetch_depth=2000, top_x=None, vector_mode="1", sort_mo
     seen_event_ids = set()
     total_events = 0
     total_markets = 0
-    total_volume = 0
-    total_24h_volume = 0
-    total_liquidity = 0
-    total_oi = 0
+    total_volume = 0.0
+    total_24h_volume = 0.0
+    total_liquidity = 0.0
+    total_oi = 0.0
     total_eii = 0.0
     total_cey = 0.0
     category_stats = {}
@@ -154,6 +157,9 @@ def fetch_global_overview(fetch_depth=2000, top_x=None, vector_mode="1", sort_mo
         while offset < depth_per_vector:
             limit = min(100, depth_per_vector - offset)
             url = f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}&order={order_param}&ascending={ascending_param}"
+            if order_param == "endDate" and ascending_param == "true":
+                now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                url += f"&end_date_min={now_iso}"
 
             try:
                 response = api.get(url, timeout=10)
@@ -176,25 +182,25 @@ def fetch_global_overview(fetch_depth=2000, top_x=None, vector_mode="1", sort_mo
                 seen_event_ids.add(event_id)
                 total_events += 1
 
-                event_vol = 0
-                event_24h_vol = 0
-                event_liq = 0
+                event_vol = 0.0
+                event_24h_vol = 0.0
+                event_liq = 0.0
                 event_markets = 0
                 event_spread_sum = 0.0
                 event_spread_count = 0
                 event_eii = 0.0
                 event_cey = 0.0
 
-                event_oi = float(event.get('openInterest', event.get('openInterestNum', 0)))
-                event_comp = float(event.get('competitive', 0))
+                event_oi = float(event.get('openInterest') or event.get('openInterestNum') or 0)
+                event_comp = float(event.get('competitive') or 0)
 
                 for m in event.get('markets', []):
                     if m.get('active') and not m.get('closed') and m.get('umaResolutionStatus') != 'resolved':
                         total_markets += 1
                         event_markets += 1
-                        m_v = float(m.get('volumeNum', 0))
-                        m_24 = float(m.get('volume24hr', 0))
-                        m_l = float(m.get('liquidity', 0))
+                        m_v = float(m.get('volumeNum') or m.get('volume') or 0)
+                        m_24 = float(m.get('volume24hr') or 0)
+                        m_l = float(m.get('liquidity') or m.get('liquidityNum') or 0)
                         event_vol += m_v
                         event_24h_vol += m_24
                         event_liq += m_l
@@ -368,7 +374,9 @@ def fetch_global_overview(fetch_depth=2000, top_x=None, vector_mode="1", sort_mo
             break
 
         prompt = f"\n[Showing {end_idx}/{total_cats}] [Right/Down/n/Enter] Next | [Left/Up/p] Prev | [a] Dump All | [q/Esc] Main Menu: "
-        action = get_navigation_key(prompt)
+        action = get_navigation_key(prompt, allow_predict=False)
+        while action == 'invalid':
+            action = get_navigation_key(prompt, allow_predict=False)
 
         if action == 'quit':
             print("=" * 146 + "\n")
@@ -425,16 +433,24 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="
         pass
 
     api_order_map = {
-        "1": "volume",     # EII = Eff * Vol -> fetch highest volume candidates
-        "2": "volume",
-        "3": "volume24hr",
-        "4": "liquidity",
-        "7": "endDate",
-        "8": "competitive",
-        "9": "startDate"
+        "1": "volume",       # CEY = EII / sqrt(Time) -> fetch high volume candidates
+        "2": "volume",       # EII = Eff * Vol -> fetch high volume candidates
+        "3": "volume",       # Vol
+        "4": "volume24hr",   # 24h Vol
+        "5": "liquidity",    # Liquidity
+        "6": "volume24hr",   # Velocity (24h / Total)
+        "7": "volume",       # Spread (sort locally after fetching active high-volume markets)
+        "8": "endDate",      # Soonest
+        "9": "competitive",  # Competitive
+        "10": "startDate",   # Newest
+        "11": "volume",      # OI
+        "12": "volume",      # Efficiency (Odds 50/50)
+        "13": "volume",      # None
+        "14": "volume24hr",  # Epistemic Pulse
+        "15": "volume24hr",  # Book Churn
     }
     order_param = api_order_map.get(sort_mode, "volume")
-    ascending_param = "true" if sort_mode == "7" else "false"
+    ascending_param = "true" if sort_mode == "8" else "false"
     if reverse_sort:
         ascending_param = "false" if ascending_param == "true" else "true"
 
@@ -446,6 +462,9 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="
     while offset < fetch_depth:
         limit = min(100, fetch_depth - offset)
         url = f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}&order={order_param}&ascending={ascending_param}"
+        if order_param == "endDate" and ascending_param == "true":
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            url += f"&end_date_min={now_iso}"
 
         try:
             response = api.get(url, timeout=10)
@@ -479,9 +498,9 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="
 
             event_title = event.get('title', 'Unknown Event')
             parent_slug = event.get('slug', '')
-            event_comp = float(event.get('competitive', 0))
+            event_comp = float(event.get('competitive') or 0)
 
-            event_oi = float(event.get('openInterest', event.get('openInterestNum', 0)))
+            event_oi = float(event.get('openInterest') or event.get('openInterestNum') or 0)
             has_valid_market = False
 
             for m in event.get('markets', []):
@@ -493,7 +512,7 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="
                 if open_only and is_pred:
                     continue
 
-                odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq, eff, eii, cey = extract_market_metrics(m)
+                odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq, eff, eii, cey, pulse, churn = extract_market_metrics(m)
 
                 if seconds_left is None:
                     continue
@@ -519,6 +538,8 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="
                     "eff": eff,
                     "eii": eii,
                     "cey": cey,
+                    "pulse": pulse,
+                    "churn": churn,
                     "spread": spread,
                     "seconds": seconds_left,
                     "competitive": event_comp,
@@ -544,8 +565,10 @@ def print_global_summary(markets, total_oi):
     total_24h = sum(m['m_24h'] for m in markets)
     total_liq = sum(m['m_liq'] for m in markets)
     total_eii = sum(m.get('eii', 0.0) for m in markets)
+    total_pulse = sum(m.get('pulse', 0.0) for m in markets)
 
     avg_velocity = (total_24h / total_vol) if total_vol > 0 else 0
+    avg_churn = (total_24h / total_liq) if total_liq > 0 else 0.0
     avg_spread = sum(m['spread'] for m in markets) / len(markets)
     epistemic_ratio = (total_eii / total_vol * 100) if total_vol > 0 else 0.0
 
@@ -555,8 +578,8 @@ def print_global_summary(markets, total_oi):
     print(f" Total Markets Found : {len(markets):,}")
     print(f" Total Volume        : ${total_vol:,.0f}")
     print(f" Epistemic Impact EII: ${total_eii:,.0f} ({epistemic_ratio:.1f}% open uncertainty)")
-    print(f" Total 24h Volume    : ${total_24h:,.0f}")
-    print(f" Total Liquidity     : ${total_liq:,.0f}")
+    print(f" Total 24h Volume    : ${total_24h:,.0f} | Epistemic Pulse: ${total_pulse:,.0f}")
+    print(f" Total Liquidity     : ${total_liq:,.0f} ({avg_churn:.2f}x book churn)")
     print(f" Total Open Interest : ${total_oi:,.0f}")
     print(f" Avg Market Velocity : {avg_velocity*100:.1f}%")
     print(f" Avg Platform Spread : {avg_spread*100:.2f}%")
@@ -581,18 +604,24 @@ def sort_markets(markets, sort_mode, reverse_sort):
         "10": ("start_date", True),
         "11": ("oi", True),
         "12": ("eff", True),
+        "14": ("pulse", True),
+        "15": ("churn", True),
         "cey": ("cey", True),
         "eii": ("eii", True),
+        "pulse": ("pulse", True),
+        "churn": ("churn", True),
         "vol": ("m_vol", True),
     }
 
     key, default_rev = sort_map.get(str(sort_mode).lower(), ("cey", True))
     final_direction = not default_rev if reverse_sort else default_rev
 
-    return sorted(markets, key=lambda x: x.get(key, 0) or 0, reverse=final_direction)
+    if key == "start_date":
+        return sorted(markets, key=lambda x: str(x.get(key) or ""), reverse=final_direction)
+    return sorted(markets, key=lambda x: float(x.get(key) or 0), reverse=final_direction)
 
 
-def get_navigation_key(prompt):
+def get_navigation_key(prompt, allow_predict=True):
     """Reads a navigation key (arrow keys, n/p, q, Enter/Space, a for all, or # to predict) for display_pager."""
     print(prompt, end="", flush=True)
     if hasattr(sys.stdin, 'isatty') and sys.stdin.isatty():
@@ -625,7 +654,7 @@ def get_navigation_key(prompt):
                 elif ch in ('q', 'Q', '\x1b'):
                     print()
                     return 'quit'
-                elif ch.isdigit() or ch in ('#', ':'):
+                elif allow_predict and (ch.isdigit() or ch in ('#', ':')):
                     buf = ch
                     sys.stdout.write(ch)
                     sys.stdout.flush()
@@ -634,7 +663,10 @@ def get_navigation_key(prompt):
                         if c2 in ('\r', '\n'):
                             print()
                             clean = buf.lstrip('#:').strip()
-                            return f"predict:{clean}"
+                            if clean.isdigit():
+                                return f"predict:{clean}"
+                            print(prompt, end="", flush=True)
+                            break
                         elif c2 == '\x08':
                             buf = buf[:-1]
                             sys.stdout.write('\b \b')
@@ -656,10 +688,11 @@ def get_navigation_key(prompt):
             return 'prev'
         elif raw in ('a', 'all', 'dump'):
             return 'all'
-        elif raw.startswith('#') or raw.startswith('predict ') or raw.isdigit():
-            clean = raw.replace('predict', '').replace('#', '').strip()
+        elif allow_predict and (raw.startswith('#') or raw.startswith(':') or raw.startswith('predict ') or raw.isdigit()):
+            clean = raw.replace('predict', '').replace(':', '').replace('#', '').strip()
             if clean.isdigit():
                 return f"predict:{clean}"
+            return 'invalid'
         else:
             return 'next'
     except (EOFError, KeyboardInterrupt):
@@ -673,7 +706,9 @@ def format_market_row(m, show_odds, rank=None):
     eii_str = f"${m.get('eii', 0.0):,.0f}"
     m_vol_str = f"${m['m_vol']:,.0f}"
     h24_str = f"${m['m_24h']:,.0f}"
+    pulse_str = f"${m.get('pulse', 0.0):,.0f}"
     liq_str = f"${m['m_liq']:,.0f}"
+    churn_str = f"{m.get('churn', 0.0):.2f}x"
 
     vel_str = f"{m['velocity']*100:.0f}%"
     spr_str = f"{m['spread']*100:.1f}%"
@@ -688,8 +723,8 @@ def format_market_row(m, show_odds, rank=None):
 
     idx_str = f"{rank:3d} | " if rank is not None else ""
     row = (
-        f"{idx_str}{status_str:<6} | {cey_str:<9} | {eii_str:<11} | {m_vol_str:<10} | {h24_str:<9} | {liq_str:<9} | "
-        f"{vel_str:<5} | {spr_str:<6} | {time_str:<12} | "
+        f"{idx_str}{status_str:<6} | {cey_str:<9} | {eii_str:<11} | {m_vol_str:<10} | {h24_str:<9} | "
+        f"{pulse_str:<10} | {liq_str:<9} | {churn_str:<6} | {vel_str:<5} | {spr_str:<6} | {time_str:<12} | "
     )
     if show_odds:
         row += f"{odds_str:<5} | {eff_str:<5} | "
@@ -705,8 +740,8 @@ def display_pager(markets, show_odds):
     current_idx = 0
 
     header = (
-        f"{'#':<3} | {'Status':<6} | {'CEY':<9} | {'EII ($)':<11} | {'Mkt Vol':<10} | {'24h Vol':<9} | {'Liq':<9} | "
-        f"{'Vel %':<5} | {'Spread':<6} | {'Ends In':<12} | "
+        f"{'#':<3} | {'Status':<6} | {'CEY':<9} | {'EII ($)':<11} | {'Mkt Vol':<10} | {'24h Vol':<9} | "
+        f"{'Pulse ($)':<10} | {'Liq':<9} | {'Churn':<6} | {'Vel %':<5} | {'Spread':<6} | {'Ends In':<12} | "
     )
     if show_odds:
         header += f"{'Odds':<5} | {'Eff%':<5} | "
@@ -715,19 +750,22 @@ def display_pager(markets, show_odds):
     while True:
         chunk = markets[current_idx : current_idx + PAGE_SIZE]
 
-        print("=" * 195)
+        print("=" * 214)
         print(header)
-        print("=" * 195)
+        print("=" * 214)
 
         for i, m in enumerate(chunk):
             print(format_market_row(m, show_odds, rank=current_idx + i + 1))
 
-        print("=" * 195)
+        print("=" * 214)
 
         end_idx = min(current_idx + len(chunk), total_markets)
         prompt = f"\n[Showing {end_idx}/{total_markets}] [Enter/n] Next | [p] Prev | [#] Predict | [a] Dump All | [q/Esc] Menu: "
 
         action = get_navigation_key(prompt)
+        while action == 'invalid':
+            print("[!] Invalid market selection. Enter a market # or navigation key.")
+            action = get_navigation_key(prompt)
 
         if action == 'quit':
             break
@@ -761,7 +799,7 @@ def display_pager(markets, show_odds):
                 for i, m in enumerate(rem_chunk):
                     print(format_market_row(m, show_odds, rank=current_idx + i + 1))
                 current_idx += len(rem_chunk)
-            print("=" * 195)
+            print("=" * 214)
             break
         elif action == 'next':
             if current_idx + PAGE_SIZE < total_markets:
@@ -792,7 +830,9 @@ def run_interactive_analyzer():
         "10": "Newest",
         "11": "OI",
         "12": "Efficiency (Odds 50/50)",
-        "13": "None"
+        "13": "None",
+        "14": "Epistemic Pulse (Eff * 24h Vol)",
+        "15": "Book Churn (24h Vol / Liq)"
     }
 
     while True:
@@ -804,17 +844,16 @@ def run_interactive_analyzer():
         print(f"6. Open Only (New) : [{'ON' if open_only else 'OFF'}]")
         print("7. Execute Scan & View Data")
         print("8. Global Stats & Category Overview")
-        print("9. Exit")
 
         choice = input("\n> ").strip()
-        if choice == "9":
+        if not choice or choice.lower() == "p":
             break
         elif choice == "1":
             category = input("Enter Category (e.g., 'Politics', 'Crypto') or 'All': ").strip().title() or "All"
         elif choice == "2":
-            print("Sort by: [1] CEY (Compounding Yield) [2] EII (Epistemic Impact) [3] Vol [4] 24h Vol [5] Liquidity [6] Velocity [7] Spread [8] Soonest [9] Competitive [10] Newest [11] OI [12] Efficiency (50/50) [13] No Sorting")
+            print("Sort by: [1] CEY (Compounding Yield) [2] EII (Epistemic Impact) [3] Vol [4] 24h Vol [5] Liquidity [6] Velocity [7] Spread [8] Soonest [9] Competitive [10] Newest [11] OI [12] Efficiency (50/50) [13] No Sorting [14] Pulse (Eff*24h) [15] Churn (24h/Liq)")
             s_choice = input("> ").strip()
-            if s_choice in [str(i) for i in range(1, 14)]:
+            if s_choice in [str(i) for i in range(1, 16)]:
                 sort_mode = s_choice
         elif choice == "3":
             reverse_sort = not reverse_sort

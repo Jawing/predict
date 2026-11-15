@@ -1,10 +1,3 @@
-import sys
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 """Portfolio and history display tables, aggregate variance metrics, and top-of-menu dashboard."""
 import math
 from datetime import datetime, timezone
@@ -19,11 +12,11 @@ from utils import (
     calculate_position_holding,
     parse_outcome_prices,
 )
-from storage import save_history, get_active_profile, load_history
+from storage import save_history, get_active_profile, load_history, default_profile_alias
 from model import (
     compute_dynamic_ego, calculate_logistic_metrics, calculate_base_ego, calculate_annualized_yield,
     calculate_dynamic_kelly_action, compute_trajectory_brier, calculate_trade_ego_metrics,
-    calculate_trade_weight, restore_snapshot_to_prediction
+    calculate_trade_weight, is_unforecasted_wallet_trade, restore_snapshot_to_prediction
 )
 
 def auto_prune_closed_markets(history, force=False):
@@ -286,6 +279,11 @@ def ensure_predicted_market_metadata(history, fetch_clob=True, base_ego=None):
                             p["slippage"] = round(max(0.0, p["vwap"] - (p.get("bestAsk") or p["vwap"])), 4)
                             p["vwap_edge"] = opt_edge
                             changed = True
+                        else:
+                            for stale_k in ("opt_buy_usd", "opt_buy_vwap", "opt_buy_edge"):
+                                if stale_k in p:
+                                    p.pop(stale_k, None)
+                                    changed = True
                 except Exception:
                     pass
 
@@ -323,7 +321,7 @@ def _print_single_market_details(r):
         print(f"Kelly Fraction: {r.get('Kelly', 0)*100:.2f}% | Eff-Kelly: {r.get('EffKelly', 0)*100:.2f}%")
         print(f"Model Edge   : {r.get('Edge', 0)*100:+.2f}% | p_norm: {r.get('p_norm', 0)*100:.1f}%")
         if r.get("bs_u") is not None and r.get("bs_m") is not None:
-            print(f"Brier Calib. : BS(User) {r['bs_u']:.4f} | BS(Mkt) {r['bs_m']:.4f} | Net Adv: {r.get('adv', 0.0):+.4f}")
+            print(f"LogLoss Calib: LL(User) {r['bs_u']:.4f} | LL(Mkt) {r['bs_m']:.4f} | Net Adv: {r.get('adv', 0.0):+.4f}")
         fee_r = float(r.get("fee_rate", 0.0) or 0.0)
         if fee_r > 0:
             print(f"Fee Rate     : {fee_r*100:.2f}% (CLOB Fee Schedule)")
@@ -402,7 +400,7 @@ def _print_single_market_details(r):
 
 def _format_source_tag(pred, history_alias=None):
     """Formats 6-8 char source indicator for tables (e.g. 'Main', '0x..9fa7', 'LOCAL')."""
-    if pred.get("exclude_from_ego"):
+    if pred.get("exclude_from_ego") or is_unforecasted_wallet_trade(pred):
         return "[EXCL]"
     w_tag = pred.get("wallet")
     src = pred.get("source", "local")
@@ -458,8 +456,8 @@ def iter_unified_active_entries(history, include_exited=True):
 def classify_active_signal(is_held, dyn_action, eff_kelly, live_edge, min_edge_th=None, opt_buy_usd=None, vwap_edge=None):
     """Canonical signal classification shared by dashboard, stats, and review table."""
     if min_edge_th is None:
-        min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.01))
-    effective_min_edge = max(float(min_edge_th), 0.01)
+        min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.0))
+    effective_min_edge = max(0.0, float(min_edge_th))
 
     if is_held:
         sig = dyn_action.get("signal_code", "HOLD")
@@ -467,11 +465,69 @@ def classify_active_signal(is_held, dyn_action, eff_kelly, live_edge, min_edge_t
             return "HOLD"
         return sig
 
-    if float(eff_kelly) > 0.005 and float(live_edge) >= effective_min_edge:
+    if float(eff_kelly) > 0.005 and float(live_edge) > 0.0 and float(live_edge) >= effective_min_edge:
         if opt_buy_usd == 0.0 or (vwap_edge is not None and (vwap_edge <= 0 or vwap_edge < effective_min_edge)):
             return "WATCH"
         return "BUY"
     return "WATCH"
+
+def classify_luck_z(z):
+    """Classifies a binomial Luck Z-score into a concise variance regime label."""
+    if z is None:
+        return "N/A"
+    if z >= 2.0:
+        return "Extremely Lucky"
+    if z >= 1.25:
+        return "Running Hot"
+    if z <= -2.0:
+        return "Extremely Unlucky"
+    if z <= -1.25:
+        return "Running Cold"
+    return "Normal Variance"
+
+
+def _compute_resolved_reflection(res_items):
+    """Computes resolved calibration bias (actual - expected) and unweighted/Kelly-weighted Luck Z-scores."""
+    if not res_items:
+        return {
+            "res_count": 0,
+            "res_actual_win_rate": None,
+            "res_exp_win_bal": None,
+            "res_exp_win_u": None,
+            "res_calib_bias_bal": None,
+            "res_calib_bias_u": None,
+            "res_luck_z": None,
+            "res_luck_z_weighted": None,
+        }
+    n = len(res_items)
+    actual_wins = sum(float(x["outcome"]) for x in res_items)
+    exp_wins_bal = sum(x["win_prob_bal"] for x in res_items)
+    exp_wins_u = sum(x["win_prob_u"] for x in res_items)
+    actual_rate = actual_wins / n
+    exp_rate_bal = exp_wins_bal / n
+    exp_rate_u = exp_wins_u / n
+
+    var_sum = sum(x["var_i"] for x in res_items)
+    luck_z = ((actual_wins - exp_wins_bal) / math.sqrt(var_sum)) if var_sum > 1e-9 else 0.0
+
+    k_sum = sum(x["kelly"] for x in res_items)
+    w_list = [x["kelly"] / k_sum for x in res_items] if k_sum > 0 else [1.0 / n] * n
+    w_actual = sum(w * float(x["outcome"]) for w, x in zip(w_list, res_items))
+    w_exp_bal = sum(w * x["win_prob_bal"] for w, x in zip(w_list, res_items))
+    w_var = sum((w ** 2) * x["var_i"] for w, x in zip(w_list, res_items))
+    luck_z_w = ((w_actual - w_exp_bal) / math.sqrt(w_var)) if w_var > 1e-9 else 0.0
+
+    return {
+        "res_count": n,
+        "res_actual_win_rate": actual_rate,
+        "res_exp_win_bal": exp_rate_bal,
+        "res_exp_win_u": exp_rate_u,
+        "res_calib_bias_bal": actual_rate - exp_rate_bal,
+        "res_calib_bias_u": actual_rate - exp_rate_u,
+        "res_luck_z": luck_z,
+        "res_luck_z_weighted": luck_z_w,
+    }
+
 
 def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh_meta=True):
     """Calculates weighted portfolio stats: balance percentage, effective N, expected win rate, variance."""
@@ -683,6 +739,13 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
     avg_days = sum(valid_days) / len(valid_days) if valid_days else None
     avg_apy = sum(valid_apys) / len(valid_apys) if valid_apys else None
 
+    res_items = [
+        x for x in items
+        if x.get("is_resolved") and x.get("outcome") is not None
+        and not (is_live_wallet_stats and x.get("source") != "wallet" and x.get("realized_pnl_raw") is None)
+    ]
+    reflection = _compute_resolved_reflection(res_items)
+
     return {
         "total_count": len(items),
         "active_count": len(sized_items),
@@ -713,6 +776,7 @@ def calculate_prediction_stats(history, sub_mode="predicted", base_ego=None, ref
         "avg_daily_edge": avg_daily_edge,
         "avg_days": avg_days,
         "avg_apy": avg_apy,
+        **reflection,
         "items": items
     }
 
@@ -777,6 +841,20 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh
         print(f"Realized PnL     : ${stats['total_pnl']:+,.2f}{wl_str} | Avg Sizing: {avg_k*100:.2f}% Kelly")
 
     print(f"Expected Win Rate: {stats['exp_win_bal']*100:.2f}% Balanced (User: {stats['exp_win_u']*100:.2f}% | Market: {stats['exp_win_m']*100:.2f}%)")
+    if stats.get("res_count", 0) > 0:
+        cb_u = stats["res_calib_bias_u"] * 100.0
+        cb_b = stats["res_calib_bias_bal"] * 100.0
+        lz = stats["res_luck_z"]
+        lzw = stats["res_luck_z_weighted"]
+        print(
+            f"Calibration Bias : Actual {stats['res_actual_win_rate']*100:.1f}% "
+            f"| vs User ({stats['res_exp_win_u']*100:.1f}%): {cb_u:+.1f}% "
+            f"| vs Pooled ({stats['res_exp_win_bal']*100:.1f}%): {cb_b:+.1f}%"
+        )
+        print(
+            f"Luck Z-Score     : {lz:+.2f} sigma [{classify_luck_z(lz)}] "
+            f"| Kelly-Wt: {lzw:+.2f} sigma [{classify_luck_z(lzw)}]"
+        )
     if sub_mode == "resolved":
         print(f"Logistic Eff.    : Entry {stats['avg_eff_m']*100:.1f}% | Pooled (p_norm) {stats['avg_eff_norm']*100:.1f}% | Avg Entry Edge: {stats['avg_active_edge']*100:+.2f}%\n")
     else:
@@ -784,7 +862,7 @@ def print_prediction_stats(history, sub_mode="predicted", base_ego=None, refresh
 
 TABLE_CONFIGS = {
     "ego_impact": {
-        "headers": ["#", "Question", "Side", "Outcome", "Kelly", "BS (User)", "BS (Mkt)", "Net Adv", "PnL", "Date", "Src"],
+        "headers": ["#", "Question", "Side", "Outcome", "Kelly", "LL (User)", "LL (Mkt)", "Net Adv", "PnL", "Date", "Src"],
         "widths": [3, 34, 4, 7, 7, 9, 9, 9, 10, 10, 8],
         "aligns": ["right", "left", "left", "left", "right", "right", "right", "right", "right", "left", "left"],
         "q_idx": 1
@@ -821,9 +899,8 @@ TABLE_CONFIGS = {
     }
 }
 
-def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_meta=True):
-    """Renders formatted history table with ANSI hyperlinks, sorting, and action bar."""
-    # Auto-prune closed markets from skipped history in background
+def _build_review_rows(history, sub_mode, refresh_meta=True):
+    """Builds normalized table rows and returns (rows, base_ego)."""
     auto_prune_closed_markets(history, force=(sub_mode == "skipped"))
 
     if refresh_meta and sub_mode in ["predicted", "all"]:
@@ -923,8 +1000,8 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                 else:
                     regime_str = dyn_action["action_label"]
             else:
-                min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.01))
-                effective_min_edge = max(min_edge_th, 0.01)
+                min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.0))
+                effective_min_edge = max(0.0, min_edge_th)
                 vwap_edge = primary.get("vwap_edge")
                 opt_usd = primary.get("opt_buy_usd")
                 opt_vwap = primary.get("opt_buy_vwap")
@@ -1187,30 +1264,11 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                     "snapshots": res.get("snapshots", [])
                 })
 
-    if not rows:
-        print(f"\n[!] No markets found in '{sub_mode}'.")
-        return
+    return rows, base_ego
 
-    # Default Sort per View (Least Mean Action: instant render without pre-prompt; re-sort anytime via 's')
-    default_sorts = {
-        "predicted": "velocity",
-        "exited": "date",
-        "resolved": "ego_impact",
-        "skipped": "date",
-        "all": "kelly",
-    }
-    sort_map = {
-        "1": "date", "date": "date", "pu": "date", "last_pu": "date", "updated": "date",
-        "2": "kelly", "kelly": "kelly", "k": "kelly",
-        "3": "edge", "edge": "edge", "e": "edge",
-        "4": "exit_prox", "exit": "exit_prox", "prox": "exit_prox",
-        "5": "velocity", "vel": "velocity", "velocity": "velocity", "v": "velocity", "daily": "velocity",
-        "6": "ego_impact", "ego": "ego_impact", "brier": "ego_impact", "b": "ego_impact",
-        "7": "cey", "cey": "cey", "c": "cey",
-    }
-    if sort_by is None:
-        sort_by = default_sorts.get(sub_mode, "date")
 
+def _render_review_table(rows, history, sub_mode, base_ego, sort_by, expanded):
+    """Sorts and prints the review table and summary stats."""
     if sort_by == "date":
         rows.sort(key=lambda x: (x.get("LastPuTs") or 0.0, x.get("LastPuDate", ""), x.get("Date", "")), reverse=True)
     elif sort_by == "kelly":
@@ -1320,127 +1378,162 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
     if sub_mode in ["predicted", "exited", "resolved", "all"]:
         print_prediction_stats(history, sub_mode=sub_mode, base_ego=base_ego, refresh_meta=False)
 
-    # Action Bar: Launch Prediction
     if sub_mode == "predicted":
         exit_signals = [r for r in rows if any(k in r.get("Regime", "") for k in ("SELL", "EXIT", "TAKE PROFIT"))]
         if exit_signals:
             print(f"  [*] Take-Profit / Exit Alert: {len(exit_signals)} position{'s' if len(exit_signals) > 1 else ''} near or reached target (Limit Sell or Market Sell on Polymarket recommended)")
 
-    prompt_action = "predict / update" if sub_mode == "predicted" else "view market"
-    sort_hint = ", 's' (sort)" if sub_mode in ("predicted", "exited", "resolved", "all") else ""
-    cal_hint = ", 'cal' (calibrate ego)" if sub_mode in ("resolved", "exited", "all") else ""
-    exp_hint = ", 'x' (collapse)" if expanded else ", 'x' (expand questions)"
-    live_hint = ", 'l' (live refresh)" if sub_mode in ("predicted", "exited", "resolved", "all") else ""
-    u_hint = ", 'u <#>' (undo update)" if sub_mode == "predicted" else ""
-    range_str = f"({len(rows)})" if len(rows) == 1 else f"(1-{len(rows)})"
-    act = input(f"Select row # to {prompt_action} {range_str}{sort_hint}{exp_hint}{live_hint}, 'd <#>' (details){u_hint}{cal_hint} [Enter for Main Menu]: ").strip()
-    act_low = act.lower()
-    if act_low in ("x", "expand", "exp"):
-        return print_review_table(history, sub_mode, expanded=not expanded, sort_by=sort_by, refresh_meta=False)
-    elif (
-        act_low in ("s", "sort", "date", "pu", "last_pu", "updated", "kelly", "edge", "exit", "prox", "vel", "velocity", "daily", "brier", "cey", "c")
-        or act_low.startswith("s ")
-        or act_low.startswith("sort ")
-    ) and sub_mode in ("predicted", "exited", "resolved", "all"):
-        if act_low in sort_map and act_low not in ("s", "sort"):
-            new_sort = sort_map[act_low]
-        elif " " in act_low:
-            sub_tok = act_low.split(None, 1)[1].strip()
-            new_sort = sort_map.get(sub_tok, sort_by)
-        else:
-            cycle_map = {
-                "predicted": ["velocity", "cey", "kelly", "edge", "exit_prox", "date"],
-                "exited": ["date", "ego_impact", "cey", "kelly", "edge"],
-                "resolved": ["ego_impact", "date", "cey", "kelly", "edge"],
-                "all": ["kelly", "velocity", "cey", "edge", "ego_impact", "date"],
-            }
-            seq = cycle_map.get(sub_mode, ["date", "kelly", "edge", "cey"])
-            next_s = seq[(seq.index(sort_by) + 1) % len(seq)] if sort_by in seq else seq[0]
-            vel_h = "  [5] Velocity (Edge/d)" if sub_mode in ("predicted", "all") else ""
-            ego_h = "  [6] Ego Impact (Brier)" if sub_mode in ("resolved", "exited", "all") else ""
-            cey_h = "  [7] CEY"
-            d_lbl = "Last PU Date" if sub_mode == "predicted" else "Date"
-            s_in = input(f"Sort '{sub_mode}' by: [1] {d_lbl}  [2] Kelly  [3] Edge  [4] Exit Proximity{vel_h}{ego_h}{cey_h} [Enter -> {next_s.upper()}]: ").strip().lower()
-            new_sort = sort_map.get(s_in, next_s) if s_in else next_s
-        return print_review_table(history, sub_mode, expanded=expanded, sort_by=new_sort, refresh_meta=False)
-    elif act.lower() in ("l", "live", "refresh") and sub_mode in ("predicted", "exited", "resolved", "all"):
-        active_pid = history.get("profile_id") or get_active_profile()
-        if active_pid and str(active_pid).startswith("0x"):
-            from wallet import import_polymarket_positions, update_resolutions
-            print(f"[*] Syncing live wallet & resolutions for '{active_pid[:6]}...{active_pid[-4:]}'...")
-            history = import_polymarket_positions(active_pid, history, auto_sync=True)
-            history = update_resolutions(history)
-            save_history(history, profile_id=active_pid)
-        else:
-            from wallet import update_resolutions
-            history = update_resolutions(history)
-            save_history(history)
-        if sub_mode in ("predicted", "all"):
-            print("[*] Refreshing live CLOB orderbooks & VWAP for active markets...")
-            ensure_predicted_market_metadata(history, fetch_clob=True)
-        return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
-    elif act.lower().startswith("d ") or act.lower().startswith("details "):
-        parts = act.split()
-        if len(parts) > 1 and parts[1].isdigit():
-            d_idx = int(parts[1]) - 1
-            if 0 <= d_idx < len(rows):
-                _print_single_market_details(rows[d_idx])
-                input("\nPress Enter to return to table: ")
-                return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
+
+def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_meta=True):
+    """Renders formatted history table with ANSI hyperlinks, sorting, and iterative action loop."""
+    default_sorts = {
+        "predicted": "velocity",
+        "exited": "date",
+        "resolved": "ego_impact",
+        "skipped": "date",
+        "all": "kelly",
+    }
+    sort_map = {
+        "1": "date", "date": "date", "pu": "date", "last_pu": "date", "updated": "date",
+        "2": "kelly", "kelly": "kelly", "k": "kelly",
+        "3": "edge", "edge": "edge", "e": "edge",
+        "4": "exit_prox", "exit": "exit_prox", "prox": "exit_prox",
+        "5": "velocity", "vel": "velocity", "velocity": "velocity", "v": "velocity", "daily": "velocity",
+        "6": "ego_impact", "ego": "ego_impact", "brier": "ego_impact", "b": "ego_impact",
+        "7": "cey", "cey": "cey", "c": "cey",
+    }
+    if sort_by is None:
+        sort_by = default_sorts.get(sub_mode, "date")
+
+    needs_rebuild = True
+    pending_refresh = refresh_meta
+    rows, base_ego = [], 0.5
+
+    while True:
+        if needs_rebuild:
+            rows, base_ego = _build_review_rows(history, sub_mode, refresh_meta=pending_refresh)
+            needs_rebuild = False
+            pending_refresh = False
+
+        if not rows:
+            print(f"\n[!] No markets found in '{sub_mode}'.")
+            return
+
+        _render_review_table(rows, history, sub_mode, base_ego, sort_by, expanded)
+
+        act = input("> ").strip()
+        act_low = act.lower()
+
+        if not act:
+            return
+        if act_low == "p":
+            return "p"
+
+        if act_low in ("x", "expand", "exp"):
+            expanded = not expanded
+        elif (
+            act_low in ("s", "sort", "date", "pu", "last_pu", "updated", "kelly", "edge", "exit", "prox", "vel", "velocity", "daily", "brier", "cey", "c")
+            or act_low.startswith("s ")
+            or act_low.startswith("sort ")
+        ) and sub_mode in ("predicted", "exited", "resolved", "all"):
+            if act_low in sort_map and act_low not in ("s", "sort"):
+                sort_by = sort_map[act_low]
+            elif " " in act_low:
+                sub_tok = act_low.split(None, 1)[1].strip()
+                sort_by = sort_map.get(sub_tok, sort_by)
             else:
-                print(f"[!] Row number out of range {range_str}.")
-                return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
-        else:
-            print("[!] Usage: 'd <row#>' (e.g. 'd 1')")
-            return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
-    elif (act.lower().startswith("u ") or act.lower().startswith("undo ")) and sub_mode == "predicted":
-        parts = act.split()
-        if len(parts) > 1 and parts[1].isdigit():
-            u_idx = int(parts[1]) - 1
-            if 0 <= u_idx < len(rows):
-                r_target = rows[u_idx]
-                m_id = str(r_target.get("Market ID"))
-                preds = ensure_list(history.get("predicted", {}).get(m_id, [])) or ensure_list(history.get("exited", {}).get(m_id, []))
-                if preds:
-                    p_target = preds[0]
-                    snaps = p_target.get("snapshots")
-                    if isinstance(snaps, list) and len(snaps) >= 2:
-                        last_s = snaps[-1]
-                        prev_s = snaps[-2]
-                        conf = input(f"Undo latest update on #{u_idx + 1} (revert pu: {float(last_s.get('pu', 0))*100:.1f}% -> {float(prev_s.get('pu', 0))*100:.1f}%)? (y/n): ").strip().lower()
-                        if conf == "y":
-                            snaps.pop()
-                            restore_snapshot_to_prediction(p_target, prev_s, base_ego=base_ego)
-                            save_history(history)
-                            print(f"[+] Successfully undid latest update on #{u_idx + 1}.")
-                            return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
-                    else:
-                        print(f"[!] No previous updates to undo for row #{u_idx + 1} (only initial prediction exists).")
+                cycle_map = {
+                    "predicted": ["velocity", "cey", "kelly", "edge", "exit_prox", "date"],
+                    "exited": ["date", "ego_impact", "cey", "kelly", "edge"],
+                    "resolved": ["ego_impact", "date", "cey", "kelly", "edge"],
+                    "all": ["kelly", "velocity", "cey", "edge", "ego_impact", "date"],
+                }
+                seq = cycle_map.get(sub_mode, ["date", "kelly", "edge", "cey"])
+                next_s = seq[(seq.index(sort_by) + 1) % len(seq)] if sort_by in seq else seq[0]
+                vel_h = "  [5] Velocity (Edge/d)" if sub_mode in ("predicted", "all") else ""
+                ego_h = "  [6] Ego Impact (Log-Loss)" if sub_mode in ("resolved", "exited", "all") else ""
+                cey_h = "  [7] CEY"
+                d_lbl = "Last PU Date" if sub_mode == "predicted" else "Date"
+                s_in = input(f"Sort '{sub_mode}' by: [1] {d_lbl}  [2] Kelly  [3] Edge  [4] Exit Proximity{vel_h}{ego_h}{cey_h} [Enter -> {next_s.upper()}]: ").strip().lower()
+                sort_by = sort_map.get(s_in, next_s) if s_in else next_s
+        elif act_low in ("l", "live", "refresh") and sub_mode in ("predicted", "exited", "resolved", "all"):
+            active_pid = history.get("profile_id") or get_active_profile()
+            if active_pid and str(active_pid).startswith("0x"):
+                from wallet import import_polymarket_positions, update_resolutions
+                print(f"[*] Syncing live wallet & resolutions for '{active_pid[:6]}...{active_pid[-4:]}'...")
+                history = import_polymarket_positions(active_pid, history, auto_sync=True)
+                history = update_resolutions(history)
+                save_history(history, profile_id=active_pid)
+            else:
+                from wallet import update_resolutions
+                history = update_resolutions(history)
+                save_history(history)
+            if sub_mode in ("predicted", "all"):
+                print("[*] Refreshing live CLOB orderbooks & VWAP for active markets...")
+                ensure_predicted_market_metadata(history, fetch_clob=True)
+            needs_rebuild = True
+            pending_refresh = False
+        elif act_low.startswith("d ") or act_low.startswith("details "):
+            parts = act.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                d_idx = int(parts[1]) - 1
+                if 0 <= d_idx < len(rows):
+                    _print_single_market_details(rows[d_idx])
+                    input("\nPress Enter to return to table: ")
                 else:
-                    print(f"[!] Market not found in active history.")
+                    print(f"[!] Row number out of range {range_str}.")
+            else:
+                print("[!] Usage: 'd <row#>' (e.g. 'd 1')")
+        elif (act_low.startswith("u ") or act_low.startswith("undo ")) and sub_mode == "predicted":
+            parts = act.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                u_idx = int(parts[1]) - 1
+                if 0 <= u_idx < len(rows):
+                    r_target = rows[u_idx]
+                    m_id = str(r_target.get("Market ID"))
+                    preds = ensure_list(history.get("predicted", {}).get(m_id, [])) or ensure_list(history.get("exited", {}).get(m_id, []))
+                    if preds:
+                        p_target = preds[0]
+                        snaps = p_target.get("snapshots")
+                        if isinstance(snaps, list) and len(snaps) >= 2:
+                            last_s = snaps[-1]
+                            prev_s = snaps[-2]
+                            conf = input(f"Undo latest update on #{u_idx + 1} (revert pu: {float(last_s.get('pu', 0))*100:.1f}% -> {float(prev_s.get('pu', 0))*100:.1f}%)? (y/n): ").strip().lower()
+                            if conf == "y":
+                                snaps.pop()
+                                restore_snapshot_to_prediction(p_target, prev_s, base_ego=base_ego)
+                                save_history(history)
+                                print(f"[+] Successfully undid latest update on #{u_idx + 1}.")
+                                needs_rebuild = True
+                                pending_refresh = False
+                        else:
+                            print(f"[!] No previous updates to undo for row #{u_idx + 1} (only initial prediction exists).")
+                    else:
+                        print("[!] Market not found in active history.")
+                else:
+                    print(f"[!] Row number out of range {range_str}.")
+            else:
+                print("[!] Usage: 'u <row#>' (e.g. 'u 2')")
+        elif act_low in ("cal", "ego", "e"):
+            from manage import toggle_ego_market_inclusion
+            toggle_ego_market_inclusion(history)
+            return
+        elif act.isdigit():
+            row_num = int(act)
+            if 1 <= row_num <= len(rows):
+                sel_r = rows[row_num - 1]
+                if sel_r.get("Mode") == "resolved":
+                    _print_single_market_details(sel_r)
+                    input("\nPress Enter to return to table: ")
+                else:
+                    _handle_targeted_predict(rows, preselected_idx=row_num - 1)
+                    history = load_history()
+                    needs_rebuild = True
+                    pending_refresh = (sub_mode in ("predicted", "all"))
             else:
                 print(f"[!] Row number out of range {range_str}.")
         else:
-            print("[!] Usage: 'u <row#>' (e.g. 'u 2')")
-        return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
-    elif act.lower() in ("cal", "ego", "e"):
-        from manage import toggle_ego_market_inclusion
-        toggle_ego_market_inclusion(history)
-        return
-    elif act.isdigit():
-        row_num = int(act)
-        if 1 <= row_num <= len(rows):
-            sel_r = rows[row_num - 1]
-            if sel_r.get("Mode") == "resolved":
-                _print_single_market_details(sel_r)
-                input("\nPress Enter to return to table: ")
-                return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
-            _handle_targeted_predict(rows, preselected_idx=row_num - 1)
-            history = load_history()
-            return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=(sub_mode in ("predicted", "all")))
-        else:
-            print(f"[!] Row number out of range {range_str}.")
-            return print_review_table(history, sub_mode, expanded=expanded, sort_by=sort_by, refresh_meta=False)
+            print("[!] Unknown command. Enter a row #, command, or press Enter for Main Menu.")
 
 def _handle_targeted_predict(rows, preselected_idx=None):
     """Launches targeted prediction on a specific table row."""
@@ -1487,12 +1580,7 @@ def print_main_menu_dashboard(history):
     pos_val = float(ws.get("portfolio", 0.0) or 0.0)
     live_bankroll = float(ws.get("bankroll") or cfg.BANKROLL) if isinstance(ws, dict) else cfg.BANKROLL
 
-    alias = history.get("alias", "")
-    if not alias:
-        if active_pid.startswith("0xbC73"):
-            alias = "Main"
-        elif active_pid == "local":
-            alias = "Paper"
+    alias = history.get("alias", "") or default_profile_alias(active_pid)
 
     if is_wallet:
         short_addr = f"{active_pid[:6]}...{active_pid[-4:]}"
@@ -1593,10 +1681,17 @@ def print_main_menu_dashboard(history):
     hdr_pad = max(0, (box_w - hdr_visible_len - 4) // 2)
     hdr_line = " " * hdr_pad + f"[ {hdr_tag} ]"
 
+    res_stats = calculate_prediction_stats(history, sub_mode="resolved", base_ego=base_ego, refresh_meta=False)
+
     print("\n" + "=" * box_w)
     print(hdr_line)
     print("-" * box_w)
     print(cap_line)
     print(f"  Live Exposure  : {active_eff_kelly*100:.1f}% Eff-Kelly (${active_eff_kelly*live_bankroll:,.2f}) | Avg Edge: {avg_edge*100:+.2f}% | Signals: {sig_summary}")
     print(f"  Track Record   : {wins}W - {losses}L{win_pct_str} | Realized PnL: {pnl_str} | Base Ego: {base_ego:.3f}")
+    if res_stats and res_stats.get("res_count", 0) > 0:
+        lz = res_stats["res_luck_z"]
+        lzw = res_stats["res_luck_z_weighted"]
+        cb_u = res_stats["res_calib_bias_u"] * 100.0
+        print(f"  Reflection     : Bias vs User: {cb_u:+.1f}% | Luck: {lz:+.2f}s [{classify_luck_z(lz)}] (Wt: {lzw:+.2f}s)")
     print("=" * box_w)

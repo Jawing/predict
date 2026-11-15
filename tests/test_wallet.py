@@ -1,6 +1,6 @@
 """Unit and integration tests for wallet.py reconciliation, trade delta replay, and resolution."""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import config as cfg
 import wallet
@@ -339,7 +339,31 @@ class TestImportPolymarketPositionsEndToEnd(unittest.TestCase):
         out = wallet.import_polymarket_positions("0x1234", history, auto_sync=False)
         self.assertEqual(len(out["predicted"]["0xP1"]), 1)
         self.assertEqual(out["predicted"]["0xP1"][0]["pu"], 0.75)
+        self.assertFalse(out["predicted"]["0xP1"][0].get("unforecasted", False))
         self.assertEqual(out["predicted"]["0xP2"][0]["pu"], 0.5)
+        self.assertTrue(out["predicted"]["0xP2"][0].get("unforecasted"))
+        self.assertTrue(out["predicted"]["0xP2"][0].get("exclude_from_ego"))
+
+    @patch.object(wallet, "api")
+    def test_fetch_v2_endpoints_handle_null_pagination(self, mock_api):
+        pos_resp = MagicMock()
+        pos_resp.status_code = 200
+        pos_resp.json.return_value = {
+            "data": [{"conditionId": "0xC1", "outcome": "Yes", "size": 5, "avgPrice": 0.5}],
+            "pagination": None,
+        }
+        trade_resp = MagicMock()
+        trade_resp.status_code = 200
+        trade_resp.json.return_value = {
+            "data": [{"conditionId": "0xC1", "side": "BUY", "size": 5, "price": 0.5, "timestamp": 1000}],
+            "pagination": None,
+        }
+        mock_api.get.side_effect = [pos_resp, trade_resp]
+
+        positions = wallet.fetch_v2_positions("0x1234", "OPEN")
+        trades = wallet.fetch_wallet_trades("0x1234")
+        self.assertEqual(len(positions), 1)
+        self.assertIn("0xc1", trades)
 
 
 if __name__ == "__main__":

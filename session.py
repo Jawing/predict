@@ -223,10 +223,14 @@ def _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discov
     vol_val = float(m.get("volume", 0.0) or m.get("volumeNum", 0.0) or 0.0)
     eii_val = float(m.get("eii", 0.0) or 0.0)
     cey_val = float(m.get("cey", 0.0) or 0.0)
+    pulse_val = float(m.get("pulse", 0.0) or 0.0)
+    churn_val = float(m.get("churn", 0.0) or 0.0)
 
     parts = [
         f"CEY: {cey_val:,.0f}",
         f"EII: ${eii_val:,.0f}",
+        f"Pulse: ${pulse_val:,.0f}",
+        f"Churn: {churn_val:.2f}x",
         f"Vol: ${vol_val:,.0f}",
     ]
 
@@ -631,7 +635,7 @@ def run_prediction_session(
             stored_pu = round(1.0 - pu_mid_val, 6) if is_pos_no else round(pu_mid_val, 6)
             stored_pm = round(1.0 - pm_mid, 6) if is_pos_no else round(pm_mid, 6)
             stored_cur_pm = round(1.0 - pm_mid, 6) if is_pos_no else round(pm_mid, 6)
-            stored_entry_px = round(vwap_true if vwap_true > 0 else (true_price if true_price > 0 else pm_mid), 4)
+            stored_entry_px = round(vwap_true if vwap_true > 0 else (true_price if true_price > 0 else stored_cur_pm), 4)
 
             if is_pos_no:
                 lm = calculate_logistic_metrics(

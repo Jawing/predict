@@ -2,6 +2,9 @@
 import json
 import os
 import re
+import time
+import zipfile
+from datetime import datetime, timezone
 import config as cfg
 from utils import ensure_list, stringify_overflow, get_history_counts
 
@@ -70,6 +73,16 @@ def get_profile_path(profile_id=None):
     return os.path.join(cfg.HISTORY_DIR, f"history_{profile_id}.json")
 
 
+def default_profile_alias(profile_id):
+    """Returns default friendly alias for known built-in profile IDs."""
+    pid = str(profile_id or "")
+    if pid.startswith("0xbC73"):
+        return "Main"
+    if pid == "local":
+        return "Paper"
+    return ""
+
+
 def get_profile_alias(profile_id=None):
     """Returns friendly alias for a profile (e.g. 'Main', 'Paper')."""
     if not profile_id:
@@ -85,11 +98,7 @@ def get_profile_alias(profile_id=None):
                     return alias
         except Exception:
             pass
-    if profile_id.startswith("0xbC73"):
-        return "Main"
-    elif profile_id == "local":
-        return "Paper"
-    return ""
+    return default_profile_alias(profile_id)
 
 
 def set_profile_alias(profile_id, alias):
@@ -136,7 +145,7 @@ def migrate_legacy_history_if_needed():
             w_addr = sanitize_profile_id(w_addr)
             target_file = os.path.join(cfg.HISTORY_DIR, f"history_{w_addr}.json")
             if "alias" not in data:
-                data["alias"] = "Main" if w_addr.startswith("0xbC73") else ("Paper" if w_addr == "local" else "")
+                data["alias"] = default_profile_alias(w_addr)
             with open(target_file, "w", encoding="utf-8") as f:
                 json.dump(stringify_overflow(data), f, indent=4)
             set_active_profile(w_addr)
@@ -166,12 +175,7 @@ def load_history(profile_id=None):
                 data.setdefault("wallet_summary", {"cash": 100.0, "portfolio": 0.0, "bankroll": 100.0})
 
                 if "alias" not in data or not data["alias"]:
-                    if profile_id.startswith("0xbC73"):
-                        data["alias"] = "Main"
-                    elif profile_id == "local":
-                        data["alias"] = "Paper"
-                    else:
-                        data["alias"] = ""
+                    data["alias"] = default_profile_alias(profile_id)
 
                 if profile_id.startswith("0x"):
                     data["wallet_address"] = profile_id
@@ -183,7 +187,7 @@ def load_history(profile_id=None):
                     active_p = [p for p in preds if not p.get("exited")]
                     exited_p = [p for p in preds if p.get("exited")]
                     if exited_p:
-                        data["exited"].setdefault(m_id, []).extend(exited_p)
+                        data["exited"][m_id] = ensure_list(data["exited"].get(m_id, [])) + exited_p
                         if active_p:
                             data["predicted"][m_id] = active_p
                         else:
@@ -205,8 +209,8 @@ def load_history(profile_id=None):
 
                 return data
         except json.JSONDecodeError as e:
-            import shutil, time as _time
-            backup_path = f"{target_path}.corrupt.{int(_time.time())}"
+            import shutil
+            backup_path = f"{target_path}.corrupt.{int(time.time())}"
             try:
                 shutil.copy2(target_path, backup_path)
                 print(f"[!] Corrupt profile JSON in {target_path} ({e}). Backed up to {backup_path}.")
@@ -215,7 +219,7 @@ def load_history(profile_id=None):
 
     # Profile does not exist yet: create skeleton
     is_wallet = profile_id.startswith("0x")
-    alias_val = "Main" if profile_id.startswith("0xbC73") else ("Paper" if profile_id == "local" else "")
+    alias_val = default_profile_alias(profile_id)
     data = {
         "wallet_address": profile_id if is_wallet else None,
         "alias": alias_val,
@@ -296,3 +300,215 @@ def delete_profile(profile_id):
             set_active_profile(profiles[0]["profile_id"])
         else:
             set_active_profile("local")
+
+
+def _default_backup_dir():
+    return os.path.join(cfg.HISTORY_DIR, "backups")
+
+
+def _is_safe_history_member(name):
+    """Validates zip member names to prevent path traversal and reject unexpected entries."""
+    if not name or "\\" in name or name.startswith("/") or ":" in name:
+        return False
+    parts = name.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return False
+    if name == "active_profile.txt":
+        return True
+    if len(parts) == 2 and parts[0] == "data" and parts[1].startswith("history_") and parts[1].endswith(".json"):
+        pid = parts[1][len("history_"):-len(".json")]
+        return bool(pid) and sanitize_profile_id(pid) == pid
+    return False
+
+
+def _prune_old_backups(target_dir, keep):
+    """Deletes oldest predict_backup_*.zip archives when count exceeds keep."""
+    if not keep or keep <= 0 or not os.path.isdir(target_dir):
+        return
+    zips = [
+        os.path.join(target_dir, f)
+        for f in os.listdir(target_dir)
+        if f.startswith("predict_backup_") and f.lower().endswith(".zip")
+    ]
+    zips = [p for p in zips if os.path.isfile(p)]
+    if len(zips) <= keep:
+        return
+    zips.sort(key=lambda p: (os.path.getmtime(p), p))
+    for old_path in zips[:-keep]:
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+
+def create_backup(backup_dir=None, output_path=None, keep=10):
+    """Creates a timestamped .zip backup of all profile histories and per-profile settings."""
+    migrate_legacy_history_if_needed()
+
+    if output_path:
+        dest_path = output_path
+        dest_parent = os.path.dirname(dest_path)
+        if dest_parent:
+            os.makedirs(dest_parent, exist_ok=True)
+        target_dir = None
+    else:
+        target_dir = backup_dir or _default_backup_dir()
+        os.makedirs(target_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest_path = os.path.join(target_dir, f"predict_backup_{stamp}.zip")
+        suffix = 1
+        while os.path.exists(dest_path):
+            dest_path = os.path.join(target_dir, f"predict_backup_{stamp}_{suffix}.zip")
+            suffix += 1
+
+    history_files = []
+    if os.path.exists(cfg.HISTORY_DIR):
+        for fname in sorted(os.listdir(cfg.HISTORY_DIR)):
+            if fname.startswith("history_") and fname.endswith(".json"):
+                fpath = os.path.join(cfg.HISTORY_DIR, fname)
+                if os.path.isfile(fpath):
+                    history_files.append((fname, fpath))
+
+    tmp_path = f"{dest_path}.tmp"
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fname, fpath in history_files:
+                zf.write(fpath, arcname=f"data/{fname}")
+            if cfg.ACTIVE_PROFILE_FILE and os.path.isfile(cfg.ACTIVE_PROFILE_FILE):
+                zf.write(cfg.ACTIVE_PROFILE_FILE, arcname="active_profile.txt")
+        os.replace(tmp_path, dest_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    if target_dir and keep:
+        _prune_old_backups(target_dir, keep)
+
+    return dest_path
+
+
+def auto_backup(max_age_hours=24, keep=10, backup_dir=None):
+    """Creates an automatic backup if existing history has no backup newer than max_age_hours."""
+    has_history = os.path.isdir(cfg.HISTORY_DIR) and any(
+        f.startswith("history_") and f.endswith(".json") for f in os.listdir(cfg.HISTORY_DIR)
+    )
+    if not has_history:
+        return None
+
+    target_dir = backup_dir or _default_backup_dir()
+    if os.path.isdir(target_dir):
+        existing = [
+            os.path.join(target_dir, f)
+            for f in os.listdir(target_dir)
+            if f.startswith("predict_backup_") and f.lower().endswith(".zip")
+            and os.path.isfile(os.path.join(target_dir, f))
+        ]
+        if existing:
+            newest_mtime = max(os.path.getmtime(p) for p in existing)
+            if (time.time() - newest_mtime) < max_age_hours * 3600:
+                return None
+
+    return create_backup(backup_dir=target_dir, keep=keep)
+
+
+def list_backups(backup_dir=None):
+    """Lists available .zip backup archives sorted newest-first."""
+    target_dir = backup_dir or _default_backup_dir()
+    if not os.path.isdir(target_dir):
+        return []
+
+    entries = []
+    for fname in os.listdir(target_dir):
+        if not fname.lower().endswith(".zip"):
+            continue
+        fpath = os.path.join(target_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+
+        profiles = []
+        try:
+            with zipfile.ZipFile(fpath, "r") as zf:
+                for name in zf.namelist():
+                    if name.startswith("data/history_") and name.endswith(".json"):
+                        profiles.append(name[len("data/history_"):-len(".json")])
+        except Exception:
+            profiles = []
+
+        mtime = os.path.getmtime(fpath)
+        entries.append((
+            (mtime, fname),
+            {
+                "filename": fname,
+                "path": fpath,
+                "size_bytes": os.path.getsize(fpath),
+                "created_at": datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "profiles": sorted(profiles),
+            },
+        ))
+
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in entries]
+
+
+def restore_backup(backup_path, create_safety_backup=True):
+    """Restores profile histories and per-profile settings from a .zip backup archive."""
+    if not backup_path or not os.path.isfile(backup_path):
+        raise FileNotFoundError(f"Backup file not found: {backup_path}")
+    if not zipfile.is_zipfile(backup_path):
+        raise ValueError(f"Not a valid zip archive: {backup_path}")
+
+    staged_history = {}
+    staged_active = None
+
+    with zipfile.ZipFile(backup_path, "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            if not _is_safe_history_member(name):
+                raise ValueError(f"Unsupported or unsafe backup entry: {name}")
+
+            raw = zf.read(name).decode("utf-8")
+            if name == "active_profile.txt":
+                staged_active = raw.strip()
+            elif name.startswith("data/"):
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"Invalid history JSON in backup archive: {name}")
+                staged_history[os.path.basename(name)] = raw
+
+    if not staged_history and staged_active is None:
+        raise ValueError("Backup archive contains no restorable history or profile data.")
+
+    safety_backup_path = None
+    has_existing_data = (
+        (os.path.isdir(cfg.HISTORY_DIR) and any(
+            f.startswith("history_") and f.endswith(".json") for f in os.listdir(cfg.HISTORY_DIR)
+        ))
+        or (cfg.ACTIVE_PROFILE_FILE and os.path.isfile(cfg.ACTIVE_PROFILE_FILE))
+    )
+    if create_safety_backup and has_existing_data:
+        safety_backup_path = create_backup()
+
+    if staged_history:
+        os.makedirs(cfg.HISTORY_DIR, exist_ok=True)
+        for fname, raw in staged_history.items():
+            with open(os.path.join(cfg.HISTORY_DIR, fname), "w", encoding="utf-8") as f:
+                f.write(raw)
+
+    if staged_active and cfg.ACTIVE_PROFILE_FILE:
+        set_active_profile(staged_active)
+        load_history(staged_active)
+    elif cfg.ACTIVE_PROFILE_FILE and os.path.isfile(cfg.ACTIVE_PROFILE_FILE):
+        load_history()
+
+    return {
+        "restored_profiles": sorted(
+            f[len("history_"):-len(".json")] for f in staged_history.keys()
+        ),
+        "active_profile": staged_active or get_active_profile(),
+        "safety_backup": safety_backup_path,
+    }

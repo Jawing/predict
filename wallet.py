@@ -82,7 +82,7 @@ def fetch_v2_positions(wallet_address, status_filter):
                         "first_entry_at": p.get("first_entry_at") or 0,
                         "_from_closed": (status_filter == "CLOSED"),
                     })
-                pagination = resp.get("pagination", {}) if isinstance(resp, dict) else {}
+                pagination = (resp.get("pagination") or {}) if isinstance(resp, dict) else {}
                 cursor = pagination["next_cursor"] if (pagination.get("has_more") and pagination.get("next_cursor")) else None
                 success = True
                 break
@@ -122,7 +122,7 @@ def fetch_wallet_trades(wallet_address):
                 "shares": sz,
                 "price": px,
             })
-        pagination = act_resp.get("pagination", {}) if isinstance(act_resp, dict) else {}
+        pagination = (act_resp.get("pagination") or {}) if isinstance(act_resp, dict) else {}
         if pagination.get("has_more") and pagination.get("next_cursor"):
             t_cursor = pagination["next_cursor"]
         else:
@@ -491,7 +491,7 @@ def _transition_matched_market(
             p["realized_pnl"] = realized_pnl
             p["source"] = "wallet"
         if to_resolve:
-            history["resolved"].setdefault(target_key, []).extend(to_resolve)
+            history["resolved"][target_key] = ensure_list(history["resolved"].get(target_key, [])) + to_resolve
     elif is_exited_open_pos:
         cur_preds = ensure_list(history["predicted"].get(target_key, []))
         to_exit = [
@@ -526,7 +526,7 @@ def _transition_matched_market(
                 p["cur_pm"] = round(sells[-1]["price"], 6)
                 p["last_synced_ts"] = max(int(p.get("last_synced_ts", 0)), sells[-1]["ts"])
         if to_exit:
-            history["exited"].setdefault(target_key, []).extend(to_exit)
+            history["exited"][target_key] = ensure_list(history["exited"].get(target_key, [])) + to_exit
 
 
 def _revive_exited_position(history, c_id_lower, pos, pos_outcome_str, initial_val, size, cur_price):
@@ -551,7 +551,8 @@ def _revive_exited_position(history, c_id_lower, pos, pos_outcome_str, initial_v
             e["cost_basis"] = initial_val
             e["shares"] = size
             e["current_value"] = float(pos.get("currentValue", size * cur_price))
-        history.setdefault("predicted", {}).setdefault(m_id, []).extend(revive_matches)
+        pred_bucket = history.setdefault("predicted", {})
+        pred_bucket[m_id] = ensure_list(pred_bucket.get(m_id, [])) + revive_matches
         return True
     return False
 
@@ -599,7 +600,7 @@ def _archive_missing_wallet_positions(history, closed_positions, wallet_cond_ids
                 kept_preds.append(p)
 
         if moved_exits:
-            history["exited"].setdefault(m_id, []).extend(moved_exits)
+            history["exited"][m_id] = ensure_list(history["exited"].get(m_id, [])) + moved_exits
             if kept_preds:
                 history["predicted"][m_id] = kept_preds
             else:
@@ -620,7 +621,7 @@ def _format_import_record_date(pos, is_exited_flag, latest_trade_ts):
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def _build_wallet_entry(item, lower, upper, base_ego, total_bankroll, wallet_address):
+def _build_wallet_entry(item, lower, upper, base_ego, total_bankroll, wallet_address, unforecasted=False):
     """Constructs a canonical wallet prediction record for import into history."""
     pos = item["pos"]
     m = item["m"]
@@ -704,6 +705,7 @@ def _build_wallet_entry(item, lower, upper, base_ego, total_bankroll, wallet_add
         "source": "wallet",
         "wallet": wallet_address,
         "exited": is_exited_flag,
+        "unforecasted": bool(unforecasted),
         "endDate": item["end_date"] or (m.get("endDate") if m else None),
         "volume": float(m.get("volume") or 0.0) if m else 0.0,
         "volume24hr": float(m.get("volume24hr") or 0.0) if m else 0.0,
@@ -711,6 +713,8 @@ def _build_wallet_entry(item, lower, upper, base_ego, total_bankroll, wallet_add
         "spread": float(m.get("spread") or 0.01) if m else 0.01,
         "clobTokenIds": m.get("clobTokenIds") if m else None,
     }
+    if unforecasted:
+        pred_entry["exclude_from_ego"] = True
     if latest_trade_ts > 0:
         pred_entry["last_synced_ts"] = latest_trade_ts
     return pred_entry
@@ -748,26 +752,26 @@ def _prompt_and_import_new_positions(history, to_import, wallet_address, base_eg
         outcome_str = pos.get("outcome", "Yes")
         linked_question = ansi_link(f"https://polymarket.com/event/{item['slug']}", item["question"])
 
+        if pos.get("redeemable"):
+            res_out = determine_redeemable_outcome(pos, m)
+            pos_res = "WON" if res_out == 1.0 else ("LOST" if res_out == 0.0 else "50/50")
+            status_str = f"RESOLVED ({pos_res} | PnL: ${realized_pnl:+,.2f})"
+        elif pos.get("_exited"):
+            status_str = f"EXITED EARLY (Sold | PnL: ${realized_pnl:+,.2f} | Live: {cur_price*100:.1f}%)"
+        else:
+            status_str = f"OPEN (Live: {cur_price*100:.1f}% | PnL: ${realized_pnl:+,.2f})"
+
         if not skip_all_remaining:
             progress_str = f" {idx + 1}/{len(to_import)}" if len(to_import) > 1 else ""
             print(f"\n[IMPORT{progress_str}] Question: {linked_question}")
-            if pos.get("redeemable"):
-                res_out = determine_redeemable_outcome(pos, m)
-                pos_res = "WON" if res_out == 1.0 else ("LOST" if res_out == 0.0 else "50/50")
-                status_str = f"RESOLVED ({pos_res} | PnL: ${realized_pnl:+,.2f})"
-            elif pos.get("_exited"):
-                status_str = f"EXITED EARLY (Sold | PnL: ${realized_pnl:+,.2f} | Live: {cur_price*100:.1f}%)"
-            else:
-                status_str = f"OPEN (Live: {cur_price*100:.1f}% | PnL: ${realized_pnl:+,.2f})"
-            print(
-                f"         Position: {outcome_str}  |  Entry Price (pm): {avg_price*100:.1f}%  "
-                f"|  Cost Basis: ${initial_val:,.2f}  |  Status: {status_str}"
-            )
+            print(f"         Position: {outcome_str}  |  Cost Basis: ${initial_val:,.2f}  (Non-spoiler: pm & outcome hidden until pu)")
 
         go_back = False
+        unforecasted = False
         while True:
             if skip_all_remaining:
                 lower, upper = avg_price, avg_price
+                unforecasted = True
                 break
             pu_input = input(
                 "         Enter your subjective probability bounds % (e.g., 60-70 or 65), "
@@ -801,9 +805,11 @@ def _prompt_and_import_new_positions(history, to_import, wallet_address, base_eg
             if cmd == "a":
                 skip_all_remaining = True
                 lower, upper = avg_price, avg_price
+                unforecasted = True
                 break
             if cmd in ("s", "skip") or not pu_input:
                 lower, upper = avg_price, avg_price
+                unforecasted = True
                 break
             try:
                 lower, upper = parse_user_input(pu_input)
@@ -818,7 +824,12 @@ def _prompt_and_import_new_positions(history, to_import, wallet_address, base_eg
         if idx >= len(to_import):
             break
 
-        pred_entry = _build_wallet_entry(item, lower, upper, base_ego, total_bankroll, wallet_address)
+        if not skip_all_remaining:
+            print(f"         Reveal       : Entry Price (pm): {avg_price*100:.1f}%  |  Status: {status_str}")
+
+        pred_entry = _build_wallet_entry(
+            item, lower, upper, base_ego, total_bankroll, wallet_address, unforecasted=unforecasted
+        )
         if pos.get("redeemable"):
             pred_entry["outcome"] = determine_redeemable_outcome(pos, m)
             history["resolved"].setdefault(market_id, []).append(pred_entry)
@@ -1037,7 +1048,7 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             if m_id != target_key:
                 history["predicted"].pop(m_id, None)
                 if preds_list:
-                    history["predicted"].setdefault(target_key, []).extend(preds_list)
+                    history["predicted"][target_key] = ensure_list(history["predicted"].get(target_key, [])) + preds_list
             elif preds_list:
                 history["predicted"][target_key] = preds_list
             else:
@@ -1145,6 +1156,7 @@ def resolve_market_entries(history, market_id, market_data, bankroll=None):
 
         resolved_entry = dict(pred_data)
         resolved_entry["outcome"] = outcome
+        resolved_entry.setdefault("resolved_ts", int(time.time()))
         if is_exited_p:
             pass  # Preserve already-realized exit PnL
         elif is_unexec_local or is_watch_pred:
