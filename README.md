@@ -1,15 +1,13 @@
 # Predict
 
-A CLI prediction tool for discovering Polymarket opportunities, sizing predictions, syncing and managing portfolios.
+A simple terminal tool for finding Polymarket questions, making unbiased probability estimates, sizing bets, and tracking your accuracy over time.
 
-## Features
+## How It Works
 
-- **Balanced Kelly Sizing**: Sizes bets using the square-root Fisher geodesic to maximize compound growth while protecting against tail drawdowns.
-- **Dynamic Trade Signals**: High-conviction holding (`HOLD (+X% to exit)`), spread-tested additions (`ADD`), and disciplined exits (`TAKE PROFIT` / `SELL`) without premature micro-trimming.
-- **Calibrated Beliefs**: Adjusts confidence using Bayesian log-odds pooling weighted by historical Brier score accuracy (with optional market exclusion).
-- **Real-Time CLOB Execution**: Walks live orderbook depth to calculate exact VWAP prices, slippage, fees, and compounding APY.
-- **Multi-Portfolio & Off-Platform Capital**: Manage live Polymarket wallets and paper sandboxes with auto-sync and persistent off-platform bankroll tracking.
-- **Discovery Vectors**: Scan markets by Volume, 24h Trending, Liquidity, Soonest, Competitive (50/50), Low Volume, Newest, or Multi-Vector.
+- **Unbiased Forecasting**: Estimate the chance of an event (e.g. `65` or `60-70`) before seeing the market odds.
+- **Accuracy-Weighted Confidence**: Measures how well your past predictions beat the market and adjusts how heavily to weight your view vs. the market price.
+- **Sized to Orderbooks**: Checks live market depth and fees to suggest sensible bet sizes and clear signals (`BUY`, `HOLD`, `ADD`, `TAKE PROFIT`, `SELL`).
+- **Live & Paper Portfolios**: Sync Polymarket wallets (`0x...`) automatically or test ideas in a paper sandbox.
 
 ## Setup
 
@@ -23,24 +21,19 @@ pip install -r requirements.txt
 python predict.py
 ```
 
-## Main Menu Options
+## Main Menu
 
-- `1: Discover Markets`: Scan Polymarket using discovery vectors up to 2,000 events deep.
-- `2: Review Portfolio`: Inspect active, exited, and resolved positions; sort by Kelly, Edge, Exit Proximity, or Ego Impact.
-- `3: Target Specific URLs`: Paste any Polymarket event URL or slug to analyze and size instantly.
-- `4: Wallet Profiles & Sync`: Sync balances/positions on launch or on-demand, switch profiles, or create paper sandboxes.
-- `5: Tools & Settings`: Custom calculators, data management (reset, manual resolve, Ego calibration selector), and filter settings.
+- `1: Discover Markets`: Browse active Polymarket events by category, market metrics (eg. volume, liquidity, or closeness of odds).
+- `2: Review Portfolio & History`: View active, exited, resolved, and skipped markets, check performance, and tune which past markets count toward calibration.
+- `3: Target Specific URLs or Slugs`: Paste a Polymarket event link or slug to evaluate it right away.
+- `4: Wallet Profiles & Sync`: Switch between live wallets and paper sandboxes, or sync positions on demand.
+- `5: Tools & Settings`: Custom probability calculator, market overview scanner, data cleanup/backups, and filter & calibration settings.
 
-## Configuration & Capital
+## Settings
 
-Settings can be edited in `config.py` or interactively via **Option 5 -> 4**:
+Edit `config.py` or adjust per profile in **Option 5 -> 4**:
 
-- `MIN_EDGE = 0.00`: Minimum required edge before considering a trade (e.g. `0.02` for 2%).
-- `MIN_DAYS = 0`: Minimum market duration in days.
-- `MAX_DAYS = 420`: Maximum market duration in days.
-- `EXTREME_ODDS = 0.00`: Tail filter to ignore extreme odds near 0% or 100%.
-
-### Bankroll Modes
-
-- **Live Wallet (`0x...`)**: Automatically syncs on-chain cash and open positions from Polymarket on startup. Use `Bankroll Add` (Option 5 -> 5) to include persistent off-platform funds (`Total Bankroll = Cash + Positions + Bankroll Add`).
-- **Paper Sandbox (`local` / custom)**: Hypothetical trading capital defined on profile creation and adjustable anytime via Option 5 -> 5. Paper profiles never query blockchain endpoints or overwrite local capital.
+- `MIN_EDGE = 0.00`: Minimum advantage over the market price required to bet (e.g. `0.02` = 2%).
+- `MIN_DAYS = 0` / `MAX_DAYS = 420`: Only show markets resolving within this day range.
+- `EXTREME_ODDS = 0.00`: Skip markets priced very close to 0% or 100%.
+- `EGO_WEIGHTING = "uniform"`: Weight past predictions equally (`"uniform"`) or by bet size (`"kelly"`).

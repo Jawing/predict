@@ -14,7 +14,6 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-import pandas as pd
 
 import config as cfg
 from utils import get_history_counts
@@ -34,8 +33,24 @@ from storage import (
 )
 from views import print_main_menu_dashboard, print_review_table
 from wallet import import_polymarket_positions, update_resolutions
-from session import run_prediction_session, custom_calculator, compare_asset_market
+from session import run_prediction_session, custom_calculator
 from manage import handle_delete_data, manual_resolve, settings_menu
+
+
+def _format_portfolio_table(rows):
+    """Formats session allocation dicts into an aligned plain-text table."""
+    if not rows:
+        return ""
+    cols = list(rows[0].keys())
+    widths = {
+        c: max(len(str(c)), *(len(str(r.get(c, ""))) for r in rows))
+        for c in cols
+    }
+    header = "  ".join(str(c).ljust(widths[c]) for c in cols)
+    lines = [header]
+    for r in rows:
+        lines.append("  ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+    return "\n".join(lines)
 
 
 def main():
@@ -48,10 +63,10 @@ def main():
 
     # Startup auto-sync if on an active online wallet profile
     active_pid = get_active_profile()
+    history = load_history(active_pid)
     if active_pid.startswith("0x"):
         try:
             print(f"[*] Auto-syncing live wallet '{get_profile_display_name(active_pid)}'...")
-            history = load_history(active_pid)
             history = import_polymarket_positions(active_pid, history, auto_sync=True)
             history = update_resolutions(history)
             save_history(history, profile_id=active_pid)
@@ -60,13 +75,16 @@ def main():
 
     try:
         from views import auto_prune_closed_markets
-        h_init = load_history()
-        auto_prune_closed_markets(h_init)
+        auto_prune_closed_markets(history)
     except Exception as e:
         print(f"[!] Startup prune warning: {e}")
 
+    first_loop = True
     while True:
-        history = load_history()
+        if first_loop:
+            first_loop = False
+        else:
+            history = load_history()
         print_main_menu_dashboard(history)
 
         counts = get_history_counts(history)
@@ -100,7 +118,7 @@ def main():
             while step <= 3:
                 if step == 1:
                     category_input = input(
-                        "\nCategory Tag(s) (e.g. 'Politics, Geopolitics', '-Sports', or '?' for list): "
+                        "\nCategory (-exclude, ?: list): "
                     ).strip()
                     if category_input.lower() == "p":
                         cancelled = True
@@ -160,7 +178,7 @@ def main():
                     if reach_choice == "2":
                         session_max_offset = 400
                     elif reach_choice == "3":
-                        pages_in = input("Enter number of pages (1-20): ").strip()
+                        pages_in = input("Pages (1-20): ").strip()
                         if pages_in.lower() == "p":
                             continue
                         try:
@@ -208,7 +226,7 @@ def main():
             continue
 
         elif choice == "3":
-            raw_urls = input("Paste Polymarket URLs/Slugs (comma or space separated):\n> ").strip()
+            raw_urls = input("URLs / Slugs:\n> ").strip()
             if not raw_urls or raw_urls.lower() == "p":
                 continue
             urls_input = raw_urls.replace(",", " ").split()
@@ -374,24 +392,21 @@ def main():
             while True:
                 print("\n--- TOOLS & SETTINGS ---")
                 print(" 1: Custom Market Calculator")
-                print(" 2: Asset vs. Binary Calculator")
+                print(" 2: Platform Market Analyzer")
                 print(" 3: Data Management")
                 print(" 4: Settings & Threshold Filters")
-                print(" 5: Platform Market Analyzer")
                 t_choice = input("> ").strip()
                 if not t_choice or t_choice.lower() == "p":
                     break
                 if t_choice == "1":
                     custom_calculator()
                 elif t_choice == "2":
-                    compare_asset_market()
+                    from analyse import run_interactive_analyzer
+                    run_interactive_analyzer()
                 elif t_choice == "3":
                     handle_delete_data()
                 elif t_choice == "4":
                     settings_menu()
-                elif t_choice == "5":
-                    from analyse import run_interactive_analyzer
-                    run_interactive_analyzer()
                 else:
                     print("[!] Invalid selection.")
             continue
@@ -411,10 +426,9 @@ def main():
         )
 
         if portfolio is not None:
-            if not portfolio.empty:
+            if portfolio:
                 print("\n--- Final Session Allocations ---")
-                pd.set_option("display.max_colwidth", None)
-                print(portfolio.to_string(index=False))
+                print(_format_portfolio_table(portfolio))
             else:
                 print("\nNo allocations made.")
 

@@ -1,4 +1,5 @@
 """Polymarket API interactions: order books, CLOB streams, Gamma markets, and on-chain RPC balances."""
+import concurrent.futures
 import json
 import math
 import random
@@ -48,6 +49,19 @@ def get_wallet_usdc_balance(wallet_address):
     return None
 
 
+def sum_positions_value(positions):
+    """Computes total current valuation across a list of open position dicts."""
+    if not positions:
+        return 0.0
+    total = 0.0
+    for pos in positions:
+        size = float(pos.get("current_size") if pos.get("current_size") is not None else pos.get("size", 0.0) or 0.0)
+        avg_price = float(pos.get("avg_price") if pos.get("avg_price") is not None else pos.get("avgPrice", 0.0) or 0.0)
+        value = float(pos.get("current_value") if pos.get("current_value") is not None else pos.get("currentValue", pos.get("initialValue", size * avg_price)) or (size * avg_price))
+        total += value
+    return total
+
+
 def get_wallet_portfolio_value(wallet_address, positions=None):
     """Retrieves current value of open positions from Polymarket Data API (v2)."""
     if not wallet_address or not wallet_address.startswith("0x"):
@@ -62,15 +76,9 @@ def get_wallet_portfolio_value(wallet_address, positions=None):
                 return float(val_resp["value"] or 0.0)
     except Exception:
         pass
-    if positions:
-        total = 0.0
-        for pos in positions:
-            size = float(pos.get("current_size") if pos.get("current_size") is not None else pos.get("size", 0.0) or 0.0)
-            avg_price = float(pos.get("avg_price") if pos.get("avg_price") is not None else pos.get("avgPrice", 0.0) or 0.0)
-            value = float(pos.get("current_value") if pos.get("current_value") is not None else pos.get("currentValue", pos.get("initialValue", size * avg_price)) or (size * avg_price))
-            total += value
-        return total
-    return 0.0
+    if positions is not None:
+        return sum_positions_value(positions)
+    return None
 
 
 def get_market_clob_tokens(m):
@@ -101,8 +109,12 @@ def refresh_prices_from_clob(m):
         r = api.get(f"https://clob.polymarket.com/book?token_id={yes_token}", timeout=5)
         if r.status_code == 200:
             book = r.json()
-            bids = [float(b['price']) for b in book.get('bids', []) if float(b.get('price', 0)) > 0]
-            asks = [float(a['price']) for a in book.get('asks', []) if float(a.get('price', 0)) > 0]
+            asks_raw = book.get('asks', [])
+            bids_raw = book.get('bids', [])
+            m['_cached_clob_yes_asks'] = asks_raw
+            m['_cached_clob_yes_ts'] = time.monotonic()
+            bids = [float(b['price']) for b in bids_raw if float(b.get('price', 0)) > 0]
+            asks = [float(a['price']) for a in asks_raw if float(a.get('price', 0)) > 0]
             if bids and asks:
                 best_bid = max(bids)
                 best_ask = min(asks)
@@ -352,12 +364,18 @@ def validate_market(m, history, mode, exclude_mode="none"):
     if not m.get('active'):
         return False, "Market betting paused (Awaiting UMA resolution)"
         
-    try:
-        outcomes = json.loads(m.get('outcomes', '["Yes", "No"]'))
-        if len(outcomes) != 2:
-            return False, f"Non-binary categorical market ({len(outcomes)} outcomes)"
-    except Exception:
-        return False, "Invalid outcomes structure"
+    raw_outcomes = m.get('outcomes', '["Yes", "No"]')
+    if isinstance(raw_outcomes, list):
+        outcomes = raw_outcomes
+    elif raw_outcomes == '["Yes", "No"]':
+        outcomes = ["Yes", "No"]
+    else:
+        try:
+            outcomes = json.loads(raw_outcomes)
+        except Exception:
+            return False, "Invalid outcomes structure"
+    if not isinstance(outcomes, list) or len(outcomes) != 2:
+        return False, f"Non-binary categorical market ({len(outcomes) if isinstance(outcomes, list) else '?' } outcomes)"
 
     market_id = m.get('id')
     if mode == "discover":
@@ -372,7 +390,7 @@ def validate_market(m, history, mode, exclude_mode="none"):
         if exclude_mode in ["skipped", "both"] and market_id in history.get("skipped", {}):
             return False, "Already skipped"
             
-    _, _, pm_mid = extract_prices(m)
+    pm_bid, pm_ask, pm_mid = extract_prices(m)
     if pm_mid is None:
         return False, "Broken or missing price data from API"
     if pm_mid < cfg.EXTREME_ODDS or pm_mid > (1.0 - cfg.EXTREME_ODDS):
@@ -385,7 +403,9 @@ def validate_market(m, history, mode, exclude_mode="none"):
         return False, "Market has expired"
     if days_until < cfg.MIN_DAYS or days_until > cfg.MAX_DAYS:
         return False, f"Time horizon ({days_until:.1f} days) outside bounds"
-            
+
+    m["_val_prices"] = (pm_bid, pm_ask, pm_mid)
+    m["_val_days_until"] = days_until
     return True, "Valid"
 
 
@@ -461,7 +481,11 @@ def enrich_market_scale_metrics(m, event=None, discovery_vector=None):
     """Populates CEY, EII, Pulse, Churn, Volume, efficiency, and discovery-vector metrics on a market dict."""
     if not isinstance(m, dict):
         return m
-    pm_bid, pm_ask, pm_mid = extract_prices(m)
+    cached_prices = m.pop("_val_prices", None)
+    if cached_prices is not None:
+        pm_bid, pm_ask, pm_mid = cached_prices
+    else:
+        pm_bid, pm_ask, pm_mid = extract_prices(m)
     if pm_mid is None:
         pm_mid = m.get("cached_mid")
     odds = pm_mid if (pm_mid is not None and 0.0 < pm_mid < 1.0) else 0.5
@@ -470,7 +494,11 @@ def enrich_market_scale_metrics(m, event=None, discovery_vector=None):
     v24 = float(m.get("volume24hr", 0.0) or 0.0)
     liq = float(m.get("liquidity", 0.0) or m.get("liquidityNum", 0.0) or 0.0)
     eii = eff * vol
-    _, _, days_until = parse_market_date(m.get("endDate"))
+    cached_days = m.pop("_val_days_until", None)
+    if cached_days is not None:
+        days_until = cached_days
+    else:
+        _, _, days_until = parse_market_date(m.get("endDate"))
     days = max(0.1, days_until) if days_until is not None else 30.0
     cey = eii / math.sqrt(days + 7.0)
     pulse = eff * v24
@@ -539,12 +567,12 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
 
             print(f"[*] Multi-Vector Heuristic Sweep: Scanning {len(tasks)} batches across {len(vectors)} complementary vectors...")
 
-            import concurrent.futures
+            _now = datetime.now(timezone.utc)
+            _min_dt = (_now + timedelta(days=cfg.MIN_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _max_dt = (_now + timedelta(days=cfg.MAX_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
             def _fetch_page(task_info):
                 op, asc, off, t = task_info
-                _now = datetime.now(timezone.utc)
-                _min_dt = (_now + timedelta(days=cfg.MIN_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                _max_dt = (_now + timedelta(days=cfg.MAX_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 url = (
                     f"{cfg.GAMMA_API}/events?active=true&closed=false&limit=100&offset={off}"
                     f"&order={op}&ascending={asc}&end_date_min={_min_dt}&end_date_max={_max_dt}"
@@ -620,6 +648,9 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
 
         random.shuffle(query_plans)
         total_scanned_events = 0
+        _now = datetime.now(timezone.utc)
+        _min_dt = (_now + timedelta(days=cfg.MIN_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _max_dt = (_now + timedelta(days=cfg.MAX_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         for tag_slug, offset in query_plans:
             if discovery_order == "multi":
@@ -650,9 +681,6 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
                 active_vec = discovery_order
                 
             try:
-                _now = datetime.now(timezone.utc)
-                _min_dt = (_now + timedelta(days=cfg.MIN_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                _max_dt = (_now + timedelta(days=cfg.MAX_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 url = (
                     f"{cfg.GAMMA_API}/events?active=true&closed=false&limit=100&offset={offset}"
                     f"&order={order_param}&ascending={ascending_param}&end_date_min={_min_dt}&end_date_max={_max_dt}"
@@ -711,32 +739,43 @@ def generate_market_stream(mode, sub_mode, target_slugs, history, category="All"
         if not target_slugs:
             print("[!] Error: No valid URL/slug provided.")
             return
-            
-        for slug in target_slugs:
+
+        def _fetch_target_slug(slug):
             try:
-                events = api.get(f"{cfg.GAMMA_API}/events?slug={slug}", timeout=10).json()
-                if not events or not isinstance(events, list):
-                    print(f"[-] Invalid or empty data returned for slug: {slug}")
-                    continue
-                    
-                for event in events:
-                    if not isinstance(event, dict):
-                        continue
-                    raw_markets = event.get('markets', [])
-                    for m in raw_markets:
-                        if target_market_id and str(m.get('id')) != str(target_market_id):
-                            continue
-                        m['parent_slug'] = event.get('slug', 'unknown')
-                        m['parent_name'] = event.get('title', 'unknown')
-                        m['event_markets'] = raw_markets
-                        m['event_description'] = event.get('description', '')
-                        if not m.get('resolutionSource'):
-                            m['resolutionSource'] = event.get('resolutionSource', '')
-                        is_valid, reason = validate_market(m, history, mode, exclude_mode)
-                        if is_valid:
-                            enrich_market_scale_metrics(m, event=event, discovery_vector="target")
-                            yield m
-                        else:
-                            print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")
+                return slug, api.get(f"{cfg.GAMMA_API}/events?slug={slug}", timeout=10).json(), None
             except Exception as e:
-                print(f"[!] Error fetching slug {slug}: {e}")
+                return slug, None, e
+
+        if len(target_slugs) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(target_slugs))) as executor:
+                slug_results = list(executor.map(_fetch_target_slug, target_slugs))
+        else:
+            slug_results = [_fetch_target_slug(target_slugs[0])]
+
+        for slug, events, err in slug_results:
+            if err is not None:
+                print(f"[!] Error fetching slug {slug}: {err}")
+                continue
+            if not events or not isinstance(events, list):
+                print(f"[-] Invalid or empty data returned for slug: {slug}")
+                continue
+
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                raw_markets = event.get('markets', [])
+                for m in raw_markets:
+                    if target_market_id and str(m.get('id')) != str(target_market_id):
+                        continue
+                    m['parent_slug'] = event.get('slug', 'unknown')
+                    m['parent_name'] = event.get('title', 'unknown')
+                    m['event_markets'] = raw_markets
+                    m['event_description'] = event.get('description', '')
+                    if not m.get('resolutionSource'):
+                        m['resolutionSource'] = event.get('resolutionSource', '')
+                    is_valid, reason = validate_market(m, history, mode, exclude_mode)
+                    if is_valid:
+                        enrich_market_scale_metrics(m, event=event, discovery_vector="target")
+                        yield m
+                    else:
+                        print(f"[-] Ignored Target Market: '{m.get('question')}' | Reason: {reason}")

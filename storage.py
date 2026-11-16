@@ -112,22 +112,26 @@ def set_profile_alias(profile_id, alias):
     return history["alias"]
 
 
+def _format_profile_display_name(profile_id, alias):
+    """Formats a profile display name given its sanitized ID and alias."""
+    is_wallet = profile_id.startswith("0x")
+    short_w = f"0x..{profile_id[-4:]}" if (is_wallet and len(profile_id) >= 6) else profile_id
+    if alias and is_wallet:
+        return f"{alias} ({short_w})"
+    if alias:
+        return f"{alias} ({profile_id})"
+    if is_wallet:
+        return short_w
+    return profile_id.upper()
+
+
 def get_profile_display_name(profile_id=None):
     """Returns a formatted profile name, incorporating alias and short address."""
     if not profile_id:
         profile_id = get_active_profile()
     profile_id = sanitize_profile_id(profile_id)
     alias = get_profile_alias(profile_id)
-    is_wallet = profile_id.startswith("0x")
-    short_w = f"0x..{profile_id[-4:]}" if (is_wallet and len(profile_id) >= 6) else profile_id
-
-    if alias and is_wallet:
-        return f"{alias} ({short_w})"
-    elif alias:
-        return f"{alias} ({profile_id})"
-    elif is_wallet:
-        return short_w
-    return profile_id.upper()
+    return _format_profile_display_name(profile_id, alias)
 
 
 def migrate_legacy_history_if_needed():
@@ -147,7 +151,7 @@ def migrate_legacy_history_if_needed():
             if "alias" not in data:
                 data["alias"] = default_profile_alias(w_addr)
             with open(target_file, "w", encoding="utf-8") as f:
-                json.dump(stringify_overflow(data), f, indent=4)
+                json.dump(stringify_overflow(data), f, indent=2)
             set_active_profile(w_addr)
             print(f"[*] Migrated legacy prediction history to profile '{w_addr}'.")
         except Exception as e:
@@ -206,6 +210,10 @@ def load_history(profile_id=None):
                     for k in ["MIN_EDGE", "MAX_DAYS", "MIN_DAYS", "EXTREME_ODDS"]:
                         if k in saved_st:
                             setattr(cfg, k, saved_st[k])
+                    if "EGO_WEIGHTING" in saved_st:
+                        ew = str(saved_st["EGO_WEIGHTING"] or "").strip().lower()
+                        if ew in ("uniform", "kelly"):
+                            cfg.EGO_WEIGHTING = ew
 
                 return data
         except json.JSONDecodeError as e:
@@ -243,9 +251,22 @@ def save_history(history, profile_id=None):
 
     os.makedirs(cfg.HISTORY_DIR, exist_ok=True)
     target_path = get_profile_path(profile_id)
-    clean_data = stringify_overflow(history)
-    with open(target_path, "w", encoding="utf-8") as f:
-        json.dump(clean_data, f, indent=4)
+    try:
+        payload = json.dumps(history, indent=2, allow_nan=False)
+    except ValueError:
+        payload = json.dumps(stringify_overflow(history), indent=2)
+
+    tmp_path = f"{target_path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, target_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def list_profiles():
@@ -268,13 +289,15 @@ def list_profiles():
 
             counts = get_history_counts(data)
             br = float(data.get("wallet_summary", {}).get("bankroll", 100.0) or 100.0)
-            alias = get_profile_alias(pid)
+            alias = (data.get("alias") or "") if isinstance(data, dict) else ""
+            if not alias:
+                alias = default_profile_alias(pid)
             is_wallet = pid.startswith("0x")
 
             profiles.append({
                 "profile_id": pid,
                 "alias": alias,
-                "display_name": get_profile_display_name(pid),
+                "display_name": _format_profile_display_name(pid, alias),
                 "is_active": (pid == active_pid),
                 "is_wallet": is_wallet,
                 "active_count": counts["active"],

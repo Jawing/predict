@@ -4,6 +4,7 @@ Allows selective deletion of markets, category clears, manual resolution overrid
 and interactive settings/filters configuration.
 """
 
+import concurrent.futures
 import os
 from datetime import datetime, timezone, timedelta
 import config as cfg
@@ -103,11 +104,7 @@ def delete_specific_markets(history):
         print("[!] No markets found in selected filter.")
         return
 
-    print("\nSelect market(s) or update(s) to delete / undo:")
-    print(" - Single index: '4' (deletes entire market #4)")
-    print(" - Multiple indices: '1, 3, 5' or '1-4'")
-    print(" - Specific update / tranche: '4.2' (market #4, update #2 / tranche #2)")
-    print(" - Press Enter to cancel")
+    print("\nRange: 1-4 | Tranche/Update: 4.2")
 
     del_input = input("> ").strip()
     if not del_input:
@@ -205,16 +202,38 @@ def delete_specific_markets(history):
     print(f"[+] Successfully processed {len(to_delete)} item(s) in prediction history.\n")
 
 
-def clear_specific_category(history):
-    """Empties all entries from a selected history category."""
+def _reset_active_profile():
+    """Deletes all saved data for the active profile after explicit CONFIRM."""
+    active_pid = get_active_profile()
+    confirm = input(f"WARNING: Type 'CONFIRM' to reset all data for profile '{active_pid}': ").strip()
+    if confirm == "CONFIRM":
+        p_path = get_profile_path(active_pid)
+        if os.path.exists(p_path):
+            os.remove(p_path)
+        if os.path.exists(cfg.HISTORY_FILE):
+            os.remove(cfg.HISTORY_FILE)
+        load_history(active_pid)
+        print(f"[+] All data for profile '{active_pid}' reset.")
+    else:
+        print("[!] Data deletion cancelled.")
+
+
+def clear_specific_category(history, allow_full_reset=False):
+    """Empties all entries from a selected history category (or resets the active profile)."""
     counts = get_history_counts(history)
     print("\nSelect Category to Clear:")
     print(f" 1: Active Predictions ({counts['active_markets']})")
     print(f" 2: Exited Positions ({counts['exited_markets']})")
     print(f" 3: Resolved Markets ({counts['resolved_markets']})")
     print(f" 4: Skipped Markets ({counts['skipped']})")
+    if allow_full_reset:
+        print(" 5: Reset Entire Profile")
 
     cat_sel = input("> ").strip()
+    if allow_full_reset and cat_sel == "5":
+        _reset_active_profile()
+        return
+
     cat_map = {"1": "predicted", "2": "exited", "3": "resolved", "4": "skipped"}
     if cat_sel.lower() == "p" or cat_sel not in cat_map:
         print("[!] Cancelled.")
@@ -259,45 +278,39 @@ def prune_closed_skipped_markets(history, verbose=True):
 
     closed_ids = set()
 
-    chunk_size = 40
-
-
-
     if verbose:
-
         print(f"[*] Auditing {len(all_ids)} skipped markets against Polymarket Gamma API...")
 
-
-
+    chunk_size = 40
+    chunk_queries = []
     for i in range(0, len(all_ids), chunk_size):
-
         chunk = all_ids[i:i + chunk_size]
-
         q_ids = "&".join(f"id={mid}" for mid in chunk if not str(mid).startswith("custom_"))
+        if q_ids:
+            chunk_queries.append(q_ids)
 
-        if not q_ids:
-
-            continue
-
+    def _fetch_closed_chunk(q_ids):
+        url = f"{cfg.GAMMA_API}/markets?closed=true&{q_ids}"
         try:
-
-            url = f"{cfg.GAMMA_API}/markets?closed=true&{q_ids}"
-
             resp = cfg.api.get(url, timeout=8).json()
-
-            if isinstance(resp, list):
-
-                for item in resp:
-
-                    if item.get("closed") or item.get("umaResolutionStatus") in ("resolved", "finalized"):
-
-                        closed_ids.add(str(item.get("id")))
-
+            return resp if isinstance(resp, list) else []
         except Exception as e:
-
             if verbose:
-
                 print(f"[!] Warning checking chunk: {e}")
+            return []
+
+    if len(chunk_queries) == 1:
+        chunk_results = [_fetch_closed_chunk(chunk_queries[0])]
+    elif chunk_queries:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(chunk_queries))) as executor:
+            chunk_results = list(executor.map(_fetch_closed_chunk, chunk_queries))
+    else:
+        chunk_results = []
+
+    for resp in chunk_results:
+        for item in resp:
+            if item.get("closed") or item.get("umaResolutionStatus") in ("resolved", "finalized"):
+                closed_ids.add(str(item.get("id")))
 
 
 
@@ -360,20 +373,18 @@ def prune_closed_skipped_markets(history, verbose=True):
 
 
 def handle_delete_data():
-    """Menu interface for full reset, selective deletion, clearing category, or manual resolution."""
+    """Streamlined data management menu: resolve/audit, delete/reset, and backup/restore."""
     while True:
         history = load_history()
         counts = get_history_counts(history)
         total_markets = counts["total_markets"]
 
         print("\n--- DATA MANAGEMENT ---")
-        print(" 1: Delete all data")
-        print(f" 2: Selectively delete markets ({total_markets})")
-        print(" 3: Clear category")
-        print(" 4: Manual resolve")
-        print(" 5: Ego calibration selector")
-        print(" 6: Backup history & settings")
-        print(" 7: Restore from backup")
+        print(" 1: Resolve / Audit Markets")
+        print(f" 2: Delete Markets / Tranches ({total_markets})")
+        print(" 3: Clear Category / Reset Profile")
+        print(" 4: Backup History & Settings")
+        print(" 5: Restore from Backup")
 
         sub_choice = input("> ").strip()
 
@@ -381,18 +392,7 @@ def handle_delete_data():
             return
 
         if sub_choice == "1":
-            active_pid = get_active_profile()
-            confirm = input(f"WARNING: Type 'CONFIRM' to reset all data for profile '{active_pid}': ").strip()
-            if confirm == "CONFIRM":
-                p_path = get_profile_path(active_pid)
-                if os.path.exists(p_path):
-                    os.remove(p_path)
-                if os.path.exists(cfg.HISTORY_FILE):
-                    os.remove(cfg.HISTORY_FILE)
-                load_history(active_pid)
-                print(f"[+] All data for profile '{active_pid}' reset.")
-            else:
-                print("[!] Data deletion cancelled.")
+            manual_resolve(history)
 
         elif sub_choice == "2":
             if total_markets == 0:
@@ -401,18 +401,9 @@ def handle_delete_data():
             delete_specific_markets(history)
 
         elif sub_choice == "3":
-            if total_markets == 0:
-                print("[!] History is empty. No data to delete.")
-                continue
-            clear_specific_category(history)
+            clear_specific_category(history, allow_full_reset=True)
 
         elif sub_choice == "4":
-            manual_resolve(history)
-
-        elif sub_choice == "5":
-            toggle_ego_market_inclusion(history)
-
-        elif sub_choice == "6":
             try:
                 b_path = create_backup()
                 size_kb = os.path.getsize(b_path) / 1024.0
@@ -420,7 +411,7 @@ def handle_delete_data():
             except Exception as e:
                 print(f"[!] Backup failed: {e}")
 
-        elif sub_choice == "7":
+        elif sub_choice == "5":
             backups = list_backups()
             if not backups:
                 print("[!] No .zip backups found. Enter a .zip file path:")
@@ -573,7 +564,7 @@ def toggle_ego_market_inclusion(history):
         res_stats = calculate_prediction_stats(history, sub_mode="resolved", base_ego=curr_ego, refresh_meta=False)
 
         wt_col = "Weight" if w_mode == "UNIFORM" else "Kelly"
-        print("\n" + "=" * 114)
+        print("\n" + "=" * 126)
         print(f"--- EGO CALIBRATION MARKET SELECTOR [Sorted by {sort_label}] ---")
         active_cnt = sum(1 for x in all_settled if not x["excluded"])
         print(f"Current Base Ego: {curr_ego:.3f} ({w_mode} mode) | Active: {active_cnt} / {len(all_settled)} markets")
@@ -586,9 +577,9 @@ def toggle_ego_market_inclusion(history):
                 f"| Bias vs User: {cb_u:+.1f}% "
                 f"| Luck: {lz:+.2f} sigma [{classify_luck_z(lz)}] (Kelly-Wt: {lzw:+.2f} sigma)"
             )
-        print("=" * 114)
-        print(f"{'#':<3} | {'Status':<10} | {'dEgo':<8} | {'Net Adv':<9} | {wt_col:<7} | {'Type':<8} | {'Side':<6} | {'PnL':<10} | {'Question'}")
-        print("-" * 114)
+        print("=" * 126)
+        print(f"{'#':<3} | {'Status':<10} | {'dEgo':<8} | {'Net Adv':<9} | {wt_col:<7} | {'Type':<8} | {'Side':<6} | {'PnL':<10} | {'Date':<10} | {'Question'}")
+        print("-" * 126)
         for i, it in enumerate(all_settled, 1):
             if it["unforecasted"]:
                 st = "[NO-PU]"
@@ -600,9 +591,11 @@ def toggle_ego_market_inclusion(history):
             w_str = f"{w_val:>5.2f}x" if w_mode == "UNIFORM" else f"{w_val*100:>5.2f}%"
             adv_str = f"{it['net_adv']:>+8.4f}"
             dego_str = f"{it['delta_ego']:>+7.4f}"
-            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {w_str:<7} | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {it['question'][:36]}")
+            date_str = str(it.get("date", "unknown"))[:10]
+            print(f"{i:<3} | {st:<10} | {dego_str} | {adv_str} | {w_str:<7} | {it['cat']:<8} | {it['side'][:6]:<6} | ${it['pnl']:>+8.2f} | {date_str:<10} | {it['question'][:36]}")
 
-        sel = input("\n> ").strip()
+        print("adj <#>: kelly | s: sort | sort <col> | reset")
+        sel = input("> ").strip()
         if not sel or sel.lower() == "p":
             break
         elif sel.lower() == "reset":
@@ -642,7 +635,7 @@ def toggle_ego_market_inclusion(history):
                 if 0 <= idx < len(all_settled):
                     target_item = all_settled[idx]
                     curr_k = float(target_item.get("kelly", 0.0) or 0.0)
-                    new_k_raw = input(f"Enter new Kelly % for '{target_item['question'][:30]}' (currently {curr_k*100:.2f}%, e.g. 1.0 for 1%): ").strip()
+                    new_k_raw = input(f"New Kelly % (current {curr_k*100:.2f}%): ").strip()
                     try:
                         clean_k = new_k_raw.strip()
                         if clean_k.endswith("%"):
@@ -708,8 +701,8 @@ def manual_resolve(history):
         q = ensure_list(preds)[0].get("question", "Unknown")
         print(f" [{b_name.upper()}] ID: {m_id} | {q}")
 
-    sel = input("\nEnter Market ID to resolve [Enter to cancel]: ").strip()
-    if not sel or sel not in combined_open:
+    sel = input("\nMarket ID: ").strip()
+    if not sel or sel.lower() == "p" or sel not in combined_open:
         return history
 
     bucket_name, preds = combined_open[sel]
@@ -748,99 +741,116 @@ def settings_menu():
     """Interactive settings and thresholds configurator."""
     active_pid = get_active_profile()
     is_wallet = active_pid.startswith("0x")
-    history = load_history(active_pid)
 
-    print("\n--- SETTINGS / FILTERS ---")
-    print(f" 1: Min Edge       = {cfg.MIN_EDGE*100:.2f}%")
-    print(f" 2: Max Days       = {cfg.MAX_DAYS}")
-    print(f" 3: Min Days       = {cfg.MIN_DAYS}")
-    print(f" 4: Extreme Odds   = {cfg.EXTREME_ODDS*100:.2f}%")
+    while True:
+        history = load_history(active_pid)
 
-    if is_wallet:
-        bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
-        print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}")
-    else:
-        print(f" 5: Paper Bankroll = ${cfg.BANKROLL:,.2f}")
+        print("\n--- SETTINGS / FILTERS ---")
+        print(f" 1: Min Edge       = {cfg.MIN_EDGE*100:.2f}%")
+        print(f" 2: Max Days       = {cfg.MAX_DAYS}")
+        print(f" 3: Min Days       = {cfg.MIN_DAYS}")
+        print(f" 4: Extreme Odds   = {cfg.EXTREME_ODDS*100:.2f}%")
 
-    s_choice = input("> ").strip()
-    if not s_choice or s_choice.lower() == "p":
-        return
-    if s_choice == "1":
-        curr_pct = cfg.MIN_EDGE * 100.0
-        new_raw = input(f"Enter new Min Edge in % (e.g. '1' for 1.0%, '1.5' for 1.5%, currently {curr_pct:.2f}%): ").strip()
-        if new_raw:
-            try:
-                val_clean = new_raw.replace("%", "").strip()
-                raw_f = float(val_clean)
-                new_val = max(0.0, raw_f / 100.0 if ("%" in new_raw or raw_f >= 0.05) else raw_f)
-                cfg.MIN_EDGE = new_val
-                history.setdefault("settings", {})["MIN_EDGE"] = new_val
-                save_history(history, profile_id=active_pid)
-                print(f"[+] Min Edge updated to {new_val*100:.2f}% (edge hurdle: {new_val:.4f}).")
-            except ValueError:
-                print("[!] Invalid percentage - setting unchanged.")
-    elif s_choice == "2":
-        new_raw = input(f"Enter Max Days horizon (currently {cfg.MAX_DAYS}): ").strip()
-        if new_raw:
-            try:
-                new_val = max(0, int(float(new_raw)))
-                cfg.MAX_DAYS = new_val
-                history.setdefault("settings", {})["MAX_DAYS"] = new_val
-                save_history(history, profile_id=active_pid)
-                print(f"[+] Max Days updated to {new_val} days.")
-            except ValueError:
-                print("[!] Invalid integer - setting unchanged.")
-    elif s_choice == "3":
-        new_raw = input(f"Enter Min Days horizon (currently {cfg.MIN_DAYS}): ").strip()
-        if new_raw:
-            try:
-                new_val = max(0, int(float(new_raw)))
-                cfg.MIN_DAYS = new_val
-                history.setdefault("settings", {})["MIN_DAYS"] = new_val
-                save_history(history, profile_id=active_pid)
-                print(f"[+] Min Days updated to {new_val} days.")
-            except ValueError:
-                print("[!] Invalid integer - setting unchanged.")
-    elif s_choice == "4":
-        curr_pct = cfg.EXTREME_ODDS * 100.0
-        new_raw = input(f"Enter Extreme Odds filter in % (e.g. '5' for 5%, '0' to disable, currently {curr_pct:.2f}%): ").strip()
-        if new_raw:
-            try:
-                val_clean = new_raw.replace("%", "").strip()
-                raw_f = float(val_clean)
-                new_val = max(0.0, min(0.45, raw_f / 100.0 if ("%" in new_raw or raw_f >= 0.5) else raw_f))
-                cfg.EXTREME_ODDS = new_val
-                history.setdefault("settings", {})["EXTREME_ODDS"] = new_val
-                save_history(history, profile_id=active_pid)
-                print(f"[+] Extreme Odds filter updated to {new_val*100:.2f}% (skips odds < {new_val*100:.1f}% or > {(1.0-new_val)*100:.1f}%).")
-            except ValueError:
-                print("[!] Invalid percentage - setting unchanged.")
-    elif s_choice == "5":
         if is_wallet:
-            curr_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
-            new_raw = input(f"Enter additional off-platform bankroll in $ (currently +${curr_add:,.2f}, default 0): ").strip()
-            if new_raw:
-                try:
-                    new_add = max(0.0, float(new_raw))
-                    history["bankroll_add"] = new_add
-                    cash_val = float(history.get("wallet_summary", {}).get("cash", 0.0) or 0.0)
-                    pos_val = float(history.get("wallet_summary", {}).get("portfolio", 0.0) or 0.0)
-                    cfg.BANKROLL = round(cash_val + pos_val + new_add, 4)
-                    history.setdefault("wallet_summary", {})["bankroll_add"] = new_add
-                    history["wallet_summary"]["bankroll"] = cfg.BANKROLL
-                    save_history(history, profile_id=active_pid)
-                    print(f"[+] Off-platform bankroll add set to +${new_add:,.2f}. Total Bankroll is now ${cfg.BANKROLL:,.2f}.")
-                except ValueError:
-                    print("[!] Invalid dollar amount.")
+            bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
+            print(f" 5: Bankroll Add   = +${bankroll_add:,.2f}")
         else:
-            new_raw = input(f"New paper sandbox bankroll (currently ${cfg.BANKROLL:,.2f}): ").strip()
-            if new_raw:
+            print(f" 5: Paper Bankroll = ${cfg.BANKROLL:,.2f}")
+        curr_ego_w = str(getattr(cfg, "EGO_WEIGHTING", "uniform") or "uniform").lower()
+        print(f" 6: Ego Weighting  = {curr_ego_w}")
+
+        s_choice = input("> ").strip()
+        if not s_choice or s_choice.lower() == "p":
+            return
+        if s_choice == "1":
+            curr_pct = cfg.MIN_EDGE * 100.0
+            new_raw = input(f"Min Edge % ({curr_pct:.2f}%): ").strip()
+            if new_raw and new_raw.lower() != "p":
                 try:
-                    new_val = max(1.0, float(new_raw))
-                    cfg.BANKROLL = new_val
-                    history.setdefault("wallet_summary", {})["bankroll"] = new_val
-                    history["wallet_summary"]["cash"] = new_val
+                    val_clean = new_raw.replace("%", "").strip()
+                    raw_f = float(val_clean)
+                    new_val = max(0.0, raw_f / 100.0 if ("%" in new_raw or raw_f >= 0.05) else raw_f)
+                    cfg.MIN_EDGE = new_val
+                    history.setdefault("settings", {})["MIN_EDGE"] = new_val
                     save_history(history, profile_id=active_pid)
-                    print(f"[+] Paper bankroll updated to ${new_val:,.2f}.")
+                    print(f"[+] Min Edge updated to {new_val*100:.2f}% (edge hurdle: {new_val:.4f}).")
                 except ValueError:
-                    print("[!] Invalid value.")
+                    print("[!] Invalid percentage - setting unchanged.")
+        elif s_choice == "2":
+            new_raw = input(f"Max Days ({cfg.MAX_DAYS}): ").strip()
+            if new_raw and new_raw.lower() != "p":
+                try:
+                    new_val = max(0, int(float(new_raw)))
+                    cfg.MAX_DAYS = new_val
+                    history.setdefault("settings", {})["MAX_DAYS"] = new_val
+                    save_history(history, profile_id=active_pid)
+                    print(f"[+] Max Days updated to {new_val} days.")
+                except ValueError:
+                    print("[!] Invalid integer - setting unchanged.")
+        elif s_choice == "3":
+            new_raw = input(f"Min Days ({cfg.MIN_DAYS}): ").strip()
+            if new_raw and new_raw.lower() != "p":
+                try:
+                    new_val = max(0, int(float(new_raw)))
+                    cfg.MIN_DAYS = new_val
+                    history.setdefault("settings", {})["MIN_DAYS"] = new_val
+                    save_history(history, profile_id=active_pid)
+                    print(f"[+] Min Days updated to {new_val} days.")
+                except ValueError:
+                    print("[!] Invalid integer - setting unchanged.")
+        elif s_choice == "4":
+            curr_pct = cfg.EXTREME_ODDS * 100.0
+            new_raw = input(f"Extreme Odds % ({curr_pct:.2f}%, 0=off): ").strip()
+            if new_raw and new_raw.lower() != "p":
+                try:
+                    val_clean = new_raw.replace("%", "").strip()
+                    raw_f = float(val_clean)
+                    new_val = max(0.0, min(0.45, raw_f / 100.0 if ("%" in new_raw or raw_f >= 0.5) else raw_f))
+                    cfg.EXTREME_ODDS = new_val
+                    history.setdefault("settings", {})["EXTREME_ODDS"] = new_val
+                    save_history(history, profile_id=active_pid)
+                    print(f"[+] Extreme Odds filter updated to {new_val*100:.2f}% (skips odds < {new_val*100:.1f}% or > {(1.0-new_val)*100:.1f}%).")
+                except ValueError:
+                    print("[!] Invalid percentage - setting unchanged.")
+        elif s_choice == "5":
+            if is_wallet:
+                curr_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
+                new_raw = input(f"Off-platform bankroll $ (+${curr_add:,.2f}): ").strip()
+                if new_raw and new_raw.lower() != "p":
+                    try:
+                        new_add = max(0.0, float(new_raw))
+                        history["bankroll_add"] = new_add
+                        cash_val = float(history.get("wallet_summary", {}).get("cash", 0.0) or 0.0)
+                        pos_val = float(history.get("wallet_summary", {}).get("portfolio", 0.0) or 0.0)
+                        cfg.BANKROLL = round(cash_val + pos_val + new_add, 4)
+                        history.setdefault("wallet_summary", {})["bankroll_add"] = new_add
+                        history["wallet_summary"]["bankroll"] = cfg.BANKROLL
+                        save_history(history, profile_id=active_pid)
+                        print(f"[+] Off-platform bankroll add set to +${new_add:,.2f}. Total Bankroll is now ${cfg.BANKROLL:,.2f}.")
+                    except ValueError:
+                        print("[!] Invalid dollar amount.")
+            else:
+                new_raw = input(f"Paper bankroll $ (${cfg.BANKROLL:,.2f}): ").strip()
+                if new_raw and new_raw.lower() != "p":
+                    try:
+                        new_val = max(1.0, float(new_raw))
+                        cfg.BANKROLL = new_val
+                        history.setdefault("wallet_summary", {})["bankroll"] = new_val
+                        history["wallet_summary"]["cash"] = new_val
+                        save_history(history, profile_id=active_pid)
+                        print(f"[+] Paper bankroll updated to ${new_val:,.2f}.")
+                    except ValueError:
+                        print("[!] Invalid value.")
+        elif s_choice == "6":
+            new_raw = input(f"Ego Weighting [uniform/kelly] ({curr_ego_w}): ").strip().lower()
+            if new_raw and new_raw != "p":
+                mode_map = {"u": "uniform", "uniform": "uniform", "1": "uniform", "k": "kelly", "kelly": "kelly", "2": "kelly"}
+                new_mode = mode_map.get(new_raw)
+                if new_mode:
+                    cfg.EGO_WEIGHTING = new_mode
+                    history.setdefault("settings", {})["EGO_WEIGHTING"] = new_mode
+                    save_history(history, profile_id=active_pid)
+                    desc = "equal weight per forecast" if new_mode == "uniform" else "weighted by backed Kelly"
+                    print(f"[+] Ego Weighting updated to '{new_mode}' ({desc}).")
+                else:
+                    print("[!] Invalid mode (enter 'uniform' or 'kelly') - setting unchanged.")

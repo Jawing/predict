@@ -211,7 +211,7 @@ class TestViewsPredictionStats(unittest.TestCase):
         # Also verify toggling expand ('x') and sort ('s edge') re-renders without rebuilding rows
         tbl_buf = io.StringIO()
         with patch("views._build_review_rows", wraps=views._build_review_rows) as spy_build, \
-             patch("builtins.input", side_effect=["x", "s edge", ""]), \
+             patch("builtins.input", side_effect=["99", "x", "s edge", ""]), \
              redirect_stdout(tbl_buf):
             ret_enter = views.print_review_table(history, sub_mode="predicted", refresh_meta=False)
         self.assertIsNone(ret_enter)
@@ -220,6 +220,8 @@ class TestViewsPredictionStats(unittest.TestCase):
         self.assertEqual(ret_prev, "p")
         tbl_out = tbl_buf.getvalue()
         self.assertEqual(spy_build.call_count, 1)
+        self.assertIn("s: sort | x: expand | l: live | d <#>: details | u <#>: undo", tbl_out)
+        self.assertIn("Row number out of range (1-3).", tbl_out)
         self.assertIn("WATCH (No Edge:", tbl_out)
         self.assertNotIn("EXEC BUY $0", tbl_out)
         self.assertIn("Full: Zero Edge Watch", tbl_out)
@@ -614,6 +616,10 @@ class TestStorageBackupAndRestore(unittest.TestCase):
             out = buf.getvalue()
             self.assertIn("Weight", out)
             self.assertIn("1.00x", out)
+            self.assertIn("Date", out)
+            self.assertIn("2026-01-01", out)
+            self.assertIn("2026-01-02", out)
+            self.assertIn("adj <#>: kelly | s: sort | sort <col> | reset", out)
             self.assertIn("[NO-PU]", out)
             self.assertIn("Active: 1 / 2 markets", out)
             self.assertIn("stays excluded from Base Ego", out)
@@ -621,6 +627,143 @@ class TestStorageBackupAndRestore(unittest.TestCase):
             self.assertFalse(history["resolved"]["m_real"][0]["exclude_from_ego"])
         finally:
             cfg.EGO_WEIGHTING = orig_ego_w
+
+    def test_settings_menu_ego_weighting_persists_and_restores(self):
+        orig_dir = cfg.HISTORY_DIR
+        orig_active = cfg.ACTIVE_PROFILE_FILE
+        orig_ego_w = cfg.EGO_WEIGHTING
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.HISTORY_DIR = tmp
+            cfg.ACTIVE_PROFILE_FILE = os.path.join(tmp, "active_profile.txt")
+            try:
+                storage.set_active_profile("paper_ego")
+                storage.save_history({"predicted": {}, "exited": {}, "resolved": {}, "skipped": {}}, profile_id="paper_ego")
+                cfg.EGO_WEIGHTING = "uniform"
+
+                with patch("builtins.input", side_effect=["6", "kelly", "6", "invalid", "p"]):
+                    manage.settings_menu()
+                self.assertEqual(cfg.EGO_WEIGHTING, "kelly")
+
+                cfg.EGO_WEIGHTING = "uniform"
+                reloaded = storage.load_history("paper_ego")
+                self.assertEqual(reloaded["settings"]["EGO_WEIGHTING"], "kelly")
+                self.assertEqual(cfg.EGO_WEIGHTING, "kelly")
+            finally:
+                cfg.HISTORY_DIR = orig_dir
+                cfg.ACTIVE_PROFILE_FILE = orig_active
+                cfg.EGO_WEIGHTING = orig_ego_w
+
+    def test_save_history_handles_nan_and_inf_fallback(self):
+        orig_dir = cfg.HISTORY_DIR
+        orig_active = cfg.ACTIVE_PROFILE_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.HISTORY_DIR = tmp
+            cfg.ACTIVE_PROFILE_FILE = os.path.join(tmp, "active_profile.txt")
+            try:
+                storage.set_active_profile("nan_prof")
+                storage.save_history(
+                    {"predicted": {"m1": [{"apy": float("inf"), "edge": float("nan")}]}, "exited": {}, "resolved": {}, "skipped": {}},
+                    profile_id="nan_prof",
+                )
+                loaded = storage.load_history("nan_prof")
+                self.assertEqual(loaded["predicted"]["m1"][0]["apy"], "Infinity")
+                self.assertEqual(loaded["predicted"]["m1"][0]["edge"], "NaN")
+            finally:
+                cfg.HISTORY_DIR = orig_dir
+                cfg.ACTIVE_PROFILE_FILE = orig_active
+
+    def test_auto_prune_persists_timestamp_across_reload(self):
+        orig_dir = cfg.HISTORY_DIR
+        orig_active = cfg.ACTIVE_PROFILE_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.HISTORY_DIR = tmp
+            cfg.ACTIVE_PROFILE_FILE = os.path.join(tmp, "active_profile.txt")
+            try:
+                storage.set_active_profile("prune_prof")
+                storage.save_history(
+                    {"predicted": {}, "exited": {}, "resolved": {}, "skipped": {"m_skip": {"question": "Q", "endDate": "2030-01-01T00:00:00Z"}}},
+                    profile_id="prune_prof",
+                )
+                with patch("manage.prune_closed_skipped_markets", return_value=0) as mock_prune:
+                    h1 = storage.load_history("prune_prof")
+                    views.auto_prune_closed_markets(h1)
+                    self.assertEqual(mock_prune.call_count, 1)
+
+                    h2 = storage.load_history("prune_prof")
+                    views.auto_prune_closed_markets(h2)
+                    self.assertEqual(mock_prune.call_count, 1)
+            finally:
+                cfg.HISTORY_DIR = orig_dir
+                cfg.ACTIVE_PROFILE_FILE = orig_active
+
+    @patch("views.save_history")
+    def test_ensure_predicted_metadata_uses_prefetched_and_skips_exited_clob(self, _mock_save):
+        called_urls = []
+
+        def fake_get(url, timeout=5):
+            called_urls.append(url)
+            if "clob.polymarket.com/book" in url:
+                return unittest.mock.MagicMock(
+                    status_code=200,
+                    json=lambda: {
+                        "bids": [{"price": "0.49", "size": "100"}],
+                        "asks": [{"price": "0.51", "size": "100"}],
+                    },
+                )
+            raise AssertionError(f"Unexpected Gamma HTTP call: {url}")
+
+        prefetched = {
+            "m_pred": {
+                "id": "m_pred", "closed": False, "active": True,
+                "outcomePrices": '["0.50", "0.50"]', "bestBid": 0.49, "bestAsk": 0.51,
+                "clobTokenIds": '["tok_pred_yes", "tok_pred_no"]', "endDate": "2030-01-01T00:00:00Z",
+            },
+            "m_exit": {
+                "id": "m_exit", "closed": False, "active": True,
+                "outcomePrices": '["0.60", "0.40"]', "bestBid": 0.59, "bestAsk": 0.61,
+                "clobTokenIds": '["tok_exit_yes", "tok_exit_no"]', "endDate": "2030-01-01T00:00:00Z",
+            },
+        }
+        history = {
+            "predicted": {"m_pred": [{"pu": 0.7, "pm": 0.5, "position": "Yes", "clobTokenIds": '["tok_pred_yes", "tok_pred_no"]'}]},
+            "exited": {"m_exit": [{"pu": 0.7, "pm": 0.5, "exited": True, "position": "Yes", "clobTokenIds": '["tok_exit_yes", "tok_exit_no"]'}]},
+            "resolved": {},
+            "skipped": {},
+        }
+        with patch.object(cfg.api, "get", side_effect=fake_get):
+            views.ensure_predicted_market_metadata(history, fetch_clob=True, prefetched_markets=prefetched)
+
+        self.assertEqual(len(called_urls), 1)
+        self.assertIn("tok_pred_yes", called_urls[0])
+        self.assertNotIn("tok_exit_yes", called_urls[0])
+        self.assertEqual(history["exited"]["m_exit"][0]["cur_pm"], 0.6)
+
+    def test_streamlined_data_management_clear_and_reset(self):
+        orig_dir = cfg.HISTORY_DIR
+        orig_active = cfg.ACTIVE_PROFILE_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.HISTORY_DIR = tmp
+            cfg.ACTIVE_PROFILE_FILE = os.path.join(tmp, "active_profile.txt")
+            try:
+                storage.set_active_profile("dm_prof")
+                storage.save_history(
+                    {
+                        "predicted": {"m1": [{"pu": 0.6, "pm": 0.5}]},
+                        "exited": {},
+                        "resolved": {},
+                        "skipped": {"m_sk": {"question": "Skip"}},
+                    },
+                    profile_id="dm_prof",
+                )
+                # Option 3 -> 4 (Clear Skipped) -> CONFIRM -> Option 3 -> 5 (Reset Entire Profile) -> CONFIRM -> p (exit)
+                with patch("builtins.input", side_effect=["3", "4", "CONFIRM", "3", "5", "CONFIRM", "p"]):
+                    manage.handle_delete_data()
+                after = storage.load_history("dm_prof")
+                self.assertEqual(after["predicted"], {})
+                self.assertEqual(after["skipped"], {})
+            finally:
+                cfg.HISTORY_DIR = orig_dir
+                cfg.ACTIVE_PROFILE_FILE = orig_active
 
 
 if __name__ == "__main__":

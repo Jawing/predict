@@ -1,4 +1,5 @@
 """Portfolio and history display tables, aggregate variance metrics, and top-of-menu dashboard."""
+import concurrent.futures
 import math
 from datetime import datetime, timezone
 import config as cfg
@@ -21,6 +22,8 @@ from model import (
 
 def auto_prune_closed_markets(history, force=False):
     """Silently audits and prunes closed/resolved markets from skipped history in background."""
+    if not isinstance(history, dict) or not history.get("skipped"):
+        return 0
     now_ts = datetime.now(timezone.utc).timestamp()
     last_ts = history.get("_last_skipped_prune", 0.0)
     if not force and (now_ts - last_ts < 300):
@@ -29,14 +32,14 @@ def auto_prune_closed_markets(history, force=False):
         from manage import prune_closed_skipped_markets
         pruned = prune_closed_skipped_markets(history, verbose=False)
         history["_last_skipped_prune"] = now_ts
-        if pruned > 0:
-            save_history(history)
+        if pruned > 0 or history.get("profile_id"):
+            save_history(history, profile_id=history.get("profile_id"))
         return pruned
     except Exception:
         return 0
 
 
-def ensure_predicted_market_metadata(history, fetch_clob=True, base_ego=None):
+def ensure_predicted_market_metadata(history, fetch_clob=True, base_ego=None, prefetched_markets=None):
     """Enriches predicted and exited (unresolved) markets with live prices, spread, endDate, and volume from Gamma API in bulk."""
     predicted_dict = history.get("predicted", {})
     exited_dict = history.get("exited", {})
@@ -87,82 +90,94 @@ def ensure_predicted_market_metadata(history, fetch_clob=True, base_ego=None):
             del exited_dict[mid]
             changed = True
 
+    resp_map = dict(prefetched_markets) if isinstance(prefetched_markets, dict) else {}
+    missing_ids = [mid for mid in m_ids if mid not in resp_map]
+
     chunk_size = 40
-    for i in range(0, len(m_ids), chunk_size):
-        chunk = m_ids[i:i + chunk_size]
+    chunks = [missing_ids[i:i + chunk_size] for i in range(0, len(missing_ids), chunk_size)]
+
+    def _fetch_gamma_chunk(chunk):
         try:
             url = f"{cfg.GAMMA_API}/markets?" + "&".join(f"id={mid}" for mid in chunk)
             resp = cfg.api.get(url, timeout=5).json()
             if isinstance(resp, list):
-                resp_map = {str(item.get("id")): item for item in resp if item.get("id")}
-                for mid in chunk:
-                    if mid not in resp_map:
-                        continue
-                    m_data = resp_map[mid]
-                    prices = parse_outcome_prices(m_data)
-                    best_bid = float(m_data.get("bestBid") or 0.0) if m_data.get("bestBid") is not None else None
-                    best_ask = float(m_data.get("bestAsk") or 0.0) if m_data.get("bestAsk") is not None else None
-                    spread = float(m_data.get("spread") or 0.0) if m_data.get("spread") is not None else None
-                    end_d = m_data.get("endDate")
-                    vol = float(m_data.get("volume") or 0.0)
-                    vol24 = float(m_data.get("volume24hr") or 0.0)
-                    closed = bool(m_data.get("closed", False))
-
-                    preds = ensure_list(predicted_dict.get(mid, [])) + ensure_list(exited_dict.get(mid, []))
-                    for p in preds:
-                        pos = p.get("position", "Yes")
-                        is_no = (pos == "No")
-                        if is_no:
-                            live_p = prices[1] if len(prices) >= 2 else (1.0 - prices[0] if prices else None)
-                            live_bid = round(1.0 - best_ask, 4) if best_ask is not None else None
-                            live_ask = round(1.0 - best_bid, 4) if best_bid is not None else None
-                        else:
-                            live_p = prices[0] if prices else None
-                            live_bid = best_bid
-                            live_ask = best_ask
-
-                        if live_p is not None and live_p != p.get("cur_pm"):
-                            p["cur_pm"] = round(live_p, 6)
-                            changed = True
-
-                        if live_bid is not None and p.get("bestBid") != live_bid:
-                            p["bestBid"] = live_bid
-                            changed = True
-                        if live_ask is not None and p.get("bestAsk") != live_ask:
-                            p["bestAsk"] = live_ask
-                            changed = True
-                        if spread is not None and p.get("spread") != spread:
-                            p["spread"] = spread
-                            changed = True
-                        if end_d and p.get("endDate") != end_d:
-                            p["endDate"] = end_d
-                            changed = True
-                        if p.get("volume") != vol:
-                            p["volume"] = vol
-                            changed = True
-                        if p.get("volume24hr") != vol24:
-                            p["volume24hr"] = vol24
-                            changed = True
-                        clob_toks = m_data.get("clobTokenIds")
-                        if clob_toks and p.get("clobTokenIds") != clob_toks:
-                            p["clobTokenIds"] = clob_toks
-                            changed = True
-                        if closed and not p.get("closed"):
-                            p["closed"] = True
-                            changed = True
-                        if "fee_rate" not in p or p.get("fee_rate") is None:
-                            f_rate_m = (m_data.get("feeSchedule") or {}).get("rate")
-                            if f_rate_m is None:
-                                f_val = float(m_data.get("makerBaseFee") or 0.0)
-                                f_rate_m = f_val / 1e18 if f_val > 1 else f_val
-                            p["fee_rate"] = float(f_rate_m or 0.0)
-                            changed = True
+                return {str(item.get("id")): item for item in resp if item.get("id")}
         except Exception:
             pass
+        return {}
 
-    # Fetch live CLOB L2 books in parallel & calculate exact VWAP & optimal immediate market-buy for all active markets
-    if fetch_clob and (predicted_dict or exited_dict):
-        import concurrent.futures
+    if len(chunks) == 1:
+        resp_map.update(_fetch_gamma_chunk(chunks[0]))
+    elif chunks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
+            for part_map in executor.map(_fetch_gamma_chunk, chunks):
+                resp_map.update(part_map)
+
+    for mid in m_ids:
+        if mid not in resp_map:
+            continue
+        m_data = resp_map[mid]
+        prices = parse_outcome_prices(m_data)
+        best_bid = float(m_data.get("bestBid") or 0.0) if m_data.get("bestBid") is not None else None
+        best_ask = float(m_data.get("bestAsk") or 0.0) if m_data.get("bestAsk") is not None else None
+        spread = float(m_data.get("spread") or 0.0) if m_data.get("spread") is not None else None
+        end_d = m_data.get("endDate")
+        vol = float(m_data.get("volume") or 0.0)
+        vol24 = float(m_data.get("volume24hr") or 0.0)
+        closed = bool(m_data.get("closed", False))
+
+        preds = ensure_list(predicted_dict.get(mid, [])) + ensure_list(exited_dict.get(mid, []))
+        for p in preds:
+            pos = p.get("position", "Yes")
+            is_no = (pos == "No")
+            if is_no:
+                live_p = prices[1] if len(prices) >= 2 else (1.0 - prices[0] if prices else None)
+                live_bid = round(1.0 - best_ask, 4) if best_ask is not None else None
+                live_ask = round(1.0 - best_bid, 4) if best_bid is not None else None
+            else:
+                live_p = prices[0] if prices else None
+                live_bid = best_bid
+                live_ask = best_ask
+
+            if live_p is not None and live_p != p.get("cur_pm"):
+                p["cur_pm"] = round(live_p, 6)
+                changed = True
+
+            if live_bid is not None and p.get("bestBid") != live_bid:
+                p["bestBid"] = live_bid
+                changed = True
+            if live_ask is not None and p.get("bestAsk") != live_ask:
+                p["bestAsk"] = live_ask
+                changed = True
+            if spread is not None and p.get("spread") != spread:
+                p["spread"] = spread
+                changed = True
+            if end_d and p.get("endDate") != end_d:
+                p["endDate"] = end_d
+                changed = True
+            if p.get("volume") != vol:
+                p["volume"] = vol
+                changed = True
+            if p.get("volume24hr") != vol24:
+                p["volume24hr"] = vol24
+                changed = True
+            clob_toks = m_data.get("clobTokenIds")
+            if clob_toks and p.get("clobTokenIds") != clob_toks:
+                p["clobTokenIds"] = clob_toks
+                changed = True
+            if closed and not p.get("closed"):
+                p["closed"] = True
+                changed = True
+            if "fee_rate" not in p or p.get("fee_rate") is None:
+                f_rate_m = (m_data.get("feeSchedule") or {}).get("rate")
+                if f_rate_m is None:
+                    f_val = float(m_data.get("makerBaseFee") or 0.0)
+                    f_rate_m = f_val / 1e18 if f_val > 1 else f_val
+                p["fee_rate"] = float(f_rate_m or 0.0)
+                changed = True
+
+    # Fetch live CLOB L2 books in parallel & calculate exact VWAP & optimal immediate market-buy for active markets
+    if fetch_clob and predicted_dict:
         from model import calculate_vwap, calculate_optimal_market_buy, calculate_logistic_metrics, calculate_dynamic_kelly_action
         from market import get_market_clob_tokens
 
@@ -171,17 +186,16 @@ def ensure_predicted_market_metadata(history, fetch_clob=True, base_ego=None):
         min_edge_th = float(getattr(cfg, "MIN_EDGE", 0.01))
 
         clob_tasks = []
-        for bucket_d in (predicted_dict, exited_dict):
-            for mid, preds_list in bucket_d.items():
-                for p in ensure_list(preds_list):
-                    clob_ids = p.get("clobTokenIds")
-                    if not clob_ids:
-                        continue
-                    yes_tok, no_tok = get_market_clob_tokens({"clobTokenIds": clob_ids})
-                    pos = p.get("position", "Yes")
-                    target_token = no_tok if pos == "No" else yes_tok
-                    if target_token:
-                        clob_tasks.append((p, target_token))
+        for mid, preds_list in predicted_dict.items():
+            for p in ensure_list(preds_list):
+                clob_ids = p.get("clobTokenIds")
+                if not clob_ids:
+                    continue
+                yes_tok, no_tok = get_market_clob_tokens({"clobTokenIds": clob_ids})
+                pos = p.get("position", "Yes")
+                target_token = no_tok if pos == "No" else yes_tok
+                if target_token:
+                    clob_tasks.append((p, target_token))
 
         def _fetch_single_clob(item_tuple):
             p, target_token = item_tuple
@@ -1421,6 +1435,18 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
 
         _render_review_table(rows, history, sub_mode, base_ego, sort_by, expanded)
 
+        range_str = f"({len(rows)})" if len(rows) == 1 else f"(1-{len(rows)})"
+        keys = []
+        if sub_mode in ("predicted", "exited", "resolved", "all"):
+            keys.extend(["s: sort", "x: expand", "l: live", "d <#>: details"])
+            if sub_mode == "predicted":
+                keys.append("u <#>: undo")
+            if sub_mode in ("resolved", "exited", "all"):
+                keys.append("cal: ego")
+        else:
+            keys.extend(["x: expand", "d <#>: details"])
+        print(" | ".join(keys))
+
         act = input("> ").strip()
         act_low = act.lower()
 
@@ -1450,27 +1476,29 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                 }
                 seq = cycle_map.get(sub_mode, ["date", "kelly", "edge", "cey"])
                 next_s = seq[(seq.index(sort_by) + 1) % len(seq)] if sort_by in seq else seq[0]
-                vel_h = "  [5] Velocity (Edge/d)" if sub_mode in ("predicted", "all") else ""
-                ego_h = "  [6] Ego Impact (Log-Loss)" if sub_mode in ("resolved", "exited", "all") else ""
+                vel_h = "  [5] Velocity" if sub_mode in ("predicted", "all") else ""
+                ego_h = "  [6] Ego Impact" if sub_mode in ("resolved", "exited", "all") else ""
                 cey_h = "  [7] CEY"
                 d_lbl = "Last PU Date" if sub_mode == "predicted" else "Date"
-                s_in = input(f"Sort '{sub_mode}' by: [1] {d_lbl}  [2] Kelly  [3] Edge  [4] Exit Proximity{vel_h}{ego_h}{cey_h} [Enter -> {next_s.upper()}]: ").strip().lower()
+                print(f"Sort: [1] {d_lbl}  [2] Kelly  [3] Edge  [4] Exit Prox{vel_h}{ego_h}{cey_h}  [Enter: {next_s.upper()}]")
+                s_in = input("> ").strip().lower()
                 sort_by = sort_map.get(s_in, next_s) if s_in else next_s
         elif act_low in ("l", "live", "refresh") and sub_mode in ("predicted", "exited", "resolved", "all"):
             active_pid = history.get("profile_id") or get_active_profile()
+            gamma_cache = {}
             if active_pid and str(active_pid).startswith("0x"):
                 from wallet import import_polymarket_positions, update_resolutions
                 print(f"[*] Syncing live wallet & resolutions for '{active_pid[:6]}...{active_pid[-4:]}'...")
                 history = import_polymarket_positions(active_pid, history, auto_sync=True)
-                history = update_resolutions(history)
+                history = update_resolutions(history, market_cache=gamma_cache)
                 save_history(history, profile_id=active_pid)
             else:
                 from wallet import update_resolutions
-                history = update_resolutions(history)
+                history = update_resolutions(history, market_cache=gamma_cache)
                 save_history(history)
             if sub_mode in ("predicted", "all"):
                 print("[*] Refreshing live CLOB orderbooks & VWAP for active markets...")
-                ensure_predicted_market_metadata(history, fetch_clob=True)
+                ensure_predicted_market_metadata(history, fetch_clob=True, prefetched_markets=gamma_cache)
             needs_rebuild = True
             pending_refresh = False
         elif act_low.startswith("d ") or act_low.startswith("details "):
@@ -1479,11 +1507,11 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                 d_idx = int(parts[1]) - 1
                 if 0 <= d_idx < len(rows):
                     _print_single_market_details(rows[d_idx])
-                    input("\nPress Enter to return to table: ")
+                    input("\n> ")
                 else:
                     print(f"[!] Row number out of range {range_str}.")
             else:
-                print("[!] Usage: 'd <row#>' (e.g. 'd 1')")
+                print("[!] Format: 'd <#>'")
         elif (act_low.startswith("u ") or act_low.startswith("undo ")) and sub_mode == "predicted":
             parts = act.split()
             if len(parts) > 1 and parts[1].isdigit():
@@ -1513,7 +1541,7 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                 else:
                     print(f"[!] Row number out of range {range_str}.")
             else:
-                print("[!] Usage: 'u <row#>' (e.g. 'u 2')")
+                print("[!] Format: 'u <#>'")
         elif act_low in ("cal", "ego", "e"):
             from manage import toggle_ego_market_inclusion
             toggle_ego_market_inclusion(history)
@@ -1524,7 +1552,7 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
                 sel_r = rows[row_num - 1]
                 if sel_r.get("Mode") == "resolved":
                     _print_single_market_details(sel_r)
-                    input("\nPress Enter to return to table: ")
+                    input("\n> ")
                 else:
                     _handle_targeted_predict(rows, preselected_idx=row_num - 1)
                     history = load_history()
@@ -1533,14 +1561,14 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
             else:
                 print(f"[!] Row number out of range {range_str}.")
         else:
-            print("[!] Unknown command. Enter a row #, command, or press Enter for Main Menu.")
+            print("[!] Invalid command.")
 
 def _handle_targeted_predict(rows, preselected_idx=None):
     """Launches targeted prediction on a specific table row."""
     if preselected_idx is not None:
         sel_idx = preselected_idx
     else:
-        sel_str = input(f"Select row # to predict / update (1-{len(rows)}) [Enter to cancel]: ").strip()
+        sel_str = input(f"Row # (1-{len(rows)}): ").strip()
         if not sel_str.isdigit():
             return
         sel_idx = int(sel_str) - 1

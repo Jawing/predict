@@ -24,6 +24,7 @@ from model import (
 from market import (
     get_wallet_usdc_balance,
     get_wallet_portfolio_value,
+    sum_positions_value,
     resolve_position_market_metadata,
     determine_redeemable_outcome,
 )
@@ -795,7 +796,7 @@ def _prompt_and_import_new_positions(history, to_import, wallet_address, base_eg
         n_open_imp = len(to_import) - n_res_imp - n_ex_imp
         imp_ans = input(
             f"\n[?] Found {len(to_import)} unimported wallet position(s) "
-            f"({n_open_imp} active, {n_ex_imp} exited, {n_res_imp} resolved). Import now? (y/n) [Enter=n]: "
+            f"({n_open_imp} active, {n_ex_imp} exited, {n_res_imp} resolved). Import? (y/n): "
         ).strip().lower()
         if imp_ans != "y":
             return 0, 0, 0
@@ -840,12 +841,10 @@ def _prompt_and_import_new_positions(history, to_import, wallet_address, base_eg
                 lower, upper = avg_price, avg_price
                 unforecasted = True
                 break
-            pu_input = input(
-                "         Enter your subjective probability bounds % (e.g., 60-70 or 65), "
-                "'b' (back), 'a' (skip all), 'q' (quit), or enter to skip: "
-            ).strip()
+            print("         b/p: back | a: skip all | q: quit")
+            pu_input = input("         % > ").strip()
             cmd = pu_input.lower()
-            if cmd in ("b", "back", "r", "redo"):
+            if cmd in ("b", "back", "p", "r", "redo"):
                 if idx > 0:
                     idx -= 1
                     if idx in imported_records:
@@ -882,7 +881,7 @@ def _prompt_and_import_new_positions(history, to_import, wallet_address, base_eg
                 lower, upper = parse_user_input(pu_input)
                 break
             except ValueError as e:
-                print(f"         [!] Error: {e}. Please try again (or enter 'b' to go back, enter to skip).")
+                print(f"         [!] Error: {e}")
             except Exception as e:
                 print(f"         [!] Error: {e}. Please try again.")
 
@@ -923,8 +922,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             wallet_address = saved_wallet
         else:
             prompt_str = (
-                f"Enter Polymarket wallet address (0x...) [Press Enter for {saved_wallet}]: "
-                if saved_wallet else "Enter Polymarket wallet address (0x...): "
+                f"Wallet 0x... ({saved_wallet}): "
+                if saved_wallet else "Wallet (0x...): "
             )
             user_w = input(prompt_str).strip()
             wallet_address = user_w if user_w else saved_wallet
@@ -942,11 +941,12 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
     base_ego = calculate_base_ego(history)
     print(f"[*] Syncing Polymarket wallet {linked_wallet}...")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         fut_open = executor.submit(fetch_v2_positions, wallet_address, "OPEN")
         fut_closed = executor.submit(fetch_v2_positions, wallet_address, "CLOSED")
         fut_trades = executor.submit(fetch_wallet_trades, wallet_address)
         fut_cash = executor.submit(get_wallet_usdc_balance, wallet_address)
+        fut_port = executor.submit(get_wallet_portfolio_value, wallet_address, None)
 
         open_positions = fut_open.result()
         closed_positions = fut_closed.result()
@@ -955,6 +955,7 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         except Exception:
             trades_by_cond = {}
         cash_balance = fut_cash.result()
+        portfolio_value = fut_port.result()
 
     if open_positions is None:
         print("[!] Network error fetching open positions from Polymarket. Preserving existing active portfolio state.")
@@ -968,7 +969,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
     prev_bankroll = get_effective_bankroll(history, cfg.BANKROLL)
     if cash_balance is None:
         cash_balance = history.get("wallet_summary", {}).get("cash", 0.0)
-    portfolio_value = get_wallet_portfolio_value(wallet_address, open_positions)
+    if portfolio_value is None:
+        portfolio_value = sum_positions_value(open_positions)
 
     bankroll_add = float(history.get("bankroll_add", 0.0) or history.get("wallet_summary", {}).get("bankroll_add", 0.0) or 0.0)
     total_bankroll = round(cash_balance + portfolio_value + bankroll_add, 4)
@@ -1001,7 +1003,43 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
     to_import = []
     resolved_by_cond, exited_by_cond, predicted_by_cond = index_history_by_condition(history)
 
-    for pos in positions:
+    # Pre-resolve market metadata concurrently per unique parent event before main loop
+    prefetched_meta = {}
+    rep_by_event = {}
+    deferred_indices = []
+    for p_idx, pos in enumerate(positions):
+        cond_id = pos.get("conditionId")
+        if not cond_id:
+            continue
+        c_id_lower = cond_id.lower()
+        is_from_closed = bool(pos.get("_from_closed"))
+        if c_id_lower in resolved_by_cond:
+            continue
+        if is_from_closed and c_id_lower in exited_by_cond:
+            continue
+        if c_id_lower in predicted_by_cond:
+            continue
+        ev_key = pos.get("eventId") or pos.get("eventSlug")
+        if ev_key and ev_key in rep_by_event:
+            deferred_indices.append((p_idx, pos))
+        else:
+            if ev_key:
+                rep_by_event[ev_key] = p_idx
+            prefetched_meta[p_idx] = pos
+
+    if len(prefetched_meta) > 1:
+        rep_items = list(prefetched_meta.items())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(rep_items))) as meta_exec:
+            rep_results = list(meta_exec.map(lambda it: (it[0], resolve_position_market_metadata(it[1], event_cache)), rep_items))
+        prefetched_meta = dict(rep_results)
+    elif len(prefetched_meta) == 1:
+        only_idx, only_pos = next(iter(prefetched_meta.items()))
+        prefetched_meta = {only_idx: resolve_position_market_metadata(only_pos, event_cache)}
+
+    for p_idx, pos in deferred_indices:
+        prefetched_meta[p_idx] = resolve_position_market_metadata(pos, event_cache)
+
+    for p_idx, pos in enumerate(positions):
         cond_id = pos.get("conditionId")
         if not cond_id:
             continue
@@ -1041,6 +1079,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
             question = p_ref.get("question") or pos.get("title") or "unknown"
             slug = p_ref.get("slug") or pos.get("slug") or "unknown"
             end_date = p_ref.get("endDate") or pos.get("endDate")
+        elif p_idx in prefetched_meta:
+            m, market_id, question, slug, end_date = prefetched_meta[p_idx]
         else:
             m, market_id, question, slug, end_date = resolve_position_market_metadata(pos, event_cache)
 
@@ -1054,7 +1094,16 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
         days_until = days_until or 0.0
 
         already_stored = False
-        for m_id in list(history.get("predicted", {}).keys()):
+        cand_mids = []
+        for m_id_hit, _ in predicted_by_cond.get(c_id_lower, ()):
+            if m_id_hit not in cand_mids:
+                cand_mids.append(m_id_hit)
+        if market_id and str(market_id) in history.get("predicted", {}) and str(market_id) not in cand_mids:
+            cand_mids.append(str(market_id))
+
+        for m_id in cand_mids:
+            if m_id not in history.get("predicted", {}):
+                continue
             preds_list = ensure_list(history["predicted"][m_id])
             matching_preds = [
                 p for p in preds_list
@@ -1118,6 +1167,8 @@ def import_polymarket_positions(wallet_address, history, auto_sync=False):
                 history["predicted"].pop(m_id, None)
                 if preds_list:
                     history["predicted"][target_key] = ensure_list(history["predicted"].get(target_key, [])) + preds_list
+                    if c_id_lower:
+                        predicted_by_cond[c_id_lower] = [(str(target_key), p_i) for p_i in history["predicted"][target_key]]
             elif preds_list:
                 history["predicted"][target_key] = preds_list
             else:
@@ -1251,7 +1302,7 @@ def resolve_market_entries(history, market_id, market_data, bankroll=None):
     return True
 
 
-def update_resolutions(history):
+def update_resolutions(history, market_cache=None):
     """Audits unresolved predictions in predicted and exited buckets against Gamma API."""
     resolved_count = 0
     history.setdefault("predicted", {})
@@ -1265,8 +1316,9 @@ def update_resolutions(history):
         print(f"[*] Auditing {len(market_ids)} unresolved market(s) for resolution...")
 
     chunk_size = 40
-    for i in range(0, len(market_ids), chunk_size):
-        chunk = market_ids[i:i + chunk_size]
+    chunks = [market_ids[i:i + chunk_size] for i in range(0, len(market_ids), chunk_size)]
+
+    def _fetch_res_chunk(chunk):
         resp_map = {}
         try:
             url = f"{cfg.GAMMA_API}/markets?" + "&".join(f"id={mid}" for mid in chunk)
@@ -1275,13 +1327,27 @@ def update_resolutions(history):
                 resp_map = {str(item.get("id")): item for item in batch_res if item.get("id")}
         except Exception:
             resp_map = {}
+        return chunk, resp_map
 
+    if len(chunks) == 1:
+        chunk_results = [_fetch_res_chunk(chunks[0])]
+    elif chunks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
+            chunk_results = list(executor.map(_fetch_res_chunk, chunks))
+    else:
+        chunk_results = []
+
+    for chunk, resp_map in chunk_results:
+        if market_cache is not None and resp_map:
+            market_cache.update(resp_map)
         for market_id in chunk:
             try:
                 m_data = resp_map.get(market_id)
                 if not m_data:
                     try:
                         m_data = api.get(f"{cfg.GAMMA_API}/markets/{market_id}", timeout=5).json()
+                        if market_cache is not None and isinstance(m_data, dict):
+                            market_cache[market_id] = m_data
                     except Exception:
                         continue
                 if resolve_market_entries(history, market_id, m_data):

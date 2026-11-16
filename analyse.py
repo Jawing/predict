@@ -1,4 +1,5 @@
 """analyse.py - Standalone market scanning, aggregation, and interactive paging."""
+import concurrent.futures
 import sys
 import math
 from datetime import datetime, timezone
@@ -151,137 +152,160 @@ def fetch_global_overview(fetch_depth=2000, top_x=None, vector_mode="1", sort_mo
     category_stats = {}
 
     depth_per_vector = fetch_depth if len(sweep_plan) == 1 else min(2000, max(200, fetch_depth // len(sweep_plan)))
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    for order_param, ascending_param in sweep_plan:
+    page_tasks = []
+    for vec_idx, (order_param, ascending_param) in enumerate(sweep_plan):
         offset = 0
         while offset < depth_per_vector:
             limit = min(100, depth_per_vector - offset)
             url = f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}&order={order_param}&ascending={ascending_param}"
             if order_param == "endDate" and ascending_param == "true":
-                now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 url += f"&end_date_min={now_iso}"
-
-            try:
-                response = api.get(url, timeout=10)
-                if response.status_code != 200:
-                    break
-                events = response.json()
-            except Exception as e:
-                print(f"[!] API Error: {e}")
-                break
-
-            if not events or not isinstance(events, list):
-                break
-
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
-                event_id = event.get('id')
-                if event_id in seen_event_ids:
-                    continue
-                seen_event_ids.add(event_id)
-                total_events += 1
-
-                event_vol = 0.0
-                event_24h_vol = 0.0
-                event_liq = 0.0
-                event_markets = 0
-                event_spread_sum = 0.0
-                event_spread_count = 0
-                event_eii = 0.0
-                event_cey = 0.0
-
-                event_oi = float(event.get('openInterest') or event.get('openInterestNum') or 0)
-                event_comp = float(event.get('competitive') or 0)
-
-                for m in event.get('markets', []):
-                    if m.get('active') and not m.get('closed') and m.get('umaResolutionStatus') != 'resolved':
-                        total_markets += 1
-                        event_markets += 1
-                        m_v = float(m.get('volumeNum') or m.get('volume') or 0)
-                        m_24 = float(m.get('volume24hr') or 0)
-                        m_l = float(m.get('liquidity') or m.get('liquidityNum') or 0)
-                        event_vol += m_v
-                        event_24h_vol += m_24
-                        event_liq += m_l
-
-                        prices = parse_outcome_prices(m)
-                        m_odds = prices[0] if len(prices) > 0 else 0.50
-                        m_eff = 4.0 * m_odds * (1.0 - m_odds)
-                        m_eii = m_eff * m_v
-                        event_eii += m_eii
-                        _, sec_left, days_u = parse_market_date(m.get('endDate'))
-                        days_c = max(0.1, days_u) if days_u is not None else 30.0
-                        event_cey += m_eii / math.sqrt(days_c + 7.0)
-
-                        try:
-                            pm_bid = float(m.get('bestBid', 0))
-                            pm_ask = float(m.get('bestAsk', 0))
-                            if pm_ask > pm_bid > 0:
-                                event_spread_sum += (pm_ask - pm_bid)
-                                event_spread_count += 1
-                        except Exception:
-                            pass
-
-                total_volume += event_vol
-                total_24h_volume += event_24h_vol
-                total_liquidity += event_liq
-                total_eii += event_eii
-                total_cey += event_cey
-
-                if event_vol > 0 or event_liq > 0:
-                    total_oi += event_oi
-
-                tags = event.get('tags', [])
-                if not tags:
-                    tags = [{'label': 'Uncategorized'}]
-
-                seen_event_labels = set()
-                for t in tags:
-                    if isinstance(t, dict):
-                        label = t.get('label', 'Unknown').strip().title()
-                    elif isinstance(t, str):
-                        label = t.strip().title()
-                    else:
-                        continue
-
-                    if not label or label.lower() == 'all':
-                        continue
-
-                    if label in seen_event_labels:
-                        continue
-                    seen_event_labels.add(label)
-
-                    if label not in category_stats:
-                        category_stats[label] = {
-                            'events': 0,
-                            'markets': 0,
-                            'volume': 0.0,
-                            '24h_vol': 0.0,
-                            'liquidity': 0.0,
-                            'oi': 0.0,
-                            'eii': 0.0,
-                            'cey': 0.0,
-                            'spread_sum': 0.0,
-                            'spread_count': 0,
-                            'comp_sum': 0.0
-                        }
-
-                    category_stats[label]['events'] += 1
-                    category_stats[label]['markets'] += event_markets
-                    category_stats[label]['volume'] += event_vol
-                    category_stats[label]['24h_vol'] += event_24h_vol
-                    category_stats[label]['liquidity'] += event_liq
-                    category_stats[label]['eii'] += event_eii
-                    category_stats[label]['cey'] += event_cey
-                    if event_vol > 0 or event_liq > 0:
-                        category_stats[label]['oi'] += event_oi
-                    category_stats[label]['spread_sum'] += event_spread_sum
-                    category_stats[label]['spread_count'] += event_spread_count
-                    category_stats[label]['comp_sum'] += event_comp
-
+            page_tasks.append((vec_idx, offset, limit, url))
             offset += limit
-            print(f"    ...scanned {total_events} unique events", end="\r")
+
+    def _fetch_overview_page(task):
+        vec_idx, offset, limit, url = task
+        try:
+            response = api.get(url, timeout=10)
+            if response.status_code != 200:
+                return vec_idx, offset, limit, None, None
+            events = response.json()
+            if not events or not isinstance(events, list):
+                return vec_idx, offset, limit, [], None
+            return vec_idx, offset, limit, events, None
+        except Exception as e:
+            return vec_idx, offset, limit, None, e
+
+    if len(page_tasks) == 1:
+        fetched_pages = [_fetch_overview_page(page_tasks[0])]
+    elif page_tasks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(page_tasks))) as executor:
+            fetched_pages = list(executor.map(_fetch_overview_page, page_tasks))
+    else:
+        fetched_pages = []
+
+    exhausted_vecs = set()
+    for vec_idx, offset, limit, events, err in fetched_pages:
+        if err is not None:
+            print(f"[!] API Error: {err}")
+            exhausted_vecs.add(vec_idx)
+            continue
+        if vec_idx in exhausted_vecs or not events:
+            exhausted_vecs.add(vec_idx)
+            continue
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_id = event.get('id')
+            if event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(event_id)
+            total_events += 1
+
+            event_vol = 0.0
+            event_24h_vol = 0.0
+            event_liq = 0.0
+            event_markets = 0
+            event_spread_sum = 0.0
+            event_spread_count = 0
+            event_eii = 0.0
+            event_cey = 0.0
+
+            event_oi = float(event.get('openInterest') or event.get('openInterestNum') or 0)
+            event_comp = float(event.get('competitive') or 0)
+
+            for m in event.get('markets', []):
+                if m.get('active') and not m.get('closed') and m.get('umaResolutionStatus') != 'resolved':
+                    total_markets += 1
+                    event_markets += 1
+                    m_v = float(m.get('volumeNum') or m.get('volume') or 0)
+                    m_24 = float(m.get('volume24hr') or 0)
+                    m_l = float(m.get('liquidity') or m.get('liquidityNum') or 0)
+                    event_vol += m_v
+                    event_24h_vol += m_24
+                    event_liq += m_l
+
+                    prices = parse_outcome_prices(m)
+                    m_odds = prices[0] if len(prices) > 0 else 0.50
+                    m_eff = 4.0 * m_odds * (1.0 - m_odds)
+                    m_eii = m_eff * m_v
+                    event_eii += m_eii
+                    _, sec_left, days_u = parse_market_date(m.get('endDate'))
+                    days_c = max(0.1, days_u) if days_u is not None else 30.0
+                    event_cey += m_eii / math.sqrt(days_c + 7.0)
+
+                    try:
+                        pm_bid = float(m.get('bestBid', 0))
+                        pm_ask = float(m.get('bestAsk', 0))
+                        if pm_ask > pm_bid > 0:
+                            event_spread_sum += (pm_ask - pm_bid)
+                            event_spread_count += 1
+                    except Exception:
+                        pass
+
+            total_volume += event_vol
+            total_24h_volume += event_24h_vol
+            total_liquidity += event_liq
+            total_eii += event_eii
+            total_cey += event_cey
+
+            if event_vol > 0 or event_liq > 0:
+                total_oi += event_oi
+
+            tags = event.get('tags', [])
+            if not tags:
+                tags = [{'label': 'Uncategorized'}]
+
+            seen_event_labels = set()
+            for t in tags:
+                if isinstance(t, dict):
+                    label = t.get('label', 'Unknown').strip().title()
+                elif isinstance(t, str):
+                    label = t.strip().title()
+                else:
+                    continue
+
+                if not label or label.lower() == 'all':
+                    continue
+
+                if label in seen_event_labels:
+                    continue
+                seen_event_labels.add(label)
+
+                if label not in category_stats:
+                    category_stats[label] = {
+                        'events': 0,
+                        'markets': 0,
+                        'volume': 0.0,
+                        '24h_vol': 0.0,
+                        'liquidity': 0.0,
+                        'oi': 0.0,
+                        'eii': 0.0,
+                        'cey': 0.0,
+                        'spread_sum': 0.0,
+                        'spread_count': 0,
+                        'comp_sum': 0.0
+                    }
+
+                category_stats[label]['events'] += 1
+                category_stats[label]['markets'] += event_markets
+                category_stats[label]['volume'] += event_vol
+                category_stats[label]['24h_vol'] += event_24h_vol
+                category_stats[label]['liquidity'] += event_liq
+                category_stats[label]['eii'] += event_eii
+                category_stats[label]['cey'] += event_cey
+                if event_vol > 0 or event_liq > 0:
+                    category_stats[label]['oi'] += event_oi
+                category_stats[label]['spread_sum'] += event_spread_sum
+                category_stats[label]['spread_count'] += event_spread_count
+                category_stats[label]['comp_sum'] += event_comp
+
+        if len(events) < limit:
+            exhausted_vecs.add(vec_idx)
+        print(f"    ...scanned {total_events} unique events", end="\r")
 
     print("\n\n" + "=" * 146)
     print(f" [GLOBAL OVERVIEW: {overview_label.upper()}] ".center(146, "="))
@@ -455,103 +479,130 @@ def fetch_and_compile_markets(fetch_depth=500, category_filter=None, sort_mode="
         ascending_param = "false" if ascending_param == "true" else "true"
 
     all_markets = []
-    offset = 0
     total_filtered_oi = 0
     seen_event_slugs = set()
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if (order_param == "endDate" and ascending_param == "true") else None
 
+    page_specs = []
+    offset = 0
     while offset < fetch_depth:
         limit = min(100, fetch_depth - offset)
-        url = f"{GAMMA_API}/events?active=true&closed=false&limit={limit}&offset={offset}&order={order_param}&ascending={ascending_param}"
-        if order_param == "endDate" and ascending_param == "true":
-            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            url += f"&end_date_min={now_iso}"
+        page_specs.append((offset, limit))
+        offset += limit
 
+    def _fetch_compile_page(spec):
+        off, lim = spec
+        url = f"{GAMMA_API}/events?active=true&closed=false&limit={lim}&offset={off}&order={order_param}&ascending={ascending_param}"
+        if now_iso:
+            url += f"&end_date_min={now_iso}"
         try:
             response = api.get(url, timeout=10)
             if response.status_code != 200:
-                if response.status_code == 422:
-                    print(f"[*] Reached Polymarket API offset limit at {offset} events.")
-                else:
-                    print(f"[!] API Error: HTTP {response.status_code}")
-                break
-            events = response.json()
+                return off, lim, response.status_code, None, None
+            return off, lim, 200, response.json(), None
         except Exception as e:
-            print(f"[!] API Error: {e}")
+            return off, lim, None, None, e
+
+    wave_size = 5
+    stop_fetching = False
+    for w_start in range(0, len(page_specs), wave_size):
+        if stop_fetching:
             break
+        wave = page_specs[w_start:w_start + wave_size]
+        if len(wave) == 1:
+            wave_results = [_fetch_compile_page(wave[0])]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(wave))) as executor:
+                wave_results = list(executor.map(_fetch_compile_page, wave))
 
-        if not events or not isinstance(events, list):
-            break
+        for off, lim, status_code, events, err in wave_results:
+            if err is not None:
+                print(f"[!] API Error: {err}")
+                stop_fetching = True
+                break
+            if status_code != 200:
+                if status_code == 422:
+                    print(f"[*] Reached Polymarket API offset limit at {off} events.")
+                else:
+                    print(f"[!] API Error: HTTP {status_code}")
+                stop_fetching = True
+                break
+            if not events or not isinstance(events, list):
+                stop_fetching = True
+                break
 
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            if category_filter and category_filter.lower() != "all":
-                tags = []
-                for t in event.get('tags', []):
-                    if isinstance(t, dict):
-                        tags.append(t.get('label', '').lower())
-                    elif isinstance(t, str):
-                        tags.append(t.lower())
-
-                if not any(category_filter.lower() in t for t in tags):
+            for event in events:
+                if not isinstance(event, dict):
                     continue
+                if category_filter and category_filter.lower() != "all":
+                    tags = []
+                    for t in event.get('tags', []):
+                        if isinstance(t, dict):
+                            tags.append(t.get('label', '').lower())
+                        elif isinstance(t, str):
+                            tags.append(t.lower())
 
-            event_title = event.get('title', 'Unknown Event')
-            parent_slug = event.get('slug', '')
-            event_comp = float(event.get('competitive') or 0)
+                    if not any(category_filter.lower() in t for t in tags):
+                        continue
 
-            event_oi = float(event.get('openInterest') or event.get('openInterestNum') or 0)
-            has_valid_market = False
+                event_title = event.get('title', 'Unknown Event')
+                parent_slug = event.get('slug', '')
+                event_comp = float(event.get('competitive') or 0)
 
-            for m in event.get('markets', []):
-                if not m.get('active') or m.get('closed') or m.get('umaResolutionStatus') == 'resolved':
-                    continue
+                event_oi = float(event.get('openInterest') or event.get('openInterestNum') or 0)
+                has_valid_market = False
 
-                m_id = str(m.get('id', ''))
-                is_pred = m_id in pred_ids
-                if open_only and is_pred:
-                    continue
+                for m in event.get('markets', []):
+                    if not m.get('active') or m.get('closed') or m.get('umaResolutionStatus') == 'resolved':
+                        continue
 
-                odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq, eff, eii, cey, pulse, churn = extract_market_metrics(m)
+                    m_id = str(m.get('id', ''))
+                    is_pred = m_id in pred_ids
+                    if open_only and is_pred:
+                        continue
 
-                if seconds_left is None:
-                    continue
+                    odds, spread, seconds_left, m_vol, m_24h, velocity, m_liq, eff, eii, cey, pulse, churn = extract_market_metrics(m)
 
-                if exclude_expired and seconds_left <= 0:
-                    continue
+                    if seconds_left is None:
+                        continue
 
-                has_valid_market = True
-                question = m.get('question', event_title)
-                start_date = m.get('startDate') or event.get('startDate') or ""
-                status_str = "PRED" if is_pred else "OPEN"
+                    if exclude_expired and seconds_left <= 0:
+                        continue
 
-                all_markets.append({
-                    "id": m_id,
-                    "status": status_str,
-                    "question": question[:45] + ".." if len(question) > 45 else question,
-                    "target_slug": parent_slug,
-                    "m_vol": m_vol,
-                    "m_24h": m_24h,
-                    "m_liq": m_liq,
-                    "velocity": velocity,
-                    "odds": odds,
-                    "eff": eff,
-                    "eii": eii,
-                    "cey": cey,
-                    "pulse": pulse,
-                    "churn": churn,
-                    "spread": spread,
-                    "seconds": seconds_left,
-                    "competitive": event_comp,
-                    "start_date": start_date,
-                    "oi": event_oi
-                })
+                    has_valid_market = True
+                    question = m.get('question', event_title)
+                    start_date = m.get('startDate') or event.get('startDate') or ""
+                    status_str = "PRED" if is_pred else "OPEN"
 
-            if has_valid_market and parent_slug not in seen_event_slugs:
-                total_filtered_oi += event_oi
-                seen_event_slugs.add(parent_slug)
+                    all_markets.append({
+                        "id": m_id,
+                        "status": status_str,
+                        "question": question[:45] + ".." if len(question) > 45 else question,
+                        "target_slug": parent_slug,
+                        "m_vol": m_vol,
+                        "m_24h": m_24h,
+                        "m_liq": m_liq,
+                        "velocity": velocity,
+                        "odds": odds,
+                        "eff": eff,
+                        "eii": eii,
+                        "cey": cey,
+                        "pulse": pulse,
+                        "churn": churn,
+                        "spread": spread,
+                        "seconds": seconds_left,
+                        "competitive": event_comp,
+                        "start_date": start_date,
+                        "oi": event_oi
+                    })
 
-        offset += limit
+                if has_valid_market and parent_slug not in seen_event_slugs:
+                    total_filtered_oi += event_oi
+                    seen_event_slugs.add(parent_slug)
+
+            if len(events) < lim:
+                stop_fetching = True
+                break
 
     return all_markets, total_filtered_oi
 
@@ -760,7 +811,7 @@ def display_pager(markets, show_odds):
         print("=" * 214)
 
         end_idx = min(current_idx + len(chunk), total_markets)
-        prompt = f"\n[Showing {end_idx}/{total_markets}] [Enter/n] Next | [p] Prev | [#] Predict | [a] Dump All | [q/Esc] Menu: "
+        prompt = f"\n[{end_idx}/{total_markets}] n: next | p: prev | #: predict | a: all | q: exit > "
 
         action = get_navigation_key(prompt)
         while action == 'invalid':
@@ -849,7 +900,7 @@ def run_interactive_analyzer():
         if not choice or choice.lower() == "p":
             break
         elif choice == "1":
-            category = input("Enter Category (e.g., 'Politics', 'Crypto') or 'All': ").strip().title() or "All"
+            category = input("Category (All): ").strip().title() or "All"
         elif choice == "2":
             print("Sort by: [1] CEY (Compounding Yield) [2] EII (Epistemic Impact) [3] Vol [4] 24h Vol [5] Liquidity [6] Velocity [7] Spread [8] Soonest [9] Competitive [10] Newest [11] OI [12] Efficiency (50/50) [13] No Sorting [14] Pulse (Eff*24h) [15] Churn (24h/Liq)")
             s_choice = input("> ").strip()
@@ -865,7 +916,7 @@ def run_interactive_analyzer():
             open_only = not open_only
         elif choice == "7":
             try:
-                depth = int(input("Search Depth limit (e.g., 500, 1000): ").strip())
+                depth = int(input("Search Depth (500): ").strip())
             except ValueError:
                 depth = 500
 
@@ -896,11 +947,11 @@ def run_interactive_analyzer():
                 v_choice = "1"
 
             try:
-                depth = int(input("Search Depth limit for Overview (e.g., 2000, 5000): ").strip())
+                depth = int(input("Search Depth (2000): ").strip())
             except ValueError:
                 depth = 2000
 
-            top_raw = input("How many top categories to display? (e.g., 15, or 'all'): ").strip().lower()
+            top_raw = input("Top categories (all): ").strip().lower()
             if not top_raw or top_raw in ("all", "a", "0", "-1", "*"):
                 top_x = None
             else:

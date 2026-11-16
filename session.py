@@ -8,7 +8,6 @@ import copy
 import math
 import time
 from datetime import datetime, timezone, timedelta
-import pandas as pd
 
 from config import api
 import config as cfg
@@ -119,7 +118,7 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
 
         print("=" * 76)
 
-        prompt_str = f"Select # (1-{total_items}), [n]ext, [p]rev, [a]ll, or search [Enter to cancel]: " if total_pages > 1 else f"Select # (1-{total_items}), or search [Enter to cancel]: "
+        prompt_str = "n: next | p: prev | a: all | text: search > " if total_pages > 1 else "text: search > "
         choice = input(prompt_str).strip()
         if not choice:
             return None
@@ -144,7 +143,7 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
                 title_disp = (title[:62] + "...") if len(title) > 65 else title
                 print(f" {i:2d} | {title_disp}")
             print("=" * 76)
-            sel = input(f"Select # to predict (1-{total_items}) [Enter to cancel]: ").strip()
+            sel = input("> ").strip()
             if sel.isdigit() and 1 <= int(sel) <= total_items:
                 return _prepare_chosen_sub(available[int(sel) - 1])
             return None
@@ -173,7 +172,7 @@ def select_sub_market(current_m, sub_markets, history, session_candidates=None, 
                 t = sm.get("groupItemTitle") or sm.get("question") or "unknown"
                 t_disp = (t[:62] + "...") if len(t) > 65 else t
                 print(f" {idx + 1:2d} | {t_disp}")
-            sel = input(f"\nSelect # to predict [Enter to cancel]: ").strip()
+            sel = input("\n> ").strip()
             if sel.isdigit() and 1 <= int(sel) <= total_items:
                 return _prepare_chosen_sub(available[int(sel) - 1])
             continue
@@ -320,7 +319,6 @@ def run_prediction_session(
 ):
     """Main interactive terminal prediction loop for discovery or targeted markets."""
     history = load_history()
-    save_history(history)
 
     base_ego = calculate_base_ego(history)
 
@@ -421,19 +419,25 @@ def run_prediction_session(
 
         _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discovery_order=discovery_order)
 
-        prompt_sub = f", 'o' (list {num_avail} mkts)" if num_avail > 0 else ""
         existing_preds_check = ensure_list(history.get("predicted", {}).get(market_id, [])) or ensure_list(history.get("exited", {}).get(market_id, []))
         has_undo_opt = False
         if existing_preds_check:
             s_chk = existing_preds_check[0].get("snapshots")
             if isinstance(s_chk, list) and len(s_chk) >= 2:
                 has_undo_opt = True
-        prompt_undo = ", 'u' (undo update)" if has_undo_opt else ""
 
+        def _print_session_keys(n_avail, can_undo):
+            opts = []
+            if n_avail > 0:
+                opts.append(f"o: {n_avail} mkts")
+            if can_undo:
+                opts.append("u: undo")
+            opts.extend(["d: details", "l: live", "s: skip", "r: redo", "q: quit"])
+            print(" | ".join(opts))
+
+        _print_session_keys(num_avail, has_undo_opt)
         while True:
-            user_input = input(
-                f"Enter % bounds ('36-48' or '42'){prompt_sub}{prompt_undo}, 'd' (details), 'l' (live), 's' (skip), 'r' (redo), 'q' (quit): "
-            ).strip()
+            user_input = input("% > ").strip()
             cmd_parts = user_input.split()
             if cmd_parts and cmd_parts[0].lower() in ("d", "details", "rules", "info", "cond", "condition"):
                 _print_market_resolution_details(m, exact_date_str, days_str)
@@ -467,8 +471,8 @@ def run_prediction_session(
                     pm_bid, pm_ask, pm_mid = m["cached_bid"], m["cached_ask"], m["cached_mid"]
                     avail_subs = get_available_sub_markets(m, sub_markets, history, session_candidates)
                     num_avail = len(avail_subs)
-                    prompt_sub = f", 'o' (list {num_avail} mkts)" if num_avail > 0 else ""
                     _print_market_card(m, exact_date_str, days_str, num_avail, event_url, discovery_order=discovery_order)
+                    _print_session_keys(num_avail, has_undo_opt)
                     continue
                 else:
                     continue
@@ -602,7 +606,14 @@ def run_prediction_session(
                 yes_token, no_token = get_market_clob_tokens(m)
                 token_id = yes_token if action == "YES" else no_token
                 asks_list = []
-                if token_id:
+                if (
+                    token_id
+                    and token_id == yes_token
+                    and isinstance(m.get("_cached_clob_yes_asks"), list)
+                    and (time.monotonic() - float(m.get("_cached_clob_yes_ts", 0.0) or 0.0)) <= 15.0
+                ):
+                    asks_list = m["_cached_clob_yes_asks"]
+                elif token_id:
                     try:
                         r = api.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=5)
                         if r.status_code == 200:
@@ -992,7 +1003,7 @@ def run_prediction_session(
                 cand_k = eff_kelly
                 print(f"Status       : [+] Staged as tracked watch prediction (Eff-Kelly: {eff_kelly*100:.2f}% | $0 allocation)\n")
             else:
-                track_ans = input(f"Status       : [-] Pass. Save as tracked watch prediction? [y/N]: ").strip().lower()
+                track_ans = input("Save watch? (y/n): ").strip().lower()
                 if track_ans in ("y", "yes"):
                     stage_item = True
                     cand_action = "WATCH"
@@ -1048,7 +1059,7 @@ def run_prediction_session(
                 if staged_alloc >= current_bankroll and current_bankroll > 0:
                     print("=" * 80)
                     print(f"[!] CAPITAL POOL SATURATED: Staged candidates reach ${staged_alloc:,.2f} ({staged_alloc/current_bankroll*100:.1f}% of Bankroll).")
-                    c_choice = input("    Continue scanning [Enter] | Finalize & Review candidates now [f/q]: ").strip().lower()
+                    c_choice = input("f/q: finalize > ").strip().lower()
                     if c_choice in ("f", "q", "done", "exit"):
                         print("\n[*] Finalizing session to review candidate pool...")
                         break
@@ -1072,7 +1083,7 @@ def run_prediction_session(
     )
 
     save_history(history)
-    return pd.DataFrame(portfolio_data)
+    return portfolio_data
 
 
 def _review_and_commit_candidates(session_candidates, history, current_bankroll, portfolio_data, session_trades, auto_commit=False):
@@ -1158,8 +1169,8 @@ def _review_and_commit_candidates(session_candidates, history, current_bankroll,
         if tot_sel_alloc > current_bankroll + 1.0:
             print(f"[!] Warning    : Selected allocation exceeds bankroll by ${tot_sel_alloc - current_bankroll:,.2f}")
 
-        act_prompt = f"\nActions: [Enter] Commit Selected  [1-{len(session_candidates)}] Toggle  [a] Select All  [q] Discard All\n> "
-        choice = input(act_prompt).strip().lower()
+        print("\nEnter: commit | a: all | q: discard")
+        choice = input("> ").strip().lower()
 
         if choice == "":
             if not sel_candidates:
@@ -1207,7 +1218,7 @@ def custom_calculator():
     """Interactive custom calculator for hypothetical market calculations."""
     print("\n--- CUSTOM MARKET CALCULATOR ---")
     history = load_history()
-    ego_mode = input("Custom Base Ego (0.0-1.0) [Enter for Historical Ego]: ").strip()
+    ego_mode = input("Base Ego (0.0-1.0, Enter=hist): ").strip()
     try:
         base_ego = (
             float(ego_mode)
@@ -1218,13 +1229,13 @@ def custom_calculator():
         base_ego = calculate_base_ego(history)
 
     try:
-        m_lower, m_upper = parse_user_input(input("Market Probability Bounds % (e.g., 42-52 or 47): ").strip())
-        lower, upper = parse_user_input(input("User Probability Bounds % (e.g., 16-42 or 29): ").strip())
-        fee_input = input("Fee Rate % [Enter for 0%]: ").strip()
+        m_lower, m_upper = parse_user_input(input("Market %: ").strip())
+        lower, upper = parse_user_input(input("User %: ").strip())
+        fee_input = input("Fee % (0): ").strip()
         fee_rate = float(fee_input) / 100.0 if fee_input else 0.0
-        days_input = input("Days until resolution [Enter for 0]: ").strip()
+        days_input = input("Days (0): ").strip()
         days_until = float(days_input) if days_input else 0.0
-        bankroll_input = input(f"Bankroll [Enter for ${cfg.BANKROLL:,.2f}]: ").strip()
+        bankroll_input = input(f"Bankroll (${cfg.BANKROLL:,.2f}): ").strip()
         calc_bankroll = float(bankroll_input) if bankroll_input else cfg.BANKROLL
 
         pu_mid_c = round((lower + upper) / 2.0, 6)
@@ -1245,8 +1256,8 @@ def custom_calculator():
         else:
             print(f"ACTION       : $0 Allocation | Edge: {edge*100:+.2f}% | Ego: {dynamic_ego:.2f}")
 
-        if input("\nSave custom prediction to history? (y/n) [Enter=n]: ").strip().lower() == "y":
-            q_title = input("Enter title: ").strip() or "Custom Market"
+        if input("\nSave? (y/n): ").strip().lower() == "y":
+            q_title = input("Title: ").strip() or "Custom Market"
             custom_id = f"custom_{int(datetime.now().timestamp())}"
             pos_side_c = action.capitalize() if action in ("YES", "NO") else "Yes"
             is_no_c = (pos_side_c == "No")
@@ -1284,146 +1295,3 @@ def custom_calculator():
             print("[+] Saved to active predictions.")
     except ValueError as e:
         print(f"\n[!] Error: {e}.\n")
-
-
-def compare_asset_market():
-    """Interactive tool comparing binary prediction contracts vs. spot/perp asset holding."""
-    print("\n--- ASSET vs. BINARY PREDICTION LEVERAGE & EFFICIENCY ---")
-    title = input("Target / Question [e.g. 'ETH reaches $1500' or 'BTC reaches $100k']: ").strip() or "Asset Target"
-    s0_in = input("Current Spot Price S0 ($) [e.g. 2250]: ").strip()
-    k_in = input("Target Strike / Barrier K ($) [e.g. 1500]: ").strip()
-
-    try:
-        s0 = float(s0_in.replace("$", "").replace(",", ""))
-        k = float(k_in.replace("$", "").replace(",", ""))
-        if s0 <= 0 or k <= 0:
-            print("[!] Spot and strike prices must be positive numbers.")
-            return
-
-        is_downside = (k < s0)
-        asset_direction = "DOWNSIDE / SHORT" if is_downside else "UPSIDE / LONG"
-        asset_pct_move = abs(k - s0) / s0
-
-        side_in = input(f"Contract Side you want to buy: [1] YES (hits ${k:,.0f})  [2] NO (avoids ${k:,.0f}) [Enter=1]: ").strip()
-        is_no = (side_in == "2" or side_in.lower() in ("no", "n"))
-        contract_side = "NO" if is_no else "YES"
-
-        pm_in = input(f"Polymarket {contract_side} Price % (e.g. 88 or 0.88): ").strip()
-        pu_in = input(f"Your Subjective Probability % of {contract_side} winning [e.g. 98 or 0.98]: ").strip()
-        days_in = input("Days to Expiry / Horizon [Enter for 30]: ").strip()
-
-        pm_val = float(pm_in.replace("%", ""))
-        pm = pm_val / 100.0 if pm_val > 1.0 else pm_val
-
-        pu_val = float(pu_in.replace("%", ""))
-        pu = pu_val / 100.0 if pu_val > 1.0 else pu_val
-
-        days = float(days_in) if days_in else 30.0
-
-        if pm <= 0 or pm >= 1.0 or pu <= 0 or pu > 1.0:
-            print("[!] Probabilities must be between 0 and 100%.")
-            return
-
-        binary_roi = (1.0 - pm) / pm
-        pct_return = binary_roi * 100.0
-        edge = pu - pm
-        ev_binary_roi = (edge / pm) * 100.0
-        bin_daily_roi = (binary_roi / max(0.1, days)) * 100.0
-        ann_ev_roi = (ev_binary_roi / max(0.1, days)) * 365.0
-
-        AAVE_LT_LONG = 0.825
-        AAVE_LT_SHORT = 0.850
-
-        is_short_strat = (not is_no and is_downside)
-
-        if not is_no:
-            leverage_mult = binary_roi / asset_pct_move if asset_pct_move > 0 else 0.0
-            bin_lev_str = f"{leverage_mult:.1f}x"
-            bin_req_str = f"{'-' if is_downside else '+'}{asset_pct_move*100:.1f}%"
-            bin_tgt_str = f"${k:,.2f}"
-            bin_liq_str = "NONE"
-            bin_risk_str = "Zero liquidation / No margin calls"
-        else:
-            leverage_mult = 1.0 / pm if pm > 0 else 1.0
-            bin_lev_str = f"{leverage_mult:.1f}x"
-            bin_req_str = f"Cush {asset_pct_move*100:.1f}%"
-            bin_tgt_str = f"${k:,.2f}"
-            bin_liq_str = "NONE"
-            bin_risk_str = f"Pays +{pct_return:.1f}% if flat/down/cushion"
-
-        table_rows = [
-            {
-                "strategy": f"Binary {contract_side} (Poly)",
-                "lev": bin_lev_str,
-                "req_move": bin_req_str,
-                "target_px": bin_tgt_str,
-                "liq_px": bin_liq_str,
-                "risk": bin_risk_str,
-            }
-        ]
-
-        strat_configs = [
-            ("Spot (Unleveraged)", 1.0),
-            ("Aave v4 Recollat (2x)", 2.0),
-            ("Aave v4 Recollat (3x)", 3.0),
-        ]
-
-        for name, lev in strat_configs:
-            req_move_val = binary_roi / lev
-            if not is_short_strat:
-                s_star_val = s0 * (1.0 + req_move_val)
-                req_move_disp = f"+{req_move_val*100:.1f}%"
-            else:
-                s_star_val = s0 * max(0.0, 1.0 - req_move_val)
-                req_move_disp = f"-{req_move_val*100:.1f}%"
-
-            if lev == 1.0:
-                liq_disp = "NONE"
-                risk_disp = "Zero liquidation (loss only at $0)"
-            else:
-                if not is_short_strat:
-                    s_liq_val = s0 * (lev - 1.0) / (lev * AAVE_LT_LONG)
-                    drop_pct = (s_liq_val - s0) / s0 * 100.0
-                    liq_disp = f"${s_liq_val:,.2f} ({drop_pct:+.1f}%)"
-                    risk_tag = "HIGH RISK: " if lev >= 3.0 else ""
-                    risk_disp = f"{risk_tag}Liquidated at {drop_pct:.1f}% dip (82.5% LT)"
-                else:
-                    s_liq_val = s0 * (lev * AAVE_LT_SHORT) / (lev - 1.0)
-                    rally_pct = (s_liq_val - s0) / s0 * 100.0
-                    liq_disp = f"${s_liq_val:,.2f} ({rally_pct:+.1f}%)"
-                    risk_tag = "HIGH RISK: " if lev >= 3.0 else ""
-                    risk_disp = f"{risk_tag}Liquidated at {rally_pct:+.1f}% rally (85% LT)"
-
-            table_rows.append({
-                "strategy": name,
-                "lev": f"{lev:.1f}x",
-                "req_move": req_move_disp,
-                "target_px": f"${s_star_val:,.2f}",
-                "liq_px": liq_disp,
-                "risk": risk_disp,
-            })
-
-        box_w = 125
-        print(f"\n" + "=" * box_w)
-        print(" " * 35 + "[ ASSET vs. PREDICTION MARKET LEVERAGE & EFFICIENCY ]")
-        print("=" * box_w)
-        print(f"Target Event       : {title}")
-        print(f"Spot Reference     : ${s0:,.2f} -> ${k:,.2f} ({asset_pct_move*100:.2f}% {asset_direction} Move)")
-        print(f"Binary Position    : BUY {contract_side} @ {pm*100:.1f}c -> $1.00 (+{pct_return:.2f}% Payout)")
-        print(f"Conviction         : Your Prob: {pu*100:.1f}% vs Market: {pm*100:.1f}% (Edge: {edge*100:+.2f}%)")
-        print(f"Horizon            : {days:.1f} days ({bin_daily_roi:+.2f}%/day max ROI | EV Ann: {ann_ev_roi:+.1f}%)")
-        print("-" * box_w)
-        print(f"Breakeven Win Rate : {pm*100:.1f}% (Requires {contract_side} to resolve > {pm*100:.1f}% of the time)")
-        print(f"Expected EV ROI    : {ev_binary_roi:+.2f}% per dollar committed (EV Payout: ${1.0 * (pu/pm):.2f} per $1.00)")
-        print("-" * box_w)
-        print("  Strategy                 | Lev   | Req Move   | Target Px ($S*) | Liq Price (Aave v4) | Margin & Liquidation Risk")
-        print("---------------------------+-------+------------+-----------------+----------------------+-----------------------------------")
-        for r in table_rows:
-            print(f"  {r['strategy']:<25}| {r['lev']:>5} | {r['req_move']:>10} | {r['target_px']:>15} | {r['liq_px']:>20} | {r['risk']:<34}")
-        print("-" * box_w)
-        print("  * Aave v4 leverage models buy -> borrow -> recollateralize looping (ETH 82.5% Liquidation Threshold).")
-        print("  * Verdict & allocation decision left to operator based on risk tolerance, liquidation buffer & payout asymmetry.")
-        print("=" * box_w + "\n")
-
-    except ValueError as e:
-        print(f"\n[!] Input error: {e}.\n")

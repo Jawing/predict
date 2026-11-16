@@ -1,5 +1,6 @@
 """Configuration parameters and API constants for the prediction pipeline."""
 import requests
+from requests.adapters import HTTPAdapter
 
 HISTORY_DIR = "data"
 HISTORY_FILE = "prediction_history.json"
@@ -17,3 +18,6 @@ KELLY_GAMMA = 0.5    # 0.5 = Balanced (sqrt, Fisher geodesic), 1.0 = Full Eff, 0
 EGO_WEIGHTING = "uniform"  # Equal 1.0 weight per blind pu forecast (full accountability; "kelly" weights by backed capital)
 
 api = requests.Session()
+_http_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+api.mount("https://", _http_adapter)
+api.mount("http://", _http_adapter)

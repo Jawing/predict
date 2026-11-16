@@ -1,7 +1,6 @@
 """Mathematical foundation: Bayesian logit pooling, dynamic ego, logistic efficiency, and Kelly criterion."""
 import math
 import re
-import numpy as np
 import config as cfg
 from utils import ensure_list
 
@@ -53,8 +52,8 @@ def calculate_logistic_metrics(pu, pm, ego=0.5, held_kelly=None, cur_pm=None, fe
     if abs(pu - pm) < 1e-9:
         pu_norm = pm
     else:
-        pu_clip = float(np.clip(pu, eps, 1.0 - eps))
-        pm_clip = float(np.clip(pm, eps, 1.0 - eps))
+        pu_clip = max(eps, min(1.0 - eps, pu))
+        pm_clip = max(eps, min(1.0 - eps, pm))
         logit_pu = math.log(pu_clip / (1.0 - pu_clip))
         logit_pm = math.log(pm_clip / (1.0 - pm_clip))
         logit_norm = (ego * logit_pu) + ((1.0 - ego) * logit_pm)

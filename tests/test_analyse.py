@@ -118,6 +118,48 @@ class TestAnalyse(unittest.TestCase):
         mock_input.return_value = "#12"
         self.assertEqual(analyse.get_navigation_key("> ", allow_predict=False), "next")
 
+    @patch("storage.load_history", return_value={"predicted": {}})
+    @patch.object(analyse, "api")
+    def test_fetch_and_compile_markets_parallel_waves_stops_on_short_page(self, mock_api, _mock_hist):
+        def make_event(eid):
+            return {
+                "id": f"ev_{eid}",
+                "title": f"Event {eid}",
+                "slug": f"event-{eid}",
+                "tags": [{"label": "Politics"}],
+                "markets": [{
+                    "id": f"m_{eid}",
+                    "question": f"Question {eid}?",
+                    "active": True,
+                    "closed": False,
+                    "umaResolutionStatus": None,
+                    "outcomePrices": '["0.50", "0.50"]',
+                    "bestBid": 0.49,
+                    "bestAsk": 0.51,
+                    "endDate": "2030-01-01T00:00:00Z",
+                    "volumeNum": 1000,
+                    "volume24hr": 100,
+                    "liquidity": 500,
+                }],
+            }
+
+        def fake_get(url, timeout=10):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "offset=0" in url:
+                resp.json.return_value = [make_event(i) for i in range(100)]
+            elif "offset=100" in url:
+                resp.json.return_value = [make_event(100 + i) for i in range(3)]
+            else:
+                resp.json.return_value = []
+            return resp
+
+        mock_api.get.side_effect = fake_get
+        markets, _ = analyse.fetch_and_compile_markets(fetch_depth=250, sort_mode="13", exclude_expired=True)
+        self.assertEqual(len(markets), 103)
+        self.assertEqual(markets[0]["id"], "m_0")
+        self.assertEqual(markets[-1]["id"], "m_102")
+
 
 if __name__ == "__main__":
     unittest.main()
