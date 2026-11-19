@@ -12,6 +12,7 @@ from utils import (
     get_history_counts,
     calculate_position_holding,
     parse_outcome_prices,
+    ExitProgram,
 )
 from storage import save_history, get_active_profile, load_history, default_profile_alias
 from model import (
@@ -1450,7 +1451,9 @@ def print_review_table(history, sub_mode, expanded=False, sort_by=None, refresh_
         act = input("> ").strip()
         act_low = act.lower()
 
-        if not act:
+        if act_low == "exit":
+            raise ExitProgram()
+        if not act or act_low == "q":
             return
         if act_low == "p":
             return "p"

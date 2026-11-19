@@ -6,6 +6,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict
 
 
+class ReturnToMainMenu(Exception):
+    """Control-flow signal to jump directly back to the main menu from any submenu."""
+
+
+class ExitProgram(Exception):
+    """Control-flow signal to exit the CLI cleanly from any menu prompt."""
+
+
 class WalletSummary(TypedDict, total=False):
     cash: float
     portfolio: float

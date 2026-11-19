@@ -4,7 +4,7 @@ import sys
 import math
 from datetime import datetime, timezone
 import config as cfg
-from utils import parse_outcome_prices, format_time_remaining, parse_market_date, ansi_link
+from utils import parse_outcome_prices, format_time_remaining, parse_market_date, ansi_link, ReturnToMainMenu, ExitProgram
 
 PAGE_SIZE = 40  # Rows per terminal page
 GAMMA_API = cfg.GAMMA_API
@@ -897,6 +897,10 @@ def run_interactive_analyzer():
         print("8. Global Stats & Category Overview")
 
         choice = input("\n> ").strip()
+        if choice.lower() == "exit":
+            raise ExitProgram()
+        if choice.lower() == "q":
+            raise ReturnToMainMenu()
         if not choice or choice.lower() == "p":
             break
         elif choice == "1":

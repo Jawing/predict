@@ -11,6 +11,7 @@ import config as cfg
 from utils import (
     ensure_list, get_history_counts, parse_market_date,
     get_effective_bankroll, calculate_resolved_pnl,
+    ReturnToMainMenu, ExitProgram,
 )
 from storage import (
     load_history,
@@ -388,6 +389,10 @@ def handle_delete_data():
 
         sub_choice = input("> ").strip()
 
+        if sub_choice.lower() == "exit":
+            raise ExitProgram()
+        if sub_choice.lower() == "q":
+            raise ReturnToMainMenu()
         if not sub_choice or sub_choice.lower() == "p":
             return
 
@@ -596,6 +601,10 @@ def toggle_ego_market_inclusion(history):
 
         print("adj <#>: kelly | s: sort | sort <col> | reset")
         sel = input("> ").strip()
+        if sel.lower() == "exit":
+            raise ExitProgram()
+        if sel.lower() == "q":
+            raise ReturnToMainMenu()
         if not sel or sel.lower() == "p":
             break
         elif sel.lower() == "reset":
@@ -760,6 +769,10 @@ def settings_menu():
         print(f" 6: Ego Weighting  = {curr_ego_w}")
 
         s_choice = input("> ").strip()
+        if s_choice.lower() == "exit":
+            raise ExitProgram()
+        if s_choice.lower() == "q":
+            raise ReturnToMainMenu()
         if not s_choice or s_choice.lower() == "p":
             return
         if s_choice == "1":
